@@ -1,0 +1,7136 @@
+// ============================================================
+// 臨床データ管理アプリ - Firebase版
+// ============================================================
+
+import React, { useState, useEffect, createContext, useContext, useRef } from 'react';
+import { auth, db, functions, httpsCallable } from './firebase';
+import {
+  createUserWithEmailAndPassword,
+  signInWithEmailAndPassword,
+  signOut,
+  onAuthStateChanged
+} from 'firebase/auth';
+import {
+  collection,
+  doc,
+  addDoc,
+  updateDoc,
+  deleteDoc,
+  query,
+  orderBy,
+  onSnapshot,
+  serverTimestamp,
+  getDocs
+} from 'firebase/firestore';
+// Tesseract.jsは不要になりました（Cloud Vision APIに移行）
+import * as XLSX from 'xlsx';
+import {
+  Chart as ChartJS,
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend
+} from 'chart.js';
+import { Line } from 'react-chartjs-2';
+
+// Chart.js登録
+ChartJS.register(
+  CategoryScale,
+  LinearScale,
+  PointElement,
+  LineElement,
+  Title,
+  Tooltip,
+  Legend
+);
+
+// ============================================================
+// 認証コンテキスト
+// ============================================================
+const AuthContext = createContext();
+
+function AuthProvider({ children }) {
+  const [user, setUser] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      setUser(user);
+      setLoading(false);
+    });
+    return unsubscribe;
+  }, []);
+
+  const signup = (email, password) => {
+    return createUserWithEmailAndPassword(auth, email, password);
+  };
+
+  const login = (email, password) => {
+    return signInWithEmailAndPassword(auth, email, password);
+  };
+
+  const logout = () => {
+    return signOut(auth);
+  };
+
+  return (
+    <AuthContext.Provider value={{ user, signup, login, logout, loading }}>
+      {!loading && children}
+    </AuthContext.Provider>
+  );
+}
+
+function useAuth() {
+  return useContext(AuthContext);
+}
+
+// ============================================================
+// OCR処理 - 個人情報フィルタリング付き
+// ============================================================
+
+// 検査項目の正規化マッピング（日本語→英語略称）
+const labItemMapping = {
+  // 蛋白
+  'TP': ['TP', '総蛋白', '総タンパク'],
+  'Alb': ['Alb', 'ALB', 'アルブミン', '7ルブミン', 'ｱﾙﾌﾞﾐﾝ'],
+  'A/G': ['A/G', 'A/G比', 'AG比'],
+
+  // 腎機能
+  'BUN': ['BUN', 'UN', '尿素窒素', 'UN(尿素窒素)'],
+  'Cr': ['Cr', 'CRE', 'クレアチニン', 'CRE(クレアチニン)', 'ｸﾚｱﾁﾆﾝ'],
+  'eGFR': ['eGFR', 'EGFR', '推算GFR'],
+  'Ccr': ['Ccr', 'CCR', '推算Ccr', 'クレアチニンクリアランス'],
+  'UA': ['UA', '尿酸'],
+
+  // 肝機能
+  'AST': ['AST', 'GOT', 'AST(GOT)', 'AST（GOT）'],
+  'ALT': ['ALT', 'GPT', 'ALT(GPT)', 'ALT（GPT）'],
+  'γ-GTP': ['γ-GTP', 'GGT', 'γGTP', 'ガンマGTP', 'r-GTP'],
+  'ALP': ['ALP', 'ALP_IE', 'ALP_IFCC', 'アルカリフォスファターゼ'],
+  'LDH': ['LDH', 'LD', 'LDH_IE', 'LDH_IFCC', '乳酸脱水素酵素'],
+  'T-Bil': ['T-Bil', 'TB', 'T-Bi1', '総ビリルビン', 'T-BIL(総ビリルビン)', '総ビ'],
+  'D-Bil': ['D-Bil', 'DB', 'D-Bi1', '直接ビリルビン', 'D-BIL(直接ビリルビン)', '直ビ', '直接ビ'],
+  'I-Bil': ['I-Bil', '間接ビリルビン', '間接ビ', '間ビ'],
+  'ChE': ['ChE', 'CHE', 'コリンエステラーゼ'],
+
+  // 電解質
+  'Na': ['Na', 'ナトリウム', 'Na(ナトリウム)'],
+  'K': ['K', 'カリウム', 'K(カリウム)'],
+  'Cl': ['Cl', 'クロール', 'Cl(クロール)'],
+  'Ca': ['Ca', 'カルシウム', 'Ca(カルシウム)'],
+  'IP': ['IP', 'P', 'リン', '無機リン', 'IP(無機リン)'],
+  'Mg': ['Mg', 'マグネシウム', 'Mg(マグネシウム)'],
+  'Fe': ['Fe', '鉄', '血清鉄'],
+  'TIBC': ['TIBC', '総鉄結合能'],
+  'UIBC': ['UIBC', '不飽和鉄結合能'],
+  'フェリチン': ['フェリチン', 'Ferritin'],
+  '補正Ca': ['補正Ca', '補正カルシウム'],
+
+  // 血算
+  'WBC': ['WBC', '白血球', '白血球数'],
+  'RBC': ['RBC', '赤血球', '赤血球数'],
+  'Hb': ['Hb', 'HGB', 'ヘモグロビン', 'ﾍﾓｸﾞﾛﾋﾞﾝ'],
+  'Hct': ['Hct', 'HCT', 'ヘマトクリット', 'ﾍﾏﾄｸﾘｯﾄ'],
+  'PLT': ['PLT', '血小板', '血小板数'],
+  'MCV': ['MCV'],
+  'MCH': ['MCH'],
+  'MCHC': ['MCHC'],
+  'Ret': ['Ret', '網赤血球', 'Retic'],
+
+  // 血液像
+  'Baso': ['Baso', '好塩基球', 'Basophil'],
+  'Eosino': ['Eosino', 'Eos', '好酸球', 'Eosinophil'],
+  'Neut': ['Neut', 'Neu', '好中球', 'Neutrophil', 'Neut-T'],
+  'Lymph': ['Lymph', 'Lym', 'リンパ球', 'Lymphocyte'],
+  'Mono': ['Mono', 'Mon', '単球', 'Monocyte'],
+  'Seg': ['Seg', '分葉核球'],
+  'Stab': ['Stab', '桿状核球'],
+
+  // 炎症マーカー
+  'CRP': ['CRP', 'C反応性蛋白'],
+  'ESR': ['ESR', '赤沈', '血沈'],
+  'PCT': ['PCT', 'プロカルシトニン'],
+
+  // 凝固
+  'PT': ['PT', 'プロトロンビン時間'],
+  'APTT': ['APTT', '活性化部分トロンボプラスチン時間'],
+  'Fib': ['Fib', 'フィブリノゲン', 'Fbg'],
+  'D-dimer': ['D-dimer', 'Dダイマー', 'DD'],
+  'FDP': ['FDP'],
+  'AT-III': ['AT-III', 'AT3', 'アンチトロンビン'],
+
+  // 糖代謝
+  'Glu': ['Glu', 'GLU', '血糖', 'BS', 'グルコース'],
+  'HbA1c': ['HbA1c', 'A1c', 'ヘモグロビンA1c'],
+
+  // 脂質
+  'TC': ['TC', 'T-Cho', '総コレステロール', 'T-CHO'],
+  'TG': ['TG', '中性脂肪', 'トリグリセリド'],
+  'HDL': ['HDL', 'HDL-C', 'HDLコレステロール'],
+  'LDL': ['LDL', 'LDL-C', 'LDLコレステロール'],
+
+  // 心筋マーカー
+  'CK': ['CK', 'CPK'],
+  'CK-MB': ['CK-MB', 'CKMB'],
+  'TnI': ['TnI', 'トロポニンI'],
+  'TnT': ['TnT', 'トロポニンT'],
+  'BNP': ['BNP'],
+  'NT-proBNP': ['NT-proBNP', 'NTproBNP'],
+
+  // 甲状腺
+  'TSH': ['TSH'],
+  'FT3': ['FT3', '遊離T3'],
+  'FT4': ['FT4', '遊離T4'],
+
+  // 腫瘍マーカー
+  'CA19-9': ['CA19-9', 'CA199', 'CA19-9_IE', 'CA19-9_ECLIA'],
+  'CA125': ['CA125', 'CA125_IE', 'CA125_ECLIA'],
+  'CEA': ['CEA'],
+  'AFP': ['AFP'],
+  'PSA': ['PSA'],
+  'SCC': ['SCC', 'SCC_IE', 'SCC_ECLIA'],
+
+  // 髄液検査
+  'CSF細胞数': ['CSF細胞', '髄液細胞', '細胞数'],
+  'CSF蛋白': ['CSF蛋白', '髄液蛋白'],
+  'CSF糖': ['CSF糖', '髄液糖'],
+
+  // その他
+  'Amy': ['Amy', 'AMY', 'アミラーゼ'],
+  'Lip': ['Lip', 'リパーゼ'],
+  'CysC': ['CysC', 'シスタチンC'],
+  'NH3': ['NH3', 'アンモニア'],
+  'Lac': ['Lac', '乳酸'],
+  'D/T比': ['D/T比', 'D/T'],
+};
+
+const labItemUnits = {
+  // 血算
+  'WBC': '/μL', 'RBC': '×10⁴/μL', 'Hb': 'g/dL', 'Hct': '%', 'PLT': '×10⁴/μL',
+  'MCV': 'fL', 'MCH': 'pg', 'MCHC': '%', 'Ret': '%',
+  // 血液像
+  'Baso': '%', 'Eosino': '%', 'Neut': '%', 'Lymph': '%', 'Mono': '%', 'Seg': '%', 'Stab': '%',
+  // 炎症
+  'CRP': 'mg/dL', 'ESR': 'mm/h', 'PCT': 'ng/mL',
+  // 肝機能
+  'AST': 'U/L', 'ALT': 'U/L', 'γ-GTP': 'U/L', 'ALP': 'U/L', 'LDH': 'U/L',
+  'T-Bil': 'mg/dL', 'D-Bil': 'mg/dL', 'I-Bil': 'mg/dL', 'ChE': 'U/L',
+  // 腎機能
+  'BUN': 'mg/dL', 'Cr': 'mg/dL', 'eGFR': 'mL/min/1.73m²', 'Ccr': 'mL/min', 'UA': 'mg/dL',
+  // 電解質
+  'Na': 'mEq/L', 'K': 'mEq/L', 'Cl': 'mEq/L', 'Ca': 'mg/dL', 'IP': 'mg/dL', 'P': 'mg/dL',
+  'Mg': 'mg/dL', 'Fe': 'μg/dL', '補正Ca': 'mg/dL',
+  // 蛋白
+  'TP': 'g/dL', 'Alb': 'g/dL', 'A/G': '',
+  // 糖代謝
+  'Glu': 'mg/dL', 'HbA1c': '%',
+  // 脂質
+  'TC': 'mg/dL', 'TG': 'mg/dL', 'HDL': 'mg/dL', 'LDL': 'mg/dL',
+  // 凝固
+  'PT': '秒', 'APTT': '秒', 'Fib': 'mg/dL', 'D-dimer': 'μg/mL', 'FDP': 'μg/mL',
+  // 心筋
+  'CK': 'U/L', 'CK-MB': 'U/L', 'TnI': 'ng/mL', 'TnT': 'ng/mL', 'BNP': 'pg/mL', 'NT-proBNP': 'pg/mL',
+  // 甲状腺
+  'TSH': 'μIU/mL', 'FT3': 'pg/mL', 'FT4': 'ng/dL',
+  // 腫瘍マーカー
+  'CA19-9': 'U/mL', 'CA125': 'U/mL', 'CEA': 'ng/mL', 'AFP': 'ng/mL', 'PSA': 'ng/mL', 'SCC': 'ng/mL',
+  // 髄液
+  'CSF細胞数': '/μL', 'CSF蛋白': 'mg/dL', 'CSF糖': 'mg/dL',
+  // その他
+  'Amy': 'U/L', 'Lip': 'U/L', 'NH3': 'μg/dL', 'Lac': 'mmol/L', 'D/T比': '',
+};
+
+// 項目名を正規化する関数
+function normalizeLabItem(rawName) {
+  const cleaned = rawName.trim()
+    .replace(/\s+/g, '')
+    .replace(/（/g, '(')
+    .replace(/）/g, ')')
+    .replace(/[ー−]/g, '-');
+
+  for (const [normalizedName, aliases] of Object.entries(labItemMapping)) {
+    for (const alias of aliases) {
+      if (cleaned === alias ||
+          cleaned.includes(alias) ||
+          alias.includes(cleaned) ||
+          cleaned.toLowerCase() === alias.toLowerCase()) {
+        return normalizedName;
+      }
+    }
+  }
+  return null;
+}
+
+// 行ベースで検査データを解析
+function parseLabLine(line) {
+  // 前後の空白を削除し、複数の空白を単一に
+  const cleaned = line.trim().replace(/\s+/g, ' ');
+
+  // 行番号を除去（例: "1 TP(総蛋白)" → "TP(総蛋白)"）
+  const withoutLineNum = cleaned.replace(/^\d+\s+/, '');
+
+  // パターン1: "項目名 数値" または "項目名(日本語) 数値"
+  // 例: "TP(総蛋白) 5.9" "eGFR 72.4" "白血球数 2860"
+  const pattern1 = /^([A-Za-zγ\-\/]+(?:[（(][^）)]+[）)])?|[ぁ-んァ-ン一-龥]+(?:[（(][^）)]+[）)])?)\s+([\d.]+)/;
+
+  // パターン2: 数値が複数ある場合（最初の数値を取得）
+  // 例: "AST(GOT) 64 H 23"
+  const pattern2 = /^(.+?)\s+([\d.]+)\s*[LHN]?\s/;
+
+  // パターン3: タブ区切りや特殊フォーマット
+  const pattern3 = /^([A-Za-zγ\-\/０-９0-9]+|[ぁ-んァ-ン一-龥]+)\s*[\t\s]+([\d.]+)/;
+
+  let match = withoutLineNum.match(pattern1) || withoutLineNum.match(pattern2) || withoutLineNum.match(pattern3);
+
+  if (match) {
+    const rawItemName = match[1];
+    const value = parseFloat(match[2]);
+
+    if (!isNaN(value)) {
+      const normalizedName = normalizeLabItem(rawItemName);
+      if (normalizedName) {
+        return {
+          item: normalizedName,
+          value: value,
+          unit: labItemUnits[normalizedName] || ''
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+// 個人情報除外パターン
+const piiPatterns = [
+  /患者(名|氏名|ID|番号)\s*[:：]?\s*[\u4e00-\u9faf\u3040-\u309f\u30a0-\u30ffA-Za-z]+/g,
+  /〒?\d{3}-?\d{4}/g,
+  /[\u4e00-\u9faf]+[都道府県][\u4e00-\u9faf]+[市区町村]/g,
+  /\d{4}[年\/\-]\d{1,2}[月\/\-]\d{1,2}[日]?\s*(生|生年月日)/g,
+  /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g,
+  /\d{2,4}-\d{2,4}-\d{4}/g, // 電話番号
+  /(様|殿|御中)/g,
+];
+
+async function performOCR(imageFile, onProgress) {
+  try {
+    // プログレス表示開始
+    if (onProgress) onProgress(10);
+
+    // 画像をBase64に変換
+    const base64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        // data:image/...;base64, の部分を除去
+        const base64String = reader.result.split(',')[1];
+        resolve(base64String);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(imageFile);
+    });
+
+    if (onProgress) onProgress(30);
+
+    // Cloud Functionsを呼び出し
+    const processLabImage = httpsCallable(functions, 'processLabImage');
+
+    if (onProgress) onProgress(50);
+
+    const result = await processLabImage({ imageBase64: base64 });
+
+    if (onProgress) onProgress(100);
+
+    console.log('Cloud Vision Result:', result.data);
+
+    return {
+      success: result.data.success,
+      data: result.data.data || [],
+      rawTextLength: result.data.rawTextLength || 0,
+      itemsFound: result.data.itemsFound || 0
+    };
+  } catch (error) {
+    console.error('OCR Error:', error);
+    return {
+      success: false,
+      error: error.message,
+      data: []
+    };
+  }
+}
+
+// ============================================================
+// スタイル定義
+// ============================================================
+const styles = {
+  // Auth styles
+  authContainer: {
+    minHeight: '100vh',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    background: 'linear-gradient(135deg, #1e3a5f 0%, #2d4a6f 50%, #1a365d 100%)',
+    padding: '20px',
+    fontFamily: "'Noto Sans JP', -apple-system, BlinkMacSystemFont, sans-serif",
+  },
+  authCard: {
+    background: '#fff',
+    borderRadius: '20px',
+    padding: '48px 40px',
+    width: '100%',
+    maxWidth: '440px',
+    boxShadow: '0 25px 80px rgba(0,0,0,0.35)',
+  },
+  authHeader: {
+    textAlign: 'center',
+    marginBottom: '36px',
+  },
+  logoIcon: {
+    width: '56px',
+    height: '56px',
+    background: 'linear-gradient(135deg, #1a365d 0%, #2b4a7c 100%)',
+    borderRadius: '14px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    margin: '0 auto 20px',
+    boxShadow: '0 4px 20px rgba(26, 54, 93, 0.3)',
+  },
+  authTitle: {
+    fontSize: '26px',
+    fontWeight: '700',
+    color: '#1a365d',
+    margin: '0 0 8px 0',
+    letterSpacing: '-0.5px',
+  },
+  authSubtitle: {
+    fontSize: '14px',
+    color: '#64748b',
+    margin: 0,
+  },
+  authForm: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '20px',
+  },
+  authFooter: {
+    marginTop: '28px',
+    paddingTop: '24px',
+    borderTop: '1px solid #e2e8f0',
+  },
+  footerText: {
+    fontSize: '12px',
+    color: '#64748b',
+    textAlign: 'center',
+    lineHeight: 1.7,
+  },
+
+  // Form elements
+  inputGroup: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+  },
+  inputLabel: {
+    fontSize: '13px',
+    fontWeight: '600',
+    color: '#475569',
+  },
+  input: {
+    padding: '14px 16px',
+    border: '2px solid #e2e8f0',
+    borderRadius: '10px',
+    fontSize: '15px',
+    transition: 'all 0.2s',
+    outline: 'none',
+    fontFamily: 'inherit',
+  },
+  errorText: {
+    color: '#dc2626',
+    fontSize: '13px',
+    margin: 0,
+    padding: '8px 12px',
+    background: '#fef2f2',
+    borderRadius: '8px',
+  },
+
+  // Buttons
+  primaryButton: {
+    padding: '16px 28px',
+    background: 'linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%)',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '10px',
+    fontSize: '15px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    transition: 'all 0.2s',
+    boxShadow: '0 4px 14px rgba(37, 99, 235, 0.35)',
+    fontFamily: 'inherit',
+  },
+  linkButton: {
+    background: 'none',
+    border: 'none',
+    color: '#2563eb',
+    fontSize: '14px',
+    cursor: 'pointer',
+    textDecoration: 'none',
+    fontFamily: 'inherit',
+  },
+  cancelButton: {
+    padding: '14px 24px',
+    background: '#f1f5f9',
+    color: '#475569',
+    border: 'none',
+    borderRadius: '10px',
+    fontSize: '14px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  },
+  logoutButton: {
+    padding: '10px 18px',
+    background: 'transparent',
+    color: '#64748b',
+    border: '1px solid #cbd5e1',
+    borderRadius: '8px',
+    fontSize: '13px',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+    transition: 'all 0.2s',
+  },
+  backButton: {
+    background: 'none',
+    border: 'none',
+    color: '#2563eb',
+    fontSize: '15px',
+    cursor: 'pointer',
+    padding: '8px 0',
+    fontFamily: 'inherit',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '4px',
+  },
+  editButton: {
+    background: 'none',
+    border: 'none',
+    color: '#2563eb',
+    fontSize: '13px',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  },
+  saveButton: {
+    marginTop: '10px',
+    padding: '10px 20px',
+    background: '#059669',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '8px',
+    fontSize: '13px',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  },
+  addButton: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '10px',
+    padding: '16px 28px',
+    background: 'linear-gradient(135deg, #059669 0%, #047857 100%)',
+    color: '#fff',
+    border: 'none',
+    borderRadius: '12px',
+    fontSize: '15px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    marginBottom: '28px',
+    boxShadow: '0 4px 14px rgba(5, 150, 105, 0.3)',
+    fontFamily: 'inherit',
+  },
+  addIcon: {
+    fontSize: '22px',
+    fontWeight: '300',
+  },
+  addLabButton: {
+    padding: '12px 22px',
+    background: '#f1f5f9',
+    color: '#334155',
+    border: 'none',
+    borderRadius: '10px',
+    fontSize: '14px',
+    fontWeight: '600',
+    cursor: 'pointer',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    fontFamily: 'inherit',
+    transition: 'all 0.2s',
+  },
+  deleteButton: {
+    padding: '8px 14px',
+    background: '#fef2f2',
+    color: '#dc2626',
+    border: 'none',
+    borderRadius: '6px',
+    fontSize: '12px',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  },
+
+  // Layout
+  mainContainer: {
+    minHeight: '100vh',
+    background: '#f8fafc',
+    fontFamily: "'Noto Sans JP', -apple-system, BlinkMacSystemFont, sans-serif",
+  },
+  header: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '18px 36px',
+    background: '#fff',
+    borderBottom: '1px solid #e2e8f0',
+    position: 'sticky',
+    top: 0,
+    zIndex: 100,
+    boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
+  },
+  headerLeft: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '18px',
+  },
+  headerRight: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '18px',
+  },
+  headerTitle: {
+    fontSize: '22px',
+    fontWeight: '700',
+    color: '#1e293b',
+    margin: 0,
+  },
+  headerBadge: {
+    padding: '6px 14px',
+    background: '#f1f5f9',
+    borderRadius: '20px',
+    fontSize: '13px',
+    color: '#475569',
+    fontWeight: '500',
+  },
+  diagnosisBadge: {
+    padding: '8px 16px',
+    background: '#eff6ff',
+    color: '#1d4ed8',
+    borderRadius: '8px',
+    fontSize: '14px',
+    fontWeight: '600',
+  },
+  userInfo: {
+    fontSize: '14px',
+    color: '#64748b',
+  },
+  content: {
+    padding: '36px',
+    maxWidth: '1280px',
+    margin: '0 auto',
+  },
+  detailContent: {
+    padding: '36px',
+    maxWidth: '960px',
+    margin: '0 auto',
+  },
+
+  // Patient cards
+  patientGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fill, minmax(320px, 1fr))',
+    gap: '24px',
+  },
+  patientCard: {
+    background: '#fff',
+    borderRadius: '16px',
+    padding: '24px',
+    cursor: 'pointer',
+    transition: 'all 0.2s',
+    border: '1px solid #e2e8f0',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.04)',
+  },
+  patientCardHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '14px',
+  },
+  patientId: {
+    fontSize: '13px',
+    fontWeight: '700',
+    color: '#2563eb',
+    fontFamily: "'JetBrains Mono', monospace",
+    background: '#eff6ff',
+    padding: '4px 10px',
+    borderRadius: '6px',
+  },
+  labCount: {
+    fontSize: '12px',
+    color: '#64748b',
+    background: '#f1f5f9',
+    padding: '4px 12px',
+    borderRadius: '12px',
+  },
+  patientDiagnosis: {
+    fontSize: '18px',
+    fontWeight: '600',
+    color: '#1e293b',
+    margin: '0 0 10px 0',
+  },
+  patientMeta: {
+    fontSize: '13px',
+    color: '#64748b',
+  },
+  patientMemo: {
+    marginTop: '14px',
+    padding: '12px 14px',
+    background: '#f8fafc',
+    borderRadius: '8px',
+    fontSize: '13px',
+    color: '#475569',
+    lineHeight: 1.6,
+    borderLeft: '3px solid #e2e8f0',
+  },
+
+  // Empty states
+  emptyState: {
+    textAlign: 'center',
+    padding: '80px 20px',
+    color: '#64748b',
+  },
+  emptyIcon: {
+    fontSize: '56px',
+    marginBottom: '20px',
+    opacity: 0.6,
+  },
+  emptyHint: {
+    fontSize: '14px',
+    marginTop: '10px',
+    color: '#94a3b8',
+  },
+  emptyLab: {
+    textAlign: 'center',
+    padding: '50px',
+    background: '#f8fafc',
+    borderRadius: '12px',
+    color: '#64748b',
+    border: '2px dashed #e2e8f0',
+  },
+
+  // Sections
+  section: {
+    background: '#fff',
+    borderRadius: '16px',
+    padding: '28px',
+    marginBottom: '28px',
+    border: '1px solid #e2e8f0',
+    boxShadow: '0 2px 8px rgba(0,0,0,0.04)',
+  },
+  sectionHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '24px',
+  },
+  sectionTitle: {
+    fontSize: '17px',
+    fontWeight: '700',
+    color: '#1e293b',
+    margin: 0,
+  },
+  infoGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, 1fr)',
+    gap: '20px',
+    marginBottom: '24px',
+  },
+  infoItem: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+  },
+  infoLabel: {
+    fontSize: '11px',
+    fontWeight: '700',
+    color: '#64748b',
+    textTransform: 'uppercase',
+    letterSpacing: '0.8px',
+  },
+  infoValue: {
+    fontSize: '15px',
+    color: '#1e293b',
+    fontWeight: '500',
+  },
+  memoSection: {
+    paddingTop: '20px',
+    borderTop: '1px solid #e2e8f0',
+  },
+  memoHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '10px',
+  },
+  memoText: {
+    fontSize: '14px',
+    color: '#475569',
+    lineHeight: 1.7,
+    margin: 0,
+  },
+
+  // Lab timeline
+  labTimeline: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '20px',
+  },
+  labCard: {
+    background: '#f8fafc',
+    borderRadius: '14px',
+    padding: '20px',
+    border: '1px solid #e2e8f0',
+  },
+  labCardHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: '16px',
+  },
+  labDate: {
+    fontSize: '16px',
+    fontWeight: '700',
+    color: '#1e293b',
+  },
+  labItemCount: {
+    fontSize: '12px',
+    color: '#64748b',
+  },
+  labDataGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(auto-fill, minmax(130px, 1fr))',
+    gap: '12px',
+  },
+  labDataItem: {
+    display: 'flex',
+    flexDirection: 'column',
+    padding: '12px',
+    background: '#fff',
+    borderRadius: '10px',
+    border: '1px solid #e2e8f0',
+  },
+  labItemName: {
+    fontSize: '11px',
+    fontWeight: '700',
+    color: '#64748b',
+    marginBottom: '4px',
+    letterSpacing: '0.3px',
+  },
+  labItemValue: {
+    fontSize: '18px',
+    fontWeight: '700',
+    color: '#1e293b',
+  },
+  labItemUnit: {
+    fontSize: '11px',
+    fontWeight: '400',
+    color: '#94a3b8',
+  },
+
+  // Modal
+  modalOverlay: {
+    position: 'fixed',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    background: 'rgba(15, 23, 42, 0.6)',
+    backdropFilter: 'blur(4px)',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    zIndex: 1000,
+    padding: '20px',
+  },
+  modal: {
+    background: '#fff',
+    borderRadius: '20px',
+    padding: '36px',
+    width: '100%',
+    maxWidth: '500px',
+    maxHeight: '90vh',
+    overflowY: 'auto',
+    boxShadow: '0 25px 80px rgba(0,0,0,0.3)',
+  },
+  modalTitle: {
+    fontSize: '22px',
+    fontWeight: '700',
+    color: '#1e293b',
+    margin: '0 0 8px 0',
+  },
+  modalNote: {
+    fontSize: '13px',
+    color: '#64748b',
+    marginBottom: '28px',
+    padding: '12px 14px',
+    background: '#fef3c7',
+    borderRadius: '8px',
+    border: '1px solid #fcd34d',
+  },
+  modalActions: {
+    display: 'flex',
+    gap: '14px',
+    marginTop: '28px',
+    justifyContent: 'flex-end',
+  },
+
+  // Upload
+  uploadSection: {
+    marginTop: '20px',
+  },
+  uploadArea: {
+    marginTop: '10px',
+  },
+  uploadLabel: {
+    display: 'block',
+    cursor: 'pointer',
+  },
+  uploadContent: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    padding: '48px',
+    border: '2px dashed #cbd5e1',
+    borderRadius: '14px',
+    background: '#f8fafc',
+    transition: 'all 0.2s',
+  },
+  uploadIcon: {
+    fontSize: '42px',
+    marginBottom: '14px',
+  },
+  uploadHint: {
+    fontSize: '12px',
+    color: '#64748b',
+    marginTop: '10px',
+    textAlign: 'center',
+  },
+  previewContainer: {
+    borderRadius: '12px',
+    overflow: 'hidden',
+    border: '1px solid #e2e8f0',
+  },
+  previewImage: {
+    width: '100%',
+    maxHeight: '220px',
+    objectFit: 'contain',
+    background: '#f8fafc',
+  },
+
+  // Processing
+  processingState: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    padding: '28px',
+    background: '#eff6ff',
+    borderRadius: '12px',
+    marginTop: '20px',
+  },
+  progressBar: {
+    width: '100%',
+    height: '8px',
+    background: '#dbeafe',
+    borderRadius: '4px',
+    marginBottom: '14px',
+    overflow: 'hidden',
+  },
+  progressFill: {
+    height: '100%',
+    background: 'linear-gradient(90deg, #2563eb, #3b82f6)',
+    borderRadius: '4px',
+    transition: 'width 0.3s',
+  },
+  processingNote: {
+    fontSize: '12px',
+    color: '#64748b',
+    marginTop: '8px',
+  },
+
+  // OCR Results
+  ocrResults: {
+    marginTop: '24px',
+    padding: '20px',
+    background: '#f0fdf4',
+    borderRadius: '14px',
+    border: '1px solid #86efac',
+  },
+  ocrTitle: {
+    fontSize: '15px',
+    fontWeight: '700',
+    color: '#166534',
+    margin: '0 0 6px 0',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+  },
+  ocrNote: {
+    fontSize: '12px',
+    color: '#15803d',
+    marginBottom: '16px',
+    padding: '8px 12px',
+    background: '#dcfce7',
+    borderRadius: '6px',
+  },
+  ocrGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, 1fr)',
+    gap: '10px',
+  },
+  ocrItem: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '10px 12px',
+    background: '#fff',
+    borderRadius: '8px',
+    border: '1px solid #bbf7d0',
+  },
+  ocrItemName: {
+    fontWeight: '600',
+    color: '#1e293b',
+    fontSize: '13px',
+  },
+  ocrItemValue: {
+    color: '#475569',
+    fontSize: '13px',
+  },
+  
+  // Manual entry
+  manualEntrySection: {
+    marginTop: '20px',
+    padding: '16px',
+    background: '#f8fafc',
+    borderRadius: '10px',
+    border: '1px solid #e2e8f0',
+  },
+  manualEntryTitle: {
+    fontSize: '14px',
+    fontWeight: '600',
+    color: '#475569',
+    marginBottom: '12px',
+  },
+  manualEntryRow: {
+    display: 'flex',
+    gap: '10px',
+    marginBottom: '10px',
+  },
+  manualInput: {
+    padding: '10px 12px',
+    border: '1px solid #e2e8f0',
+    borderRadius: '6px',
+    fontSize: '14px',
+    outline: 'none',
+    fontFamily: 'inherit',
+  },
+  addItemButton: {
+    padding: '10px 16px',
+    background: '#e2e8f0',
+    color: '#475569',
+    border: 'none',
+    borderRadius: '6px',
+    fontSize: '13px',
+    cursor: 'pointer',
+    fontFamily: 'inherit',
+  },
+};
+
+// ============================================================
+// ログイン画面
+// ============================================================
+function LoginView() {
+  const { signup, login } = useAuth();
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [isRegistering, setIsRegistering] = useState(false);
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const handleAuth = async (e) => {
+    e.preventDefault();
+    if (!email || !password) {
+      setError('メールアドレスとパスワードを入力してください');
+      return;
+    }
+    if (password.length < 6) {
+      setError('パスワードは6文字以上で入力してください');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+
+    try {
+      if (isRegistering) {
+        await signup(email, password);
+      } else {
+        await login(email, password);
+      }
+    } catch (err) {
+      console.error(err);
+      if (err.code === 'auth/user-not-found') {
+        setError('ユーザーが見つかりません');
+      } else if (err.code === 'auth/wrong-password') {
+        setError('パスワードが正しくありません');
+      } else if (err.code === 'auth/email-already-in-use') {
+        setError('このメールアドレスは既に使用されています');
+      } else if (err.code === 'auth/invalid-email') {
+        setError('メールアドレスの形式が正しくありません');
+      } else {
+        setError('認証エラーが発生しました');
+      }
+    }
+
+    setLoading(false);
+  };
+
+  return (
+    <div style={styles.authContainer}>
+      <div style={styles.authCard}>
+        <div style={styles.authHeader}>
+          <div style={styles.logoIcon}>
+            <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+              <path d="M8 14h12M14 8v12" stroke="#60a5fa" strokeWidth="2.5" strokeLinecap="round"/>
+              <circle cx="14" cy="14" r="5" stroke="#60a5fa" strokeWidth="2" fill="none"/>
+            </svg>
+          </div>
+          <h1 style={styles.authTitle}>Clinical Data Registry</h1>
+          <p style={styles.authSubtitle}>臨床データ管理システム</p>
+        </div>
+
+        <form style={styles.authForm} onSubmit={handleAuth}>
+          <div style={styles.inputGroup}>
+            <label style={styles.inputLabel}>メールアドレス</label>
+            <input
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              style={styles.input}
+              placeholder="your@email.com"
+            />
+          </div>
+          <div style={styles.inputGroup}>
+            <label style={styles.inputLabel}>パスワード</label>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              style={styles.input}
+              placeholder="••••••••"
+            />
+          </div>
+          {error && <p style={styles.errorText}>{error}</p>}
+          <button 
+            type="submit" 
+            style={{...styles.primaryButton, opacity: loading ? 0.7 : 1}}
+            disabled={loading}
+          >
+            {loading ? '処理中...' : (isRegistering ? '新規登録' : 'ログイン')}
+          </button>
+          <button
+            type="button"
+            onClick={() => setIsRegistering(!isRegistering)}
+            style={styles.linkButton}
+          >
+            {isRegistering ? 'アカウントをお持ちの方はこちら' : '新規登録はこちら'}
+          </button>
+        </form>
+
+        <div style={styles.authFooter}>
+          <p style={styles.footerText}>
+            🔒 データは暗号化されて保存されます<br/>
+            患者の個人情報（氏名等）は保存されません
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============================================================
+// 患者一覧画面
+// ============================================================
+function PatientsListView({ onSelectPatient }) {
+  const { user, logout } = useAuth();
+  const [patients, setPatients] = useState([]);
+  const [showAddModal, setShowAddModal] = useState(false);
+  const [newPatient, setNewPatient] = useState({
+    diagnosis: '',
+    group: '',
+    onsetDate: '',
+    memo: ''
+  });
+  const [loading, setLoading] = useState(true);
+  const [isExporting, setIsExporting] = useState(false);
+
+  // 分析機能用state
+  const [showAnalysisModal, setShowAnalysisModal] = useState(false);
+  const [selectedPatientIds, setSelectedPatientIds] = useState([]);
+  const [selectedItems, setSelectedItems] = useState([]);
+  const [analysisData, setAnalysisData] = useState(null);
+  const [availableItems, setAvailableItems] = useState([]);
+  const [isLoadingAnalysis, setIsLoadingAnalysis] = useState(false);
+  const [analysisRawData, setAnalysisRawData] = useState([]);
+  const chartRef = useRef(null);
+  const [showGroupComparison, setShowGroupComparison] = useState(false);
+  const [availableGroups, setAvailableGroups] = useState([]);
+  const [selectedGroup1, setSelectedGroup1] = useState('');
+  const [selectedGroup2, setSelectedGroup2] = useState('');
+  const [comparisonResults, setComparisonResults] = useState(null);
+  const [dayRangeStart, setDayRangeStart] = useState('');
+  const [dayRangeEnd, setDayRangeEnd] = useState('');
+
+  // 患者一括インポート用state
+  const [showBulkImportModal, setShowBulkImportModal] = useState(false);
+  const [bulkImportData, setBulkImportData] = useState([]);
+  const [isBulkImporting, setIsBulkImporting] = useState(false);
+
+  // Firestoreからリアルタイムでデータ取得
+  useEffect(() => {
+    if (!user) return;
+
+    const q = query(
+      collection(db, 'users', user.uid, 'patients'),
+      orderBy('createdAt', 'desc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const patientsData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setPatients(patientsData);
+      setLoading(false);
+    });
+
+    return unsubscribe;
+  }, [user]);
+
+  const addPatient = async () => {
+    if (!newPatient.diagnosis) return;
+
+    try {
+      await addDoc(collection(db, 'users', user.uid, 'patients'), {
+        displayId: `P${Date.now().toString(36).toUpperCase()}`,
+        diagnosis: newPatient.diagnosis,
+        group: newPatient.group,
+        onsetDate: newPatient.onsetDate,
+        memo: newPatient.memo,
+        createdAt: serverTimestamp(),
+      });
+
+      setNewPatient({ diagnosis: '', group: '', onsetDate: '', memo: '' });
+      setShowAddModal(false);
+    } catch (err) {
+      console.error('Error adding patient:', err);
+    }
+  };
+
+  // ============================================
+  // 患者一括インポート機能
+  // ============================================
+  const handleBulkImportFile = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const workbook = XLSX.read(event.target.result, { type: 'binary' });
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
+        const data = XLSX.utils.sheet_to_json(sheet);
+
+        // カラム名の正規化
+        const normalizedData = data.map((row, idx) => ({
+          _rowNum: idx + 2,
+          patientId: row['PatientID'] || row['患者ID'] || row['ID'] || `P${Date.now().toString(36).toUpperCase()}${idx}`,
+          diagnosis: row['Diagnosis'] || row['診断名'] || row['病名'] || '',
+          group: row['Group'] || row['群'] || '',
+          onsetDate: normalizeDate(row['OnsetDate'] || row['発症日'] || ''),
+          memo: row['Memo'] || row['メモ'] || row['備考'] || ''
+        }));
+
+        setBulkImportData(normalizedData);
+      } catch (err) {
+        console.error('Error parsing file:', err);
+        alert('ファイルの読み込みに失敗しました');
+      }
+    };
+    reader.readAsBinaryString(file);
+  };
+
+  // 日付の正規化
+  const normalizeDate = (dateVal) => {
+    if (!dateVal) return '';
+    if (typeof dateVal === 'number') {
+      // Excel serial date
+      const date = new Date((dateVal - 25569) * 86400 * 1000);
+      return date.toISOString().split('T')[0];
+    }
+    if (typeof dateVal === 'string') {
+      // Try to parse
+      const parsed = new Date(dateVal);
+      if (!isNaN(parsed.getTime())) {
+        return parsed.toISOString().split('T')[0];
+      }
+    }
+    return String(dateVal);
+  };
+
+  const executeBulkImport = async () => {
+    if (bulkImportData.length === 0) return;
+
+    setIsBulkImporting(true);
+    let successCount = 0;
+
+    for (const row of bulkImportData) {
+      if (!row.diagnosis) continue;
+
+      try {
+        await addDoc(collection(db, 'users', user.uid, 'patients'), {
+          displayId: row.patientId,
+          diagnosis: row.diagnosis,
+          group: row.group,
+          onsetDate: row.onsetDate,
+          memo: row.memo,
+          createdAt: serverTimestamp(),
+        });
+        successCount++;
+      } catch (err) {
+        console.error('Error importing patient:', err);
+      }
+    }
+
+    alert(`${successCount}件の患者データをインポートしました`);
+    setShowBulkImportModal(false);
+    setBulkImportData([]);
+    setIsBulkImporting(false);
+  };
+
+  // ============================================
+  // エクスポート機能
+  // ============================================
+
+  // CSVダウンロード用ヘルパー関数
+  const downloadCSV = (data, headers, filename) => {
+    const csvContent = [
+      headers.join(','),
+      ...data.map(row =>
+        headers.map(h => {
+          const val = row[h];
+          if (val === null || val === undefined) return '';
+          if (typeof val === 'string' && (val.includes(',') || val.includes('\n') || val.includes('"'))) {
+            return `"${val.replace(/"/g, '""')}"`;
+          }
+          return val;
+        }).join(',')
+      )
+    ].join('\n');
+
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+    const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 発症日からの日数を計算（汎用）
+  const calcDays = (onsetDate, targetDate) => {
+    if (!onsetDate || !targetDate) return '';
+    const onset = new Date(onsetDate);
+    const target = new Date(targetDate);
+    return Math.ceil((target - onset) / (1000 * 60 * 60 * 24));
+  };
+
+  const exportAllData = async () => {
+    if (patients.length === 0) {
+      alert('エクスポートするデータがありません');
+      return;
+    }
+
+    setIsExporting(true);
+
+    try {
+      // 全患者の検査データを取得
+      const allLabData = [];
+      const allTreatmentData = [];
+      const allEventData = [];
+
+      for (const patient of patients) {
+        // 検査データ
+        const labQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          orderBy('date', 'asc')
+        );
+        const labSnapshot = await getDocs(labQuery);
+
+        labSnapshot.docs.forEach(labDoc => {
+          const labData = labDoc.data();
+          const labDate = labData.date;
+          const specimen = labData.specimen || '';
+          const dayFromOnset = calcDays(patient.onsetDate, labDate);
+
+          if (labData.data && Array.isArray(labData.data)) {
+            labData.data.forEach(item => {
+              allLabData.push({
+                PatientID: patient.displayId,
+                Group: patient.group || '',
+                Diagnosis: patient.diagnosis || '',
+                OnsetDate: patient.onsetDate || '',
+                LabDate: labDate,
+                DayFromOnset: dayFromOnset,
+                Specimen: specimen,
+                Item: item.item,
+                Value: item.value,
+                Unit: item.unit || ''
+              });
+            });
+          }
+        });
+
+        // 治療薬データ
+        const treatmentQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+          orderBy('startDate', 'asc')
+        );
+        const treatmentSnapshot = await getDocs(treatmentQuery);
+
+        treatmentSnapshot.docs.forEach(treatDoc => {
+          const t = treatDoc.data();
+          allTreatmentData.push({
+            PatientID: patient.displayId,
+            Group: patient.group || '',
+            Diagnosis: patient.diagnosis || '',
+            OnsetDate: patient.onsetDate || '',
+            Category: t.category || '',
+            MedicationName: t.medicationName || '',
+            Dosage: t.dosage || '',
+            DosageUnit: t.dosageUnit || '',
+            StartDate: t.startDate || '',
+            StartDayFromOnset: calcDays(patient.onsetDate, t.startDate),
+            EndDate: t.endDate || '',
+            EndDayFromOnset: calcDays(patient.onsetDate, t.endDate),
+            Note: t.note || ''
+          });
+        });
+
+        // 臨床経過データ
+        const eventQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          orderBy('startDate', 'asc')
+        );
+        const eventSnapshot = await getDocs(eventQuery);
+
+        eventSnapshot.docs.forEach(eventDoc => {
+          const e = eventDoc.data();
+          allEventData.push({
+            PatientID: patient.displayId,
+            Group: patient.group || '',
+            Diagnosis: patient.diagnosis || '',
+            OnsetDate: patient.onsetDate || '',
+            EventType: e.eventType || '',
+            StartDate: e.startDate || '',
+            StartDayFromOnset: calcDays(patient.onsetDate, e.startDate),
+            EndDate: e.endDate || '',
+            EndDayFromOnset: calcDays(patient.onsetDate, e.endDate),
+            JCS: e.jcs || '',
+            Frequency: e.frequency || '',
+            Presence: e.presence || '',
+            Severity: e.severity || '',
+            Note: e.note || ''
+          });
+        });
+      }
+
+      // 日付
+      const dateStr = new Date().toISOString().split('T')[0];
+
+      // 検査データCSV
+      if (allLabData.length > 0) {
+        const labHeaders = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'LabDate', 'DayFromOnset', 'Specimen', 'Item', 'Value', 'Unit'];
+        downloadCSV(allLabData, labHeaders, `lab_data_${dateStr}.csv`);
+      }
+
+      // 治療薬データCSV
+      if (allTreatmentData.length > 0) {
+        const treatHeaders = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'Category', 'MedicationName', 'Dosage', 'DosageUnit', 'StartDate', 'StartDayFromOnset', 'EndDate', 'EndDayFromOnset', 'Note'];
+        downloadCSV(allTreatmentData, treatHeaders, `treatment_data_${dateStr}.csv`);
+      }
+
+      // 臨床経過データCSV
+      if (allEventData.length > 0) {
+        const eventHeaders = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'EventType', 'StartDate', 'StartDayFromOnset', 'EndDate', 'EndDayFromOnset', 'JCS', 'Frequency', 'Presence', 'Severity', 'Note'];
+        downloadCSV(allEventData, eventHeaders, `clinical_events_${dateStr}.csv`);
+      }
+
+      const totalCount = allLabData.length + allTreatmentData.length + allEventData.length;
+      if (totalCount === 0) {
+        alert('エクスポートするデータがありません');
+      } else {
+        alert(`エクスポート完了:\n・検査データ: ${allLabData.length}件\n・治療薬データ: ${allTreatmentData.length}件\n・臨床経過データ: ${allEventData.length}件`);
+      }
+    } catch (err) {
+      console.error('Export error:', err);
+      alert('エクスポートに失敗しました');
+    }
+
+    setIsExporting(false);
+  };
+
+  // 分析モーダルを開く際にデータを読み込む
+  const openAnalysisModal = async () => {
+    setShowAnalysisModal(true);
+    setIsLoadingAnalysis(true);
+    setSelectedPatientIds([]);
+    setSelectedItems([]);
+    setAnalysisData(null);
+    setShowGroupComparison(false);
+    setComparisonResults(null);
+    setSelectedGroup1('');
+    setSelectedGroup2('');
+
+    // 全患者の検査項目と群を収集
+    const itemsSet = new Set();
+    const groupsSet = new Set();
+
+    for (const patient of patients) {
+      if (patient.group) groupsSet.add(patient.group);
+
+      const labQuery = query(
+        collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+        orderBy('date', 'asc')
+      );
+      const labSnapshot = await getDocs(labQuery);
+
+      labSnapshot.docs.forEach(labDoc => {
+        const labData = labDoc.data();
+        if (labData.data && Array.isArray(labData.data)) {
+          labData.data.forEach(item => {
+            if (item.item) itemsSet.add(item.item);
+          });
+        }
+      });
+    }
+
+    setAvailableItems(Array.from(itemsSet).sort());
+    setAvailableGroups(Array.from(groupsSet).sort());
+    setIsLoadingAnalysis(false);
+  };
+
+  // 分析データを生成
+  const generateAnalysisData = async () => {
+    if (selectedPatientIds.length === 0 || selectedItems.length === 0) {
+      alert('患者と項目を選択してください');
+      return;
+    }
+
+    setIsLoadingAnalysis(true);
+
+    const selectedPatientsData = patients.filter(p => selectedPatientIds.includes(p.id));
+    const chartDatasets = [];
+    const rawDataRows = []; // CSV用の生データ
+    const colors = [
+      '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6',
+      '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#6366f1'
+    ];
+
+    let colorIndex = 0;
+
+    for (const patient of selectedPatientsData) {
+      const labQuery = query(
+        collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+        orderBy('date', 'asc')
+      );
+      const labSnapshot = await getDocs(labQuery);
+
+      for (const itemName of selectedItems) {
+        const dataPoints = [];
+
+        labSnapshot.docs.forEach(labDoc => {
+          const labData = labDoc.data();
+          const labDate = labData.date;
+
+          // 発症日からの日数を計算
+          let dayFromOnset = null;
+          if (patient.onsetDate && labDate) {
+            const onset = new Date(patient.onsetDate);
+            const lab = new Date(labDate);
+            const diffTime = lab - onset;
+            dayFromOnset = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+          }
+
+          if (labData.data && Array.isArray(labData.data)) {
+            const item = labData.data.find(d => d.item === itemName);
+            if (item && dayFromOnset !== null) {
+              dataPoints.push({
+                x: dayFromOnset,
+                y: parseFloat(item.value) || 0
+              });
+              // CSV用生データを追加
+              rawDataRows.push({
+                PatientID: patient.displayId,
+                Group: patient.group || '',
+                Diagnosis: patient.diagnosis || '',
+                OnsetDate: patient.onsetDate || '',
+                LabDate: labDate,
+                DayFromOnset: dayFromOnset,
+                Item: itemName,
+                Value: item.value,
+                Unit: item.unit || ''
+              });
+            }
+          }
+        });
+
+        if (dataPoints.length > 0) {
+          // Sort by x (day from onset)
+          dataPoints.sort((a, b) => a.x - b.x);
+
+          const color = colors[colorIndex % colors.length];
+          chartDatasets.push({
+            label: `${patient.displayId} - ${itemName}${patient.group ? ` (${patient.group})` : ''}`,
+            data: dataPoints,
+            borderColor: color,
+            backgroundColor: color + '40',
+            tension: 0.1,
+            pointRadius: 5,
+            pointHoverRadius: 7,
+          });
+          colorIndex++;
+        }
+      }
+    }
+
+    // X軸のラベル（全データポイントの日数をユニークに）
+    const allDays = new Set();
+    chartDatasets.forEach(ds => {
+      ds.data.forEach(point => allDays.add(point.x));
+    });
+    const sortedDays = Array.from(allDays).sort((a, b) => a - b);
+
+    setAnalysisData({
+      labels: sortedDays,
+      datasets: chartDatasets
+    });
+    setAnalysisRawData(rawDataRows);
+
+    setIsLoadingAnalysis(false);
+  };
+
+  // 分析データをCSVエクスポート
+  const exportAnalysisCSV = () => {
+    if (analysisRawData.length === 0) {
+      alert('エクスポートするデータがありません');
+      return;
+    }
+
+    const headers = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'LabDate', 'DayFromOnset', 'Item', 'Value', 'Unit'];
+    const csvContent = [
+      headers.join(','),
+      ...analysisRawData.map(row =>
+        headers.map(h => {
+          const val = row[h];
+          if (typeof val === 'string' && (val.includes(',') || val.includes('\n') || val.includes('"'))) {
+            return `"${val.replace(/"/g, '""')}"`;
+          }
+          return val;
+        }).join(',')
+      )
+    ].join('\n');
+
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+    const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `analysis_data_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // グラフを画像としてエクスポート
+  const exportChartImage = () => {
+    if (chartRef.current) {
+      const url = chartRef.current.toBase64Image();
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `analysis_chart_${new Date().toISOString().split('T')[0]}.png`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    }
+  };
+
+  // 統計関数
+  const mean = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
+
+  const std = (arr) => {
+    const m = mean(arr);
+    return Math.sqrt(arr.reduce((acc, val) => acc + Math.pow(val - m, 2), 0) / (arr.length - 1));
+  };
+
+  // t検定（Welchのt検定）
+  const tTest = (group1, group2) => {
+    const n1 = group1.length;
+    const n2 = group2.length;
+    if (n1 < 2 || n2 < 2) return { t: null, p: null, significant: false };
+
+    const m1 = mean(group1);
+    const m2 = mean(group2);
+    const s1 = std(group1);
+    const s2 = std(group2);
+
+    const se = Math.sqrt((s1 * s1) / n1 + (s2 * s2) / n2);
+    if (se === 0) return { t: null, p: null, significant: false };
+
+    const t = (m1 - m2) / se;
+
+    // 自由度（Welch-Satterthwaite）
+    const v1 = (s1 * s1) / n1;
+    const v2 = (s2 * s2) / n2;
+    const df = Math.pow(v1 + v2, 2) / (Math.pow(v1, 2) / (n1 - 1) + Math.pow(v2, 2) / (n2 - 1));
+
+    // p値の近似計算（簡易版）
+    const p = tDistributionPValue(Math.abs(t), df);
+
+    return { t: t.toFixed(3), p: p.toFixed(4), significant: p < 0.05, df: df.toFixed(1) };
+  };
+
+  // t分布のp値近似計算
+  const tDistributionPValue = (t, df) => {
+    // 簡易的な近似（正規分布で代用、df > 30の場合は良好）
+    const x = df / (df + t * t);
+    const a = df / 2;
+    const b = 0.5;
+    // ベータ関数の不完全積分の近似
+    const p = 1 - incompleteBeta(x, a, b);
+    return 2 * Math.min(p, 1 - p); // 両側検定
+  };
+
+  // 不完全ベータ関数の近似
+  const incompleteBeta = (x, a, b) => {
+    if (x === 0) return 0;
+    if (x === 1) return 1;
+
+    // 簡易近似
+    const bt = Math.exp(
+      lgamma(a + b) - lgamma(a) - lgamma(b) +
+      a * Math.log(x) + b * Math.log(1 - x)
+    );
+
+    if (x < (a + 1) / (a + b + 2)) {
+      return bt * betaCF(x, a, b) / a;
+    } else {
+      return 1 - bt * betaCF(1 - x, b, a) / b;
+    }
+  };
+
+  // ログガンマ関数
+  const lgamma = (x) => {
+    const c = [76.18009172947146, -86.50532032941677, 24.01409824083091,
+              -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5];
+    let y = x;
+    let tmp = x + 5.5;
+    tmp -= (x + 0.5) * Math.log(tmp);
+    let ser = 1.000000000190015;
+    for (let j = 0; j < 6; j++) {
+      ser += c[j] / ++y;
+    }
+    return -tmp + Math.log(2.5066282746310005 * ser / x);
+  };
+
+  // 連分数展開
+  const betaCF = (x, a, b) => {
+    const maxIterations = 100;
+    const eps = 3e-7;
+
+    let qab = a + b;
+    let qap = a + 1;
+    let qam = a - 1;
+    let c = 1;
+    let d = 1 - qab * x / qap;
+    if (Math.abs(d) < 1e-30) d = 1e-30;
+    d = 1 / d;
+    let h = d;
+
+    for (let m = 1; m <= maxIterations; m++) {
+      let m2 = 2 * m;
+      let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
+      d = 1 + aa * d;
+      if (Math.abs(d) < 1e-30) d = 1e-30;
+      c = 1 + aa / c;
+      if (Math.abs(c) < 1e-30) c = 1e-30;
+      d = 1 / d;
+      h *= d * c;
+      aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
+      d = 1 + aa * d;
+      if (Math.abs(d) < 1e-30) d = 1e-30;
+      c = 1 + aa / c;
+      if (Math.abs(c) < 1e-30) c = 1e-30;
+      d = 1 / d;
+      let del = d * c;
+      h *= del;
+      if (Math.abs(del - 1) < eps) break;
+    }
+    return h;
+  };
+
+  // Mann-Whitney U検定
+  const mannWhitneyU = (group1, group2) => {
+    const n1 = group1.length;
+    const n2 = group2.length;
+    if (n1 < 1 || n2 < 1) return { U: null, p: null, significant: false };
+
+    // 全データを結合してランク付け
+    const combined = [
+      ...group1.map(v => ({ value: v, group: 1 })),
+      ...group2.map(v => ({ value: v, group: 2 }))
+    ].sort((a, b) => a.value - b.value);
+
+    // ランク付け（同順位は平均ランク）
+    let ranks = [];
+    let i = 0;
+    while (i < combined.length) {
+      let j = i;
+      while (j < combined.length && combined[j].value === combined[i].value) {
+        j++;
+      }
+      const avgRank = (i + 1 + j) / 2;
+      for (let k = i; k < j; k++) {
+        ranks.push({ ...combined[k], rank: avgRank });
+      }
+      i = j;
+    }
+
+    // 各群のランク和
+    const R1 = ranks.filter(r => r.group === 1).reduce((sum, r) => sum + r.rank, 0);
+    const U1 = n1 * n2 + (n1 * (n1 + 1)) / 2 - R1;
+    const U2 = n1 * n2 - U1;
+    const U = Math.min(U1, U2);
+
+    // 正規近似によるp値
+    const mU = (n1 * n2) / 2;
+    const sigmaU = Math.sqrt((n1 * n2 * (n1 + n2 + 1)) / 12);
+    const z = (U - mU) / sigmaU;
+    const p = 2 * (1 - normalCDF(Math.abs(z)));
+
+    return { U: U.toFixed(1), z: z.toFixed(3), p: p.toFixed(4), significant: p < 0.05 };
+  };
+
+  // 正規分布の累積分布関数
+  const normalCDF = (x) => {
+    const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+    const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+    const sign = x < 0 ? -1 : 1;
+    x = Math.abs(x) / Math.sqrt(2);
+    const t = 1 / (1 + p * x);
+    const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+    return 0.5 * (1 + sign * y);
+  };
+
+  // 群間比較を実行
+  // 発症日からの日数を計算するヘルパー関数
+  const calcDayFromOnset = (patient, labDate) => {
+    if (!patient.onsetDate || !labDate) return null;
+    const onset = new Date(patient.onsetDate);
+    const lab = new Date(labDate);
+    return Math.ceil((lab - onset) / (1000 * 60 * 60 * 24));
+  };
+
+  // 日数フィルタをチェック
+  const isInDayRange = (dayFromOnset) => {
+    if (dayFromOnset === null) return false;
+    const start = dayRangeStart !== '' ? parseInt(dayRangeStart) : null;
+    const end = dayRangeEnd !== '' ? parseInt(dayRangeEnd) : null;
+
+    if (start === null && end === null) return true; // フィルタなし
+    if (start !== null && dayFromOnset < start) return false;
+    if (end !== null && dayFromOnset > end) return false;
+    return true;
+  };
+
+  const runGroupComparison = async () => {
+    if (!selectedGroup1 || !selectedGroup2 || selectedItems.length === 0) {
+      alert('2つの群と検査項目を選択してください');
+      return;
+    }
+
+    setIsLoadingAnalysis(true);
+
+    const group1Patients = patients.filter(p => p.group === selectedGroup1);
+    const group2Patients = patients.filter(p => p.group === selectedGroup2);
+
+    const results = [];
+
+    for (const itemName of selectedItems) {
+      const group1Values = [];
+      const group2Values = [];
+
+      // Group 1のデータ収集
+      for (const patient of group1Patients) {
+        const labQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          orderBy('date', 'asc')
+        );
+        const labSnapshot = await getDocs(labQuery);
+
+        labSnapshot.docs.forEach(labDoc => {
+          const labData = labDoc.data();
+          const labDate = labData.date;
+          const dayFromOnset = calcDayFromOnset(patient, labDate);
+
+          // 日数フィルタをチェック
+          if (!isInDayRange(dayFromOnset)) return;
+
+          if (labData.data && Array.isArray(labData.data)) {
+            const item = labData.data.find(d => d.item === itemName);
+            if (item && !isNaN(parseFloat(item.value))) {
+              group1Values.push(parseFloat(item.value));
+            }
+          }
+        });
+      }
+
+      // Group 2のデータ収集
+      for (const patient of group2Patients) {
+        const labQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          orderBy('date', 'asc')
+        );
+        const labSnapshot = await getDocs(labQuery);
+
+        labSnapshot.docs.forEach(labDoc => {
+          const labData = labDoc.data();
+          const labDate = labData.date;
+          const dayFromOnset = calcDayFromOnset(patient, labDate);
+
+          // 日数フィルタをチェック
+          if (!isInDayRange(dayFromOnset)) return;
+
+          if (labData.data && Array.isArray(labData.data)) {
+            const item = labData.data.find(d => d.item === itemName);
+            if (item && !isNaN(parseFloat(item.value))) {
+              group2Values.push(parseFloat(item.value));
+            }
+          }
+        });
+      }
+
+      if (group1Values.length > 0 && group2Values.length > 0) {
+        const tResult = tTest(group1Values, group2Values);
+        const mwResult = mannWhitneyU(group1Values, group2Values);
+
+        results.push({
+          item: itemName,
+          group1: {
+            n: group1Values.length,
+            mean: mean(group1Values).toFixed(2),
+            std: group1Values.length > 1 ? std(group1Values).toFixed(2) : '-',
+            median: group1Values.sort((a, b) => a - b)[Math.floor(group1Values.length / 2)].toFixed(2)
+          },
+          group2: {
+            n: group2Values.length,
+            mean: mean(group2Values).toFixed(2),
+            std: group2Values.length > 1 ? std(group2Values).toFixed(2) : '-',
+            median: group2Values.sort((a, b) => a - b)[Math.floor(group2Values.length / 2)].toFixed(2)
+          },
+          tTest: tResult,
+          mannWhitney: mwResult
+        });
+      }
+    }
+
+    setComparisonResults(results);
+    setIsLoadingAnalysis(false);
+  };
+
+  // 統計結果をCSVエクスポート
+  const exportComparisonCSV = () => {
+    if (!comparisonResults || comparisonResults.length === 0) return;
+
+    const headers = [
+      'Item',
+      `${selectedGroup1}_n`, `${selectedGroup1}_mean`, `${selectedGroup1}_SD`, `${selectedGroup1}_median`,
+      `${selectedGroup2}_n`, `${selectedGroup2}_mean`, `${selectedGroup2}_SD`, `${selectedGroup2}_median`,
+      't_statistic', 't_df', 't_p_value', 't_significant',
+      'U_statistic', 'U_z', 'U_p_value', 'U_significant'
+    ];
+
+    const rows = comparisonResults.map(r => [
+      r.item,
+      r.group1.n, r.group1.mean, r.group1.std, r.group1.median,
+      r.group2.n, r.group2.mean, r.group2.std, r.group2.median,
+      r.tTest.t || '', r.tTest.df || '', r.tTest.p || '', r.tTest.significant ? 'Yes' : 'No',
+      r.mannWhitney.U || '', r.mannWhitney.z || '', r.mannWhitney.p || '', r.mannWhitney.significant ? 'Yes' : 'No'
+    ]);
+
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+    const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const dayRangeStr = (dayRangeStart !== '' || dayRangeEnd !== '')
+      ? `_Day${dayRangeStart || '0'}-${dayRangeEnd || 'end'}`
+      : '';
+    a.download = `group_comparison_${selectedGroup1}_vs_${selectedGroup2}${dayRangeStr}_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 患者選択トグル
+  const togglePatientSelection = (patientId) => {
+    setSelectedPatientIds(prev =>
+      prev.includes(patientId)
+        ? prev.filter(id => id !== patientId)
+        : [...prev, patientId]
+    );
+  };
+
+  // 項目選択トグル
+  const toggleItemSelection = (itemName) => {
+    setSelectedItems(prev =>
+      prev.includes(itemName)
+        ? prev.filter(i => i !== itemName)
+        : [...prev, itemName]
+    );
+  };
+
+  if (loading) {
+    return (
+      <div style={styles.mainContainer}>
+        <div style={{...styles.emptyState, padding: '100px'}}>
+          読み込み中...
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.mainContainer}>
+      <header style={styles.header}>
+        <div style={styles.headerLeft}>
+          <h1 style={styles.headerTitle}>患者一覧</h1>
+          <span style={styles.headerBadge}>{patients.length} 件</span>
+        </div>
+        <div style={styles.headerRight}>
+          <span style={styles.userInfo}>{user?.email}</span>
+          <button onClick={logout} style={styles.logoutButton}>
+            ログアウト
+          </button>
+        </div>
+      </header>
+
+      <main style={styles.content}>
+        <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
+          <button onClick={() => setShowAddModal(true)} style={styles.addButton}>
+            <span style={styles.addIcon}>+</span>
+            新規患者登録
+          </button>
+          <button
+            onClick={exportAllData}
+            disabled={isExporting || patients.length === 0}
+            style={{
+              ...styles.addButton,
+              backgroundColor: patients.length === 0 ? '#ccc' : '#28a745',
+              opacity: isExporting ? 0.7 : 1,
+              cursor: isExporting || patients.length === 0 ? 'not-allowed' : 'pointer'
+            }}
+          >
+            {isExporting ? 'エクスポート中...' : '📊 CSVエクスポート'}
+          </button>
+          <button
+            onClick={openAnalysisModal}
+            disabled={patients.length === 0}
+            style={{
+              ...styles.addButton,
+              backgroundColor: patients.length === 0 ? '#ccc' : '#8b5cf6',
+              cursor: patients.length === 0 ? 'not-allowed' : 'pointer'
+            }}
+          >
+            📈 経時データ分析
+          </button>
+          <button
+            onClick={() => setShowBulkImportModal(true)}
+            style={{
+              ...styles.addButton,
+              backgroundColor: '#f59e0b'
+            }}
+          >
+            📥 一括インポート
+          </button>
+        </div>
+
+        {patients.length === 0 ? (
+          <div style={styles.emptyState}>
+            <div style={styles.emptyIcon}>📋</div>
+            <p>登録された患者はまだいません</p>
+            <p style={styles.emptyHint}>「新規患者登録」から始めましょう</p>
+          </div>
+        ) : (
+          <div style={styles.patientGrid}>
+            {patients.map((patient) => (
+              <div
+                key={patient.id}
+                style={styles.patientCard}
+                onClick={() => onSelectPatient(patient)}
+                onMouseOver={(e) => {
+                  e.currentTarget.style.transform = 'translateY(-2px)';
+                  e.currentTarget.style.boxShadow = '0 8px 25px rgba(0,0,0,0.1)';
+                }}
+                onMouseOut={(e) => {
+                  e.currentTarget.style.transform = 'translateY(0)';
+                  e.currentTarget.style.boxShadow = '0 2px 8px rgba(0,0,0,0.04)';
+                }}
+              >
+                <div style={styles.patientCardHeader}>
+                  <span style={styles.patientId}>{patient.displayId}</span>
+                  <span style={styles.labCount}>
+                    検査 {patient.labCount || 0} 件
+                  </span>
+                </div>
+                <h3 style={styles.patientDiagnosis}>{patient.diagnosis}</h3>
+                <div style={styles.patientMeta}>
+                  <span>発症日: {patient.onsetDate || '未設定'}</span>
+                </div>
+                {patient.memo && (
+                  <p style={styles.patientMemo}>{patient.memo}</p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </main>
+
+      {/* 新規患者登録モーダル */}
+      {showAddModal && (
+        <div style={styles.modalOverlay}>
+          <div style={styles.modal}>
+            <h2 style={styles.modalTitle}>新規患者登録</h2>
+            <p style={styles.modalNote}>
+              ⚠️ 個人情報保護のため、患者氏名は登録できません
+            </p>
+
+            <div style={styles.inputGroup}>
+              <label style={styles.inputLabel}>病名 / 診断名 *</label>
+              <input
+                type="text"
+                value={newPatient.diagnosis}
+                onChange={(e) => setNewPatient({...newPatient, diagnosis: e.target.value})}
+                style={styles.input}
+                placeholder="例: マイコプラズマ脳炎"
+              />
+            </div>
+
+            <div style={{...styles.inputGroup, marginTop: '16px'}}>
+              <label style={styles.inputLabel}>群（Group）</label>
+              <input
+                type="text"
+                value={newPatient.group}
+                onChange={(e) => setNewPatient({...newPatient, group: e.target.value})}
+                style={styles.input}
+                placeholder="例: Mycoplasma, Viral, Control"
+              />
+            </div>
+
+            <div style={{...styles.inputGroup, marginTop: '16px'}}>
+              <label style={styles.inputLabel}>発症日</label>
+              <input
+                type="date"
+                value={newPatient.onsetDate}
+                onChange={(e) => setNewPatient({...newPatient, onsetDate: e.target.value})}
+                style={styles.input}
+              />
+            </div>
+
+            <div style={{...styles.inputGroup, marginTop: '16px'}}>
+              <label style={styles.inputLabel}>メモ</label>
+              <textarea
+                value={newPatient.memo}
+                onChange={(e) => setNewPatient({...newPatient, memo: e.target.value})}
+                style={{...styles.input, minHeight: '100px', resize: 'vertical'}}
+                placeholder="経過や特記事項など"
+              />
+            </div>
+
+            <div style={styles.modalActions}>
+              <button onClick={() => setShowAddModal(false)} style={styles.cancelButton}>
+                キャンセル
+              </button>
+              <button 
+                onClick={addPatient} 
+                style={{...styles.primaryButton, opacity: !newPatient.diagnosis ? 0.5 : 1}}
+                disabled={!newPatient.diagnosis}
+              >
+                登録
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 患者一括インポートモーダル */}
+      {showBulkImportModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '800px', maxHeight: '90vh', overflow: 'auto'}}>
+            <h2 style={styles.modalTitle}>患者データ一括インポート</h2>
+
+            <div style={{marginBottom: '20px'}}>
+              <p style={{fontSize: '13px', color: '#6b7280', marginBottom: '12px'}}>
+                Excel/CSVファイルから複数の患者を一括登録できます。<br/>
+                以下のカラム名に対応しています：
+              </p>
+              <div style={{
+                background: '#f8fafc',
+                padding: '12px',
+                borderRadius: '8px',
+                fontSize: '12px',
+                fontFamily: 'monospace'
+              }}>
+                <div><strong>PatientID / 患者ID / ID</strong> - 患者識別子（任意）</div>
+                <div><strong>Diagnosis / 診断名 / 病名</strong> - 診断名（必須）</div>
+                <div><strong>Group / 群</strong> - 群分け</div>
+                <div><strong>OnsetDate / 発症日</strong> - 発症日 (YYYY-MM-DD)</div>
+                <div><strong>Memo / メモ / 備考</strong> - メモ</div>
+              </div>
+            </div>
+
+            <div style={styles.inputGroup}>
+              <label style={styles.inputLabel}>ファイルを選択</label>
+              <input
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                onChange={handleBulkImportFile}
+                style={{...styles.input, padding: '10px'}}
+              />
+            </div>
+
+            {bulkImportData.length > 0 && (
+              <div style={{marginTop: '20px'}}>
+                <p style={{fontWeight: '500', marginBottom: '12px'}}>
+                  プレビュー（{bulkImportData.length}件）
+                </p>
+                <div style={{maxHeight: '300px', overflow: 'auto', border: '1px solid #e2e8f0', borderRadius: '8px'}}>
+                  <table style={{width: '100%', borderCollapse: 'collapse', fontSize: '12px'}}>
+                    <thead>
+                      <tr style={{background: '#f1f5f9', position: 'sticky', top: 0}}>
+                        <th style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>ID</th>
+                        <th style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>診断名</th>
+                        <th style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>群</th>
+                        <th style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>発症日</th>
+                        <th style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>メモ</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {bulkImportData.map((row, idx) => (
+                        <tr key={idx} style={{background: idx % 2 === 0 ? 'white' : '#f8fafc'}}>
+                          <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0'}}>{row.patientId}</td>
+                          <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', color: row.diagnosis ? 'inherit' : '#ef4444'}}>
+                            {row.diagnosis || '（必須）'}
+                          </td>
+                          <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0'}}>{row.group}</td>
+                          <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0'}}>{row.onsetDate}</td>
+                          <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', maxWidth: '150px', overflow: 'hidden', textOverflow: 'ellipsis'}}>
+                            {row.memo}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => {
+                  setShowBulkImportModal(false);
+                  setBulkImportData([]);
+                }}
+                style={styles.cancelButton}
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={executeBulkImport}
+                disabled={bulkImportData.length === 0 || isBulkImporting}
+                style={{
+                  ...styles.primaryButton,
+                  backgroundColor: '#f59e0b',
+                  opacity: bulkImportData.length === 0 ? 0.5 : 1
+                }}
+              >
+                {isBulkImporting ? 'インポート中...' : `${bulkImportData.length}件をインポート`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 経時データ分析モーダル */}
+      {showAnalysisModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '900px', maxHeight: '90vh', overflow: 'auto'}}>
+            <h2 style={styles.modalTitle}>経時データ分析</h2>
+
+            {isLoadingAnalysis && !analysisData ? (
+              <div style={{textAlign: 'center', padding: '40px'}}>
+                データを読み込み中...
+              </div>
+            ) : (
+              <>
+                <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '20px', marginBottom: '20px'}}>
+                  {/* 患者選択 */}
+                  <div>
+                    <label style={styles.inputLabel}>患者を選択</label>
+                    <div style={{
+                      maxHeight: '200px',
+                      overflow: 'auto',
+                      border: '1px solid #e2e8f0',
+                      borderRadius: '8px',
+                      padding: '8px'
+                    }}>
+                      {patients.map(patient => (
+                        <label
+                          key={patient.id}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '8px',
+                            padding: '8px',
+                            cursor: 'pointer',
+                            borderRadius: '4px',
+                            background: selectedPatientIds.includes(patient.id) ? '#eff6ff' : 'transparent'
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedPatientIds.includes(patient.id)}
+                            onChange={() => togglePatientSelection(patient.id)}
+                          />
+                          <span style={{fontWeight: '500'}}>{patient.displayId}</span>
+                          <span style={{fontSize: '12px', color: '#6b7280'}}>
+                            {patient.diagnosis}
+                            {patient.group && ` (${patient.group})`}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                    <div style={{marginTop: '8px', fontSize: '12px', color: '#6b7280'}}>
+                      {selectedPatientIds.length}人選択中
+                    </div>
+                  </div>
+
+                  {/* 項目選択 */}
+                  <div>
+                    <label style={styles.inputLabel}>検査項目を選択</label>
+                    <div style={{
+                      maxHeight: '200px',
+                      overflow: 'auto',
+                      border: '1px solid #e2e8f0',
+                      borderRadius: '8px',
+                      padding: '8px'
+                    }}>
+                      {availableItems.length === 0 ? (
+                        <div style={{padding: '16px', textAlign: 'center', color: '#6b7280'}}>
+                          検査データがありません
+                        </div>
+                      ) : (
+                        availableItems.map(item => (
+                          <label
+                            key={item}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '8px',
+                              padding: '6px 8px',
+                              cursor: 'pointer',
+                              borderRadius: '4px',
+                              background: selectedItems.includes(item) ? '#f0fdf4' : 'transparent'
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedItems.includes(item)}
+                              onChange={() => toggleItemSelection(item)}
+                            />
+                            <span>{item}</span>
+                          </label>
+                        ))
+                      )}
+                    </div>
+                    <div style={{marginTop: '8px', fontSize: '12px', color: '#6b7280'}}>
+                      {selectedItems.length}項目選択中
+                    </div>
+                  </div>
+                </div>
+
+                <button
+                  onClick={generateAnalysisData}
+                  disabled={selectedPatientIds.length === 0 || selectedItems.length === 0 || isLoadingAnalysis}
+                  style={{
+                    ...styles.primaryButton,
+                    width: '100%',
+                    marginBottom: '20px',
+                    opacity: (selectedPatientIds.length === 0 || selectedItems.length === 0) ? 0.5 : 1
+                  }}
+                >
+                  {isLoadingAnalysis ? 'グラフ生成中...' : 'グラフを生成'}
+                </button>
+
+                {/* グラフ表示 */}
+                {analysisData && analysisData.datasets.length > 0 && (
+                  <div style={{
+                    background: '#f8fafc',
+                    padding: '20px',
+                    borderRadius: '12px',
+                    marginBottom: '20px'
+                  }}>
+                    <Line
+                      ref={chartRef}
+                      data={analysisData}
+                      options={{
+                        responsive: true,
+                        plugins: {
+                          legend: {
+                            position: 'top',
+                          },
+                          title: {
+                            display: true,
+                            text: '経時データ（発症日からの日数）'
+                          },
+                          tooltip: {
+                            callbacks: {
+                              label: function(context) {
+                                return `${context.dataset.label}: ${context.parsed.y}`;
+                              }
+                            }
+                          }
+                        },
+                        scales: {
+                          x: {
+                            type: 'linear',
+                            title: {
+                              display: true,
+                              text: '発症からの日数'
+                            }
+                          },
+                          y: {
+                            title: {
+                              display: true,
+                              text: '値'
+                            }
+                          }
+                        }
+                      }}
+                    />
+                    {/* エクスポートボタン */}
+                    <div style={{
+                      display: 'flex',
+                      gap: '10px',
+                      marginTop: '16px',
+                      justifyContent: 'center'
+                    }}>
+                      <button
+                        onClick={exportAnalysisCSV}
+                        style={{
+                          ...styles.addButton,
+                          backgroundColor: '#28a745',
+                          padding: '8px 16px',
+                          fontSize: '14px'
+                        }}
+                      >
+                        📊 CSVダウンロード
+                      </button>
+                      <button
+                        onClick={exportChartImage}
+                        style={{
+                          ...styles.addButton,
+                          backgroundColor: '#0ea5e9',
+                          padding: '8px 16px',
+                          fontSize: '14px'
+                        }}
+                      >
+                        🖼️ グラフ画像ダウンロード
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {analysisData && analysisData.datasets.length === 0 && (
+                  <div style={{
+                    textAlign: 'center',
+                    padding: '40px',
+                    background: '#fef3c7',
+                    borderRadius: '12px',
+                    color: '#92400e'
+                  }}>
+                    選択した条件に一致するデータがありません。
+                    <br />
+                    発症日が設定されている患者と、検査データがある項目を選択してください。
+                  </div>
+                )}
+
+                {/* 群間比較セクション */}
+                <div style={{
+                  marginTop: '30px',
+                  padding: '20px',
+                  background: '#faf5ff',
+                  borderRadius: '12px',
+                  border: '1px solid #e9d5ff'
+                }}>
+                  <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px'}}>
+                    <h3 style={{margin: 0, color: '#7c3aed', fontSize: '16px'}}>📊 群間統計比較</h3>
+                    <button
+                      onClick={() => setShowGroupComparison(!showGroupComparison)}
+                      style={{
+                        background: showGroupComparison ? '#7c3aed' : 'white',
+                        color: showGroupComparison ? 'white' : '#7c3aed',
+                        border: '1px solid #7c3aed',
+                        borderRadius: '6px',
+                        padding: '6px 12px',
+                        cursor: 'pointer',
+                        fontSize: '13px'
+                      }}
+                    >
+                      {showGroupComparison ? '閉じる' : '開く'}
+                    </button>
+                  </div>
+
+                  {showGroupComparison && (
+                    <>
+                      {availableGroups.length < 2 ? (
+                        <div style={{padding: '20px', textAlign: 'center', color: '#6b7280'}}>
+                          群間比較には2つ以上の群が必要です。<br/>
+                          患者登録時に「群」を設定してください。
+                        </div>
+                      ) : (
+                        <>
+                          <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', marginBottom: '16px'}}>
+                            <div>
+                              <label style={styles.inputLabel}>群1</label>
+                              <select
+                                value={selectedGroup1}
+                                onChange={(e) => setSelectedGroup1(e.target.value)}
+                                style={{...styles.input, width: '100%'}}
+                              >
+                                <option value="">選択してください</option>
+                                {availableGroups.map(g => (
+                                  <option key={g} value={g} disabled={g === selectedGroup2}>{g}</option>
+                                ))}
+                              </select>
+                            </div>
+                            <div>
+                              <label style={styles.inputLabel}>群2</label>
+                              <select
+                                value={selectedGroup2}
+                                onChange={(e) => setSelectedGroup2(e.target.value)}
+                                style={{...styles.input, width: '100%'}}
+                              >
+                                <option value="">選択してください</option>
+                                {availableGroups.map(g => (
+                                  <option key={g} value={g} disabled={g === selectedGroup1}>{g}</option>
+                                ))}
+                              </select>
+                            </div>
+                          </div>
+
+                          {/* 発症日からの日数範囲指定 */}
+                          <div style={{
+                            padding: '12px',
+                            background: '#f0f9ff',
+                            borderRadius: '8px',
+                            marginBottom: '16px',
+                            border: '1px solid #bae6fd'
+                          }}>
+                            <label style={{...styles.inputLabel, marginBottom: '8px', display: 'block'}}>
+                              📅 発症からの日数で絞り込み（任意）
+                            </label>
+                            <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                              <span style={{fontSize: '13px', color: '#475569'}}>Day</span>
+                              <input
+                                type="number"
+                                value={dayRangeStart}
+                                onChange={(e) => setDayRangeStart(e.target.value)}
+                                style={{...styles.input, width: '80px', padding: '6px 10px'}}
+                                placeholder="開始"
+                              />
+                              <span style={{fontSize: '13px', color: '#475569'}}>〜</span>
+                              <input
+                                type="number"
+                                value={dayRangeEnd}
+                                onChange={(e) => setDayRangeEnd(e.target.value)}
+                                style={{...styles.input, width: '80px', padding: '6px 10px'}}
+                                placeholder="終了"
+                              />
+                              <span style={{fontSize: '12px', color: '#6b7280'}}>日目</span>
+                              {(dayRangeStart !== '' || dayRangeEnd !== '') && (
+                                <button
+                                  onClick={() => { setDayRangeStart(''); setDayRangeEnd(''); }}
+                                  style={{
+                                    background: '#e2e8f0',
+                                    border: 'none',
+                                    borderRadius: '4px',
+                                    padding: '4px 8px',
+                                    fontSize: '11px',
+                                    cursor: 'pointer',
+                                    color: '#475569'
+                                  }}
+                                >
+                                  クリア
+                                </button>
+                              )}
+                            </div>
+                            <p style={{fontSize: '11px', color: '#64748b', marginTop: '6px', marginBottom: 0}}>
+                              例: Day 0〜3 で急性期、Day 7〜14 で亜急性期のデータのみを比較
+                            </p>
+                          </div>
+
+                          <p style={{fontSize: '12px', color: '#6b7280', marginBottom: '12px'}}>
+                            ※ 上で選択した検査項目について、2群間の統計比較を行います
+                            {(dayRangeStart !== '' || dayRangeEnd !== '') && (
+                              <span style={{color: '#7c3aed', fontWeight: '500'}}>
+                                （Day {dayRangeStart || '?'} 〜 {dayRangeEnd || '?'} のみ）
+                              </span>
+                            )}
+                          </p>
+
+                          <button
+                            onClick={runGroupComparison}
+                            disabled={!selectedGroup1 || !selectedGroup2 || selectedItems.length === 0 || isLoadingAnalysis}
+                            style={{
+                              ...styles.primaryButton,
+                              width: '100%',
+                              backgroundColor: '#7c3aed',
+                              opacity: (!selectedGroup1 || !selectedGroup2 || selectedItems.length === 0) ? 0.5 : 1
+                            }}
+                          >
+                            {isLoadingAnalysis ? '計算中...' : '統計比較を実行'}
+                          </button>
+
+                          {/* 統計結果表示 */}
+                          {comparisonResults && comparisonResults.length > 0 && (
+                            <div style={{marginTop: '20px'}}>
+                              <div style={{overflowX: 'auto'}}>
+                                <table style={{
+                                  width: '100%',
+                                  borderCollapse: 'collapse',
+                                  fontSize: '12px',
+                                  background: 'white',
+                                  borderRadius: '8px',
+                                  overflow: 'hidden'
+                                }}>
+                                  <thead>
+                                    <tr style={{background: '#f1f5f9'}}>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>項目</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}} colSpan="3">{selectedGroup1}</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}} colSpan="3">{selectedGroup2}</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>t検定 p値</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>U検定 p値</th>
+                                    </tr>
+                                    <tr style={{background: '#f8fafc', fontSize: '11px'}}>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}></th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>n</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>Mean±SD</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>Median</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>n</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>Mean±SD</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>Median</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}></th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}></th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {comparisonResults.map((r, idx) => (
+                                      <tr key={idx} style={{background: idx % 2 === 0 ? 'white' : '#f8fafc'}}>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', fontWeight: '500'}}>{r.item}</td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group1.n}</td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group1.mean}±{r.group1.std}</td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group1.median}</td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group2.n}</td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group2.mean}±{r.group2.std}</td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group2.median}</td>
+                                        <td style={{
+                                          padding: '8px',
+                                          borderBottom: '1px solid #e2e8f0',
+                                          textAlign: 'center',
+                                          fontWeight: r.tTest.significant ? 'bold' : 'normal',
+                                          color: r.tTest.significant ? '#dc2626' : 'inherit'
+                                        }}>
+                                          {r.tTest.p || '-'}{r.tTest.significant && ' *'}
+                                        </td>
+                                        <td style={{
+                                          padding: '8px',
+                                          borderBottom: '1px solid #e2e8f0',
+                                          textAlign: 'center',
+                                          fontWeight: r.mannWhitney.significant ? 'bold' : 'normal',
+                                          color: r.mannWhitney.significant ? '#dc2626' : 'inherit'
+                                        }}>
+                                          {r.mannWhitney.p || '-'}{r.mannWhitney.significant && ' *'}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                              <p style={{fontSize: '11px', color: '#6b7280', marginTop: '8px'}}>
+                                * p &lt; 0.05（統計的に有意）　t検定: Welchのt検定（パラメトリック）　U検定: Mann-Whitney U検定（ノンパラメトリック）
+                              </p>
+                              <button
+                                onClick={exportComparisonCSV}
+                                style={{
+                                  ...styles.addButton,
+                                  backgroundColor: '#28a745',
+                                  padding: '8px 16px',
+                                  fontSize: '13px',
+                                  marginTop: '12px'
+                                }}
+                              >
+                                📊 統計結果CSVダウンロード
+                              </button>
+                            </div>
+                          )}
+
+                          {comparisonResults && comparisonResults.length === 0 && (
+                            <div style={{marginTop: '16px', padding: '16px', background: '#fef3c7', borderRadius: '8px', color: '#92400e', fontSize: '13px'}}>
+                              選択した項目にデータがありません。
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </>
+                  )}
+                </div>
+              </>
+            )}
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => {
+                  setShowAnalysisModal(false);
+                  setAnalysisData(null);
+                  setSelectedPatientIds([]);
+                  setSelectedItems([]);
+                  setComparisonResults(null);
+                  setDayRangeStart('');
+                  setDayRangeEnd('');
+                }}
+                style={styles.cancelButton}
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// 患者詳細画面
+// ============================================================
+function PatientDetailView({ patient, onBack }) {
+  const { user } = useAuth();
+  const [labResults, setLabResults] = useState([]);
+  const [showAddLabModal, setShowAddLabModal] = useState(false);
+  const [selectedImage, setSelectedImage] = useState(null);
+  const [ocrResults, setOcrResults] = useState(null);
+  const [labDate, setLabDate] = useState('');
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState(0);
+  const [editingMemo, setEditingMemo] = useState(false);
+  const [memoText, setMemoText] = useState(patient?.memo || '');
+  const [editingPatientInfo, setEditingPatientInfo] = useState(false);
+  const [editedPatient, setEditedPatient] = useState({
+    diagnosis: patient?.diagnosis || '',
+    group: patient?.group || '',
+    onsetDate: patient?.onsetDate || '',
+  });
+  const [manualItems, setManualItems] = useState([]);
+  const [manualItem, setManualItem] = useState({ item: '', value: '', unit: '' });
+
+  // Excelインポート用state
+  const [showExcelModal, setShowExcelModal] = useState(false);
+  const [excelData, setExcelData] = useState(null);
+  const [excelSheets, setExcelSheets] = useState([]);
+  const [selectedSheet, setSelectedSheet] = useState('');
+  const [parsedExcelData, setParsedExcelData] = useState([]);
+  const [isImporting, setIsImporting] = useState(false);
+
+  // 既存検査データ編集用state
+  const [editingLabId, setEditingLabId] = useState(null);
+  const [editLabItem, setEditLabItem] = useState({ item: '', value: '', unit: '' });
+
+  // 臨床経過用state
+  const [clinicalEvents, setClinicalEvents] = useState([]);
+  const [showAddEventModal, setShowAddEventModal] = useState(false);
+  const [lastUsedDate, setLastUsedDate] = useState(''); // 最後に使用した日付を記憶
+  const [newEvent, setNewEvent] = useState({
+    eventType: '',
+    customEventType: '',
+    startDate: '',
+    endDate: '',
+    severity: '',
+    jcs: '',
+    frequency: '',
+    presence: '',
+    note: ''
+  });
+  const [editingEventId, setEditingEventId] = useState(null);
+  const [editEvent, setEditEvent] = useState({
+    eventType: '',
+    startDate: '',
+    endDate: '',
+    severity: '',
+    jcs: '',
+    frequency: '',
+    presence: '',
+    note: ''
+  });
+
+  // イベント種類と入力形式の定義
+  const eventTypeConfig = {
+    '意識障害': { inputType: 'jcs', label: 'JCSスケール' },
+    'てんかん発作': { inputType: 'frequency', label: '頻度' },
+    '不随意運動': { inputType: 'frequency', label: '頻度' },
+    '麻痺': { inputType: 'severity', label: '重症度' },
+    '感覚障害': { inputType: 'severity', label: '重症度' },
+    '失語': { inputType: 'severity', label: '重症度' },
+    '認知機能障害': { inputType: 'severity', label: '重症度' },
+    '精神症状': { inputType: 'severity', label: '重症度' },
+    '発熱': { inputType: 'severity', label: '重症度' },
+    '頭痛': { inputType: 'presence', label: '有無' },
+    '髄膜刺激症状': { inputType: 'presence', label: '有無' },
+    '人工呼吸器管理': { inputType: 'presence', label: '有無' },
+    'ICU入室': { inputType: 'presence', label: '有無' },
+    'その他': { inputType: 'custom', label: '' }
+  };
+
+  const [availableEventTypes, setAvailableEventTypes] = useState(Object.keys(eventTypeConfig));
+
+  // JCSスケール選択肢
+  const jcsOptions = [
+    { value: '0', label: '0 (清明)' },
+    { value: 'I-1', label: 'I-1 (見当識保たれるがボンヤリ)' },
+    { value: 'I-2', label: 'I-2 (見当識障害あり)' },
+    { value: 'I-3', label: 'I-3 (自分の名前・生年月日が言えない)' },
+    { value: 'II-10', label: 'II-10 (普通の呼びかけで開眼)' },
+    { value: 'II-20', label: 'II-20 (大声・体揺すりで開眼)' },
+    { value: 'II-30', label: 'II-30 (痛み刺激+呼びかけでかろうじて開眼)' },
+    { value: 'III-100', label: 'III-100 (痛み刺激で払いのける)' },
+    { value: 'III-200', label: 'III-200 (痛み刺激で手足を動かす・顔をしかめる)' },
+    { value: 'III-300', label: 'III-300 (痛み刺激に反応しない)' }
+  ];
+
+  // 頻度選択肢
+  const frequencyOptions = [
+    { value: 'hourly', label: '毎時間' },
+    { value: 'several_daily', label: '1日数回' },
+    { value: 'daily', label: '毎日' },
+    { value: 'several_weekly', label: '週数回' },
+    { value: 'weekly', label: '週1回' },
+    { value: 'monthly', label: '月1回' },
+    { value: 'rare', label: '稀' }
+  ];
+
+  // ========================================
+  // 治療薬管理用state
+  // ========================================
+  const [treatments, setTreatments] = useState([]);
+  const [showAddTreatmentModal, setShowAddTreatmentModal] = useState(false);
+  const [lastUsedTreatmentDate, setLastUsedTreatmentDate] = useState('');
+  const [newTreatment, setNewTreatment] = useState({
+    category: '',
+    medicationName: '',
+    customMedication: '',
+    dosage: '',
+    dosageUnit: '',
+    startDate: '',
+    endDate: '',
+    note: ''
+  });
+  const [editingTreatmentId, setEditingTreatmentId] = useState(null);
+  const [editTreatment, setEditTreatment] = useState({
+    category: '',
+    medicationName: '',
+    dosage: '',
+    dosageUnit: '',
+    startDate: '',
+    endDate: '',
+    note: ''
+  });
+
+  // プレゼン用統合タイムライン
+  const [showClinicalTimeline, setShowClinicalTimeline] = useState(false);
+  const timelineRef = useRef(null);
+
+  // 経時データオーバーレイ用state
+  const [showTimeSeriesOverlay, setShowTimeSeriesOverlay] = useState(false);
+  const [selectedLabItemsForChart, setSelectedLabItemsForChart] = useState([]);
+  const [showTreatmentsOnChart, setShowTreatmentsOnChart] = useState(false);
+  const [selectedTreatmentsForChart, setSelectedTreatmentsForChart] = useState([]);
+  const [showEventsOnChart, setShowEventsOnChart] = useState(false);
+  const [selectedEventsForChart, setSelectedEventsForChart] = useState([]);
+  const [timelinePosition, setTimelinePosition] = useState('below'); // 'above' or 'below'
+  const [timelineDisplayMode, setTimelineDisplayMode] = useState('separate'); // 'separate' or 'overlay'
+  const overlayChartRef = useRef(null);
+
+  // 治療薬カテゴリと薬剤リスト
+  const treatmentCategories = {
+    '抗てんかん薬': {
+      medications: [
+        'バルプロ酸（デパケン）',
+        'レベチラセタム（イーケプラ）',
+        'ラコサミド（ビムパット）',
+        'カルバマゼピン（テグレトール）',
+        'フェニトイン（アレビアチン）',
+        'フェノバルビタール',
+        'クロバザム（マイスタン）',
+        'クロナゼパム（リボトリール）',
+        'ゾニサミド（エクセグラン）',
+        'トピラマート（トピナ）',
+        'ペランパネル（フィコンパ）',
+        'ガバペンチン（ガバペン）',
+        'ミダゾラム',
+        'ジアゼパム（セルシン）',
+        'ロラゼパム（ワイパックス）',
+        'その他'
+      ],
+      defaultUnit: 'mg/日'
+    },
+    'ステロイド': {
+      medications: [
+        'IVMP（メチルプレドニゾロンパルス）',
+        'PSL（プレドニゾロン）',
+        'ベタメタゾン（リンデロン）',
+        'デキサメタゾン（デカドロン）',
+        'ヒドロコルチゾン（ソルコーテフ）',
+        'その他'
+      ],
+      defaultUnit: 'mg/日'
+    },
+    '免疫グロブリン': {
+      medications: [
+        'IVIG（大量免疫グロブリン療法）',
+        'その他'
+      ],
+      defaultUnit: 'mg/kg/日'
+    },
+    '血漿交換': {
+      medications: [
+        '単純血漿交換（PE）',
+        '二重濾過血漿交換（DFPP）',
+        '免疫吸着療法（IA）',
+        'その他'
+      ],
+      defaultUnit: '回'
+    },
+    '免疫抑制剤': {
+      medications: [
+        'タクロリムス（プログラフ）',
+        'シクロスポリン（ネオーラル）',
+        'アザチオプリン（イムラン）',
+        'ミコフェノール酸モフェチル（セルセプト）',
+        'シクロホスファミド（エンドキサン）',
+        'リツキシマブ（リツキサン）',
+        'その他'
+      ],
+      defaultUnit: 'mg/日'
+    },
+    '抗ウイルス薬': {
+      medications: [
+        'アシクロビル（ゾビラックス）',
+        'ガンシクロビル',
+        'バラシクロビル（バルトレックス）',
+        'その他'
+      ],
+      defaultUnit: 'mg/日'
+    },
+    '抗菌薬': {
+      medications: [
+        'セフトリアキソン（ロセフィン）',
+        'メロペネム（メロペン）',
+        'バンコマイシン',
+        'アンピシリン',
+        'その他'
+      ],
+      defaultUnit: 'g/日'
+    },
+    '抗浮腫薬': {
+      medications: [
+        'グリセオール',
+        'マンニトール',
+        '高張食塩水',
+        'その他'
+      ],
+      defaultUnit: 'mL/日'
+    },
+    'その他': {
+      medications: [],
+      defaultUnit: ''
+    }
+  };
+
+  // 投与量単位の選択肢
+  const dosageUnits = [
+    'mg/日',
+    'mg/回',
+    'mg/kg/日',
+    'mg/kg',
+    'g/日',
+    'g/kg/日',
+    'g/kg',
+    'mL/日',
+    '回',
+    '単位/日',
+    'μg/日',
+    'その他'
+  ];
+
+  // 検査データをリアルタイム取得
+  useEffect(() => {
+    if (!user || !patient) return;
+
+    const q = query(
+      collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+      orderBy('date', 'desc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const labData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setLabResults(labData);
+    });
+
+    return unsubscribe;
+  }, [user, patient]);
+
+  // 臨床経過データをリアルタイム取得
+  useEffect(() => {
+    if (!user || !patient) return;
+
+    const q = query(
+      collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+      orderBy('startDate', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const eventsData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setClinicalEvents(eventsData);
+    });
+
+    return unsubscribe;
+  }, [user, patient]);
+
+  // 治療薬データをリアルタイム取得
+  useEffect(() => {
+    if (!user || !patient) return;
+
+    const q = query(
+      collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+      orderBy('startDate', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const treatmentData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      }));
+      setTreatments(treatmentData);
+    });
+
+    return unsubscribe;
+  }, [user, patient]);
+
+  // 新規イベント追加モーダルを開く（日付を自動入力）
+  const openAddEventModal = () => {
+    setNewEvent({
+      eventType: '',
+      customEventType: '',
+      startDate: lastUsedDate || '', // 最後に使用した日付を自動入力
+      endDate: '',
+      severity: '',
+      jcs: '',
+      frequency: '',
+      presence: '',
+      note: ''
+    });
+    setShowAddEventModal(true);
+  };
+
+  // イベントをコピーして新規追加モーダルを開く
+  const copyEvent = (event) => {
+    // イベントタイプが定義済みかカスタムか判定
+    const isCustomType = !Object.keys(eventTypeConfig).includes(event.eventType);
+
+    setNewEvent({
+      eventType: isCustomType ? 'その他' : event.eventType,
+      customEventType: isCustomType ? event.eventType : '',
+      startDate: event.startDate || lastUsedDate || '',
+      endDate: event.endDate || '',
+      severity: event.severity || '',
+      jcs: event.jcs || '',
+      frequency: event.frequency || '',
+      presence: event.presence || '',
+      note: '' // メモはコピーしない
+    });
+    setShowAddEventModal(true);
+  };
+
+  // 臨床経過イベントを追加
+  const addClinicalEvent = async () => {
+    const eventType = newEvent.eventType === 'その他' ? newEvent.customEventType : newEvent.eventType;
+    if (!eventType || !newEvent.startDate) {
+      alert('イベント種類と開始日は必須です');
+      return;
+    }
+
+    const config = eventTypeConfig[newEvent.eventType] || { inputType: 'severity' };
+
+    try {
+      await addDoc(
+        collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+        {
+          eventType: eventType,
+          inputType: config.inputType,
+          startDate: newEvent.startDate,
+          endDate: newEvent.endDate || null,
+          severity: newEvent.severity || null,
+          jcs: newEvent.jcs || null,
+          frequency: newEvent.frequency || null,
+          presence: newEvent.presence || null,
+          note: newEvent.note || '',
+          createdAt: serverTimestamp()
+        }
+      );
+
+      // 最後に使用した日付を記憶
+      setLastUsedDate(newEvent.startDate);
+
+      // カスタムイベントタイプを追加
+      if (newEvent.eventType === 'その他' && newEvent.customEventType) {
+        if (!availableEventTypes.includes(newEvent.customEventType)) {
+          setAvailableEventTypes([...availableEventTypes.slice(0, -1), newEvent.customEventType, 'その他']);
+        }
+      }
+
+      setNewEvent({
+        eventType: '',
+        customEventType: '',
+        startDate: '',
+        endDate: '',
+        severity: '',
+        jcs: '',
+        frequency: '',
+        presence: '',
+        note: ''
+      });
+      setShowAddEventModal(false);
+    } catch (err) {
+      console.error('Error adding clinical event:', err);
+      alert('イベントの追加に失敗しました');
+    }
+  };
+
+  // 臨床経過イベントを削除
+  const deleteClinicalEvent = async (eventId) => {
+    if (!confirm('このイベントを削除しますか？')) return;
+
+    try {
+      await deleteDoc(
+        doc(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents', eventId)
+      );
+    } catch (err) {
+      console.error('Error deleting clinical event:', err);
+    }
+  };
+
+  // 臨床経過イベントの編集を開始
+  const startEditEvent = (event) => {
+    setEditingEventId(event.id);
+    setEditEvent({
+      eventType: event.eventType || '',
+      startDate: event.startDate || '',
+      endDate: event.endDate || '',
+      severity: event.severity || '',
+      jcs: event.jcs || '',
+      frequency: event.frequency || '',
+      presence: event.presence || '',
+      note: event.note || ''
+    });
+  };
+
+  // 臨床経過イベントの編集をキャンセル
+  const cancelEditEvent = () => {
+    setEditingEventId(null);
+    setEditEvent({
+      eventType: '',
+      startDate: '',
+      endDate: '',
+      severity: '',
+      jcs: '',
+      frequency: '',
+      presence: '',
+      note: ''
+    });
+  };
+
+  // 臨床経過イベントを更新
+  const updateClinicalEvent = async () => {
+    if (!editEvent.eventType || !editEvent.startDate) {
+      alert('イベント種類と開始日は必須です');
+      return;
+    }
+
+    try {
+      await updateDoc(
+        doc(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents', editingEventId),
+        {
+          eventType: editEvent.eventType,
+          startDate: editEvent.startDate,
+          endDate: editEvent.endDate || null,
+          severity: editEvent.severity || null,
+          jcs: editEvent.jcs || null,
+          frequency: editEvent.frequency || null,
+          presence: editEvent.presence || null,
+          note: editEvent.note || ''
+        }
+      );
+      cancelEditEvent();
+    } catch (err) {
+      console.error('Error updating clinical event:', err);
+      alert('イベントの更新に失敗しました');
+    }
+  };
+
+  // ========================================
+  // 治療薬管理関数
+  // ========================================
+
+  // 治療薬追加モーダルを開く（日付を自動入力）
+  const openAddTreatmentModal = () => {
+    setNewTreatment({
+      category: '',
+      medicationName: '',
+      customMedication: '',
+      dosage: '',
+      dosageUnit: '',
+      startDate: lastUsedTreatmentDate || '',
+      endDate: '',
+      note: ''
+    });
+    setShowAddTreatmentModal(true);
+  };
+
+  // 治療薬をコピーして新規追加モーダルを開く
+  const copyTreatment = (treatment) => {
+    // カテゴリと薬剤名の判定
+    let category = treatment.category || 'その他';
+    let medicationName = treatment.medicationName || '';
+    let customMedication = '';
+
+    // その他カテゴリか、カテゴリ内にない薬剤の場合
+    if (category === 'その他' ||
+        (treatmentCategories[category] &&
+         !treatmentCategories[category].medications.includes(medicationName))) {
+      customMedication = medicationName;
+      if (category !== 'その他') {
+        medicationName = 'その他';
+      }
+    }
+
+    setNewTreatment({
+      category: category,
+      medicationName: medicationName,
+      customMedication: customMedication,
+      dosage: '', // 容量は空にして再入力を促す
+      dosageUnit: treatment.dosageUnit || '',
+      startDate: treatment.startDate || lastUsedTreatmentDate || '',
+      endDate: treatment.endDate || '',
+      note: ''
+    });
+    setShowAddTreatmentModal(true);
+  };
+
+  // 治療薬を追加
+  const addTreatment = async () => {
+    const medicationName = newTreatment.medicationName === 'その他'
+      ? newTreatment.customMedication
+      : newTreatment.medicationName;
+
+    if (!newTreatment.category || !medicationName || !newTreatment.startDate) {
+      alert('カテゴリ、薬剤名、開始日は必須です');
+      return;
+    }
+
+    try {
+      await addDoc(
+        collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+        {
+          category: newTreatment.category,
+          medicationName: medicationName,
+          dosage: newTreatment.dosage || null,
+          dosageUnit: newTreatment.dosageUnit || null,
+          startDate: newTreatment.startDate,
+          endDate: newTreatment.endDate || null,
+          note: newTreatment.note || '',
+          createdAt: serverTimestamp()
+        }
+      );
+
+      // 最後に使用した日付を記憶
+      setLastUsedTreatmentDate(newTreatment.startDate);
+
+      setNewTreatment({
+        category: '',
+        medicationName: '',
+        customMedication: '',
+        dosage: '',
+        dosageUnit: '',
+        startDate: '',
+        endDate: '',
+        note: ''
+      });
+      setShowAddTreatmentModal(false);
+    } catch (err) {
+      console.error('Error adding treatment:', err);
+      alert('治療薬の追加に失敗しました');
+    }
+  };
+
+  // 治療薬を削除
+  const deleteTreatment = async (treatmentId) => {
+    if (!confirm('この治療薬記録を削除しますか？')) return;
+
+    try {
+      await deleteDoc(
+        doc(db, 'users', user.uid, 'patients', patient.id, 'treatments', treatmentId)
+      );
+    } catch (err) {
+      console.error('Error deleting treatment:', err);
+    }
+  };
+
+  // 治療薬の編集を開始
+  const startEditTreatment = (treatment) => {
+    setEditingTreatmentId(treatment.id);
+    setEditTreatment({
+      category: treatment.category || '',
+      medicationName: treatment.medicationName || '',
+      dosage: treatment.dosage || '',
+      dosageUnit: treatment.dosageUnit || '',
+      startDate: treatment.startDate || '',
+      endDate: treatment.endDate || '',
+      note: treatment.note || ''
+    });
+  };
+
+  // 治療薬の編集をキャンセル
+  const cancelEditTreatment = () => {
+    setEditingTreatmentId(null);
+    setEditTreatment({
+      category: '',
+      medicationName: '',
+      dosage: '',
+      dosageUnit: '',
+      startDate: '',
+      endDate: '',
+      note: ''
+    });
+  };
+
+  // 治療薬を更新
+  const updateTreatment = async () => {
+    if (!editTreatment.medicationName || !editTreatment.startDate) {
+      alert('薬剤名と開始日は必須です');
+      return;
+    }
+
+    try {
+      await updateDoc(
+        doc(db, 'users', user.uid, 'patients', patient.id, 'treatments', editingTreatmentId),
+        {
+          category: editTreatment.category,
+          medicationName: editTreatment.medicationName,
+          dosage: editTreatment.dosage || null,
+          dosageUnit: editTreatment.dosageUnit || null,
+          startDate: editTreatment.startDate,
+          endDate: editTreatment.endDate || null,
+          note: editTreatment.note || ''
+        }
+      );
+      cancelEditTreatment();
+    } catch (err) {
+      console.error('Error updating treatment:', err);
+      alert('治療薬の更新に失敗しました');
+    }
+  };
+
+  // 同じ薬剤の投与量履歴を取得（グラフ用）
+  const getMedicationDosageHistory = (medicationName) => {
+    return treatments
+      .filter(t => t.medicationName === medicationName && t.dosage)
+      .sort((a, b) => new Date(a.startDate) - new Date(b.startDate))
+      .map(t => ({
+        date: t.startDate,
+        dosage: parseFloat(t.dosage),
+        unit: t.dosageUnit,
+        dayFromOnset: calcDaysFromOnset(t.startDate)
+      }));
+  };
+
+  // 発症日からの日数を計算
+  const calcDaysFromOnset = (dateStr) => {
+    if (!patient.onsetDate || !dateStr) return null;
+    const onset = new Date(patient.onsetDate);
+    const date = new Date(dateStr);
+    return Math.ceil((date - onset) / (1000 * 60 * 60 * 24));
+  };
+
+  const handleImageUpload = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setSelectedImage(URL.createObjectURL(file));
+    setIsProcessing(true);
+    setOcrProgress(0);
+
+    const result = await performOCR(file, setOcrProgress);
+    
+    if (result.success) {
+      setOcrResults(result.data);
+    } else {
+      console.error('OCR failed:', result.error);
+      setOcrResults([]);
+    }
+    
+    setIsProcessing(false);
+  };
+
+  const addManualItem = () => {
+    if (!manualItem.item || !manualItem.value) return;
+    
+    const newItem = {
+      item: manualItem.item.toUpperCase(),
+      value: parseFloat(manualItem.value),
+      unit: manualItem.unit || labItemUnits[manualItem.item.toUpperCase()] || ''
+    };
+    
+    if (ocrResults) {
+      setOcrResults([...ocrResults, newItem]);
+    } else {
+      setOcrResults([newItem]);
+    }
+    
+    setManualItem({ item: '', value: '', unit: '' });
+  };
+
+  const saveLabResults = async () => {
+    if (!ocrResults || ocrResults.length === 0 || !labDate) return;
+
+    try {
+      await addDoc(
+        collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+        {
+          date: labDate,
+          data: ocrResults,
+          createdAt: serverTimestamp()
+        }
+      );
+
+      // 患者の検査件数を更新
+      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+        labCount: (labResults.length || 0) + 1
+      });
+
+      setShowAddLabModal(false);
+      setOcrResults(null);
+      setSelectedImage(null);
+      setLabDate('');
+    } catch (err) {
+      console.error('Error saving lab results:', err);
+    }
+  };
+
+  // ============================================
+  // Excelインポート機能
+  // ============================================
+  const handleExcelUpload = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (evt) => {
+      const data = evt.target.result;
+      const workbook = XLSX.read(data, { type: 'array' });
+      setExcelData(workbook);
+      setExcelSheets(workbook.SheetNames);
+      setSelectedSheet(workbook.SheetNames[0]);
+      parseExcelSheet(workbook, workbook.SheetNames[0]);
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  const parseExcelSheet = (workbook, sheetName) => {
+    const sheet = workbook.Sheets[sheetName];
+    const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+
+    // シート名から検体タイプを判定
+    const specimenType = sheetName.includes('CSF') ? 'CSF' :
+                         sheetName.includes('Serum') ? 'Serum' : '';
+
+    // ヘッダー行を探す（検査項目、単位、Day1...）
+    let headerRowIndex = -1;
+    let dateRowIndex = -1;
+
+    for (let i = 0; i < Math.min(10, jsonData.length); i++) {
+      const row = jsonData[i];
+      if (row && row[0] === '検査項目') {
+        headerRowIndex = i;
+      }
+      if (row && row[0] === '採取日') {
+        dateRowIndex = i;
+      }
+    }
+
+    if (headerRowIndex === -1) {
+      console.log('ヘッダー行が見つかりません');
+      setParsedExcelData([]);
+      return;
+    }
+
+    const headerRow = jsonData[headerRowIndex];
+    const dateRow = jsonData[dateRowIndex];
+
+    // 日付列のインデックスを取得（Day1, Day3, Day7...）
+    const dateColumns = [];
+    for (let i = 2; i < headerRow.length; i++) {
+      if (headerRow[i] && headerRow[i].toString().startsWith('Day')) {
+        const dateValue = dateRow ? dateRow[i] : null;
+        let formattedDate = '';
+
+        if (dateValue) {
+          // Excelの日付をパース
+          if (typeof dateValue === 'number') {
+            const date = XLSX.SSF.parse_date_code(dateValue);
+            formattedDate = `${date.y}-${String(date.m).padStart(2,'0')}-${String(date.d).padStart(2,'0')}`;
+          } else {
+            formattedDate = dateValue.toString().replace(/\//g, '-');
+          }
+        }
+
+        dateColumns.push({
+          index: i,
+          day: headerRow[i],
+          date: formattedDate
+        });
+      }
+    }
+
+    // 検査データを抽出
+    const labDataByDate = {};
+
+    for (let i = headerRowIndex + 1; i < jsonData.length; i++) {
+      const row = jsonData[i];
+      if (!row || !row[0]) continue;
+
+      const itemName = row[0].toString().trim();
+      const unit = row[1] ? row[1].toString() : '';
+
+      // セクションヘッダーをスキップ
+      if (itemName.startsWith('【') || itemName === '') continue;
+
+      for (const col of dateColumns) {
+        const value = row[col.index];
+        if (value !== undefined && value !== null && value !== '' && !isNaN(parseFloat(value))) {
+          if (!labDataByDate[col.date]) {
+            labDataByDate[col.date] = {
+              date: col.date,
+              day: col.day,
+              specimen: specimenType,
+              data: []
+            };
+          }
+
+          labDataByDate[col.date].data.push({
+            item: itemName,
+            value: parseFloat(value),
+            unit: unit
+          });
+        }
+      }
+    }
+
+    const result = Object.values(labDataByDate).sort((a, b) => a.date.localeCompare(b.date));
+    console.log('Parsed Excel Data:', result);
+    setParsedExcelData(result);
+  };
+
+  const handleSheetChange = (sheetName) => {
+    setSelectedSheet(sheetName);
+    if (excelData) {
+      parseExcelSheet(excelData, sheetName);
+    }
+  };
+
+  const importExcelData = async () => {
+    if (parsedExcelData.length === 0) return;
+
+    setIsImporting(true);
+
+    try {
+      for (const dayData of parsedExcelData) {
+        if (dayData.data.length === 0) continue;
+
+        await addDoc(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          {
+            date: dayData.date,
+            specimen: dayData.specimen || '',
+            data: dayData.data,
+            source: 'excel',
+            createdAt: serverTimestamp()
+          }
+        );
+      }
+
+      // 患者の検査件数を更新
+      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+        labCount: (labResults.length || 0) + parsedExcelData.length
+      });
+
+      setShowExcelModal(false);
+      setExcelData(null);
+      setExcelSheets([]);
+      setParsedExcelData([]);
+      alert(`${parsedExcelData.length}件の検査データをインポートしました`);
+    } catch (err) {
+      console.error('Error importing Excel data:', err);
+      alert('インポートに失敗しました');
+    }
+
+    setIsImporting(false);
+  };
+
+  const deleteLabResult = async (labId) => {
+    if (!confirm('この検査データを削除しますか？')) return;
+
+    try {
+      await deleteDoc(
+        doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', labId)
+      );
+
+      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+        labCount: Math.max((labResults.length || 1) - 1, 0)
+      });
+    } catch (err) {
+      console.error('Error deleting lab result:', err);
+    }
+  };
+
+  // 既存の検査データに項目を追加
+  const addItemToLabResult = async (labId) => {
+    if (!editLabItem.item || !editLabItem.value) return;
+
+    const lab = labResults.find(l => l.id === labId);
+    if (!lab) return;
+
+    const newItem = {
+      item: editLabItem.item.toUpperCase(),
+      value: parseFloat(editLabItem.value) || editLabItem.value,
+      unit: editLabItem.unit || labItemUnits[editLabItem.item.toUpperCase()] || ''
+    };
+
+    const updatedData = [...(lab.data || []), newItem];
+
+    try {
+      await updateDoc(
+        doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', labId),
+        { data: updatedData }
+      );
+      setEditLabItem({ item: '', value: '', unit: '' });
+    } catch (err) {
+      console.error('Error adding item to lab result:', err);
+      alert('項目の追加に失敗しました');
+    }
+  };
+
+  // 既存の検査データから項目を削除
+  const removeItemFromLabResult = async (labId, itemIndex) => {
+    const lab = labResults.find(l => l.id === labId);
+    if (!lab) return;
+
+    const updatedData = lab.data.filter((_, idx) => idx !== itemIndex);
+
+    try {
+      await updateDoc(
+        doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', labId),
+        { data: updatedData }
+      );
+    } catch (err) {
+      console.error('Error removing item from lab result:', err);
+    }
+  };
+
+  const saveMemo = async () => {
+    try {
+      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+        memo: memoText
+      });
+      setEditingMemo(false);
+    } catch (err) {
+      console.error('Error updating memo:', err);
+    }
+  };
+
+  const savePatientInfo = async () => {
+    try {
+      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+        diagnosis: editedPatient.diagnosis,
+        group: editedPatient.group,
+        onsetDate: editedPatient.onsetDate,
+      });
+      // 親コンポーネントの患者データも更新されるようにonBackを呼ぶか、
+      // またはpatientオブジェクトを直接更新
+      patient.diagnosis = editedPatient.diagnosis;
+      patient.group = editedPatient.group;
+      patient.onsetDate = editedPatient.onsetDate;
+      setEditingPatientInfo(false);
+    } catch (err) {
+      console.error('Error updating patient info:', err);
+      alert('患者情報の更新に失敗しました');
+    }
+  };
+
+  return (
+    <div style={styles.mainContainer}>
+      <header style={styles.header}>
+        <div style={styles.headerLeft}>
+          <button onClick={onBack} style={styles.backButton}>
+            ← 戻る
+          </button>
+          <h1 style={styles.headerTitle}>{patient?.displayId}</h1>
+          <span style={styles.diagnosisBadge}>{patient?.diagnosis}</span>
+        </div>
+        <div style={{display: 'flex', gap: '10px'}}>
+          <button
+            onClick={() => setShowClinicalTimeline(true)}
+            style={{
+              padding: '8px 16px',
+              background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
+              color: 'white',
+              border: 'none',
+              borderRadius: '8px',
+              cursor: 'pointer',
+              fontSize: '13px',
+              fontWeight: '500',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px'
+            }}
+          >
+            📊 臨床経過タイムライン
+          </button>
+        </div>
+      </header>
+
+      <main style={styles.detailContent}>
+        {/* 基本情報セクション */}
+        <section style={styles.section}>
+          <div style={styles.sectionHeader}>
+            <h2 style={styles.sectionTitle}>基本情報</h2>
+            <button
+              onClick={() => {
+                if (editingPatientInfo) {
+                  // キャンセル時は元の値に戻す
+                  setEditedPatient({
+                    diagnosis: patient?.diagnosis || '',
+                    group: patient?.group || '',
+                    onsetDate: patient?.onsetDate || '',
+                  });
+                }
+                setEditingPatientInfo(!editingPatientInfo);
+              }}
+              style={styles.editButton}
+            >
+              {editingPatientInfo ? 'キャンセル' : '編集'}
+            </button>
+          </div>
+
+          {editingPatientInfo ? (
+            <div style={styles.infoGrid}>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>診断名</span>
+                <input
+                  type="text"
+                  value={editedPatient.diagnosis}
+                  onChange={(e) => setEditedPatient({...editedPatient, diagnosis: e.target.value})}
+                  style={{...styles.input, marginTop: '4px'}}
+                />
+              </div>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>群</span>
+                <input
+                  type="text"
+                  value={editedPatient.group}
+                  onChange={(e) => setEditedPatient({...editedPatient, group: e.target.value})}
+                  style={{...styles.input, marginTop: '4px'}}
+                  placeholder="例: 急性期群"
+                />
+              </div>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>発症日</span>
+                <input
+                  type="date"
+                  value={editedPatient.onsetDate}
+                  onChange={(e) => setEditedPatient({...editedPatient, onsetDate: e.target.value})}
+                  style={{...styles.input, marginTop: '4px'}}
+                />
+              </div>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>登録日</span>
+                <span style={styles.infoValue}>
+                  {patient?.createdAt?.toDate?.()?.toLocaleDateString('ja-JP') || '-'}
+                </span>
+              </div>
+              <div style={{gridColumn: '1 / -1', marginTop: '10px'}}>
+                <button onClick={savePatientInfo} style={styles.saveButton}>保存</button>
+              </div>
+            </div>
+          ) : (
+            <div style={styles.infoGrid}>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>診断名</span>
+                <span style={styles.infoValue}>{patient?.diagnosis || '未設定'}</span>
+              </div>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>群</span>
+                <span style={styles.infoValue}>{patient?.group || '未設定'}</span>
+              </div>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>発症日</span>
+                <span style={styles.infoValue}>{patient?.onsetDate || '未設定'}</span>
+              </div>
+              <div style={styles.infoItem}>
+                <span style={styles.infoLabel}>登録日</span>
+                <span style={styles.infoValue}>
+                  {patient?.createdAt?.toDate?.()?.toLocaleDateString('ja-JP') || '-'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          <div style={styles.memoSection}>
+            <div style={styles.memoHeader}>
+              <span style={styles.infoLabel}>メモ</span>
+              <button
+                onClick={() => setEditingMemo(!editingMemo)}
+                style={styles.editButton}
+              >
+                {editingMemo ? 'キャンセル' : '編集'}
+              </button>
+            </div>
+            {editingMemo ? (
+              <div>
+                <textarea
+                  value={memoText}
+                  onChange={(e) => setMemoText(e.target.value)}
+                  style={{...styles.input, minHeight: '100px', width: '100%', boxSizing: 'border-box'}}
+                />
+                <button onClick={saveMemo} style={styles.saveButton}>保存</button>
+              </div>
+            ) : (
+              <p style={styles.memoText}>{patient?.memo || 'メモなし'}</p>
+            )}
+          </div>
+        </section>
+
+        {/* 臨床経過セクション（治療薬と臨床イベントを統合） */}
+        <section style={styles.section}>
+          <div style={styles.sectionHeader}>
+            <h2 style={styles.sectionTitle}>臨床経過</h2>
+            <div style={{display: 'flex', gap: '8px'}}>
+              <button
+                onClick={openAddTreatmentModal}
+                style={{...styles.addLabButton, background: '#ecfdf5', color: '#047857'}}
+              >
+                <span>💊</span> 治療薬追加
+              </button>
+              <button
+                onClick={openAddEventModal}
+                style={{...styles.addLabButton, background: '#fef3c7', color: '#92400e'}}
+              >
+                <span>📋</span> 症状追加
+              </button>
+            </div>
+          </div>
+
+          {clinicalEvents.length === 0 && treatments.length === 0 ? (
+            <div style={styles.emptyLab}>
+              <p>臨床経過データはまだありません</p>
+              <p style={{fontSize: '13px', marginTop: '8px'}}>
+                治療薬や症状（意識障害、てんかん発作、不随意運動など）の経過を記録できます
+              </p>
+            </div>
+          ) : (
+            <>
+              {/* 臨床経過タイムライン（同一症状をまとめて表示・重症度の階段状変化） */}
+              {(() => {
+                // 発症日がない場合はスキップ
+                if (!patient.onsetDate) return null;
+
+                // 同じイベントタイプでグループ化
+                const eventGroups = {};
+                clinicalEvents.forEach(e => {
+                  const type = e.eventType;
+                  if (!eventGroups[type]) {
+                    eventGroups[type] = {
+                      type: type,
+                      inputType: e.inputType,
+                      entries: []
+                    };
+                  }
+                  eventGroups[type].entries.push(e);
+                });
+
+                // 各グループ内でソート
+                Object.values(eventGroups).forEach(group => {
+                  group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+                });
+
+                const groupList = Object.values(eventGroups).sort((a, b) => {
+                  const aFirst = a.entries[0]?.startDate || '';
+                  const bFirst = b.entries[0]?.startDate || '';
+                  return new Date(aFirst) - new Date(bFirst);
+                });
+
+                // タイムラインの範囲を計算
+                const allDays = clinicalEvents.flatMap(e => {
+                  const start = calcDaysFromOnset(e.startDate);
+                  const end = e.endDate ? calcDaysFromOnset(e.endDate) : start;
+                  return [start, end];
+                }).filter(d => d !== null);
+
+                if (allDays.length === 0) return null;
+
+                const minDay = Math.min(...allDays, 0);
+                const maxDay = Math.max(...allDays) + 3;
+                const dayRange = maxDay - minDay || 1;
+
+                // 症状タイプごとの色
+                const eventColors = {
+                  '意識障害': '#dc2626',
+                  'てんかん発作': '#ea580c',
+                  '不随意運動': '#d97706',
+                  '麻痺': '#ca8a04',
+                  '感覚障害': '#65a30d',
+                  '失語': '#16a34a',
+                  '認知機能障害': '#0d9488',
+                  '精神症状': '#0891b2',
+                  '発熱': '#ef4444',
+                  '頭痛': '#f97316',
+                  '髄膜刺激症状': '#84cc16',
+                  '人工呼吸器管理': '#7c3aed',
+                  'ICU入室': '#9333ea'
+                };
+
+                // 重症度スコア（高さ計算用）
+                const getSeverityScore = (event) => {
+                  if (event.jcs) {
+                    // JCSスコアを数値化
+                    if (event.jcs === '0') return 0;
+                    if (event.jcs.startsWith('I-')) return parseInt(event.jcs.split('-')[1]) || 1;
+                    if (event.jcs.startsWith('II-')) return 10 + (parseInt(event.jcs.split('-')[1]) || 10);
+                    if (event.jcs.startsWith('III-')) return 100 + (parseInt(event.jcs.split('-')[1]) || 100);
+                    return 1;
+                  }
+                  if (event.frequency) {
+                    const freqScores = { hourly: 6, several_daily: 5, daily: 4, several_weekly: 3, weekly: 2, monthly: 1, rare: 0.5 };
+                    return freqScores[event.frequency] || 1;
+                  }
+                  if (event.severity) {
+                    const sevScores = { '重症': 3, '中等症': 2, '軽症': 1 };
+                    return sevScores[event.severity] || 1;
+                  }
+                  if (event.presence) {
+                    return event.presence === 'あり' ? 1 : 0;
+                  }
+                  return 1;
+                };
+
+                // グループ内の最大スコア
+                const getMaxScore = (entries) => {
+                  const scores = entries.map(e => getSeverityScore(e)).filter(s => s > 0);
+                  return scores.length > 0 ? Math.max(...scores) : 1;
+                };
+
+                // 詳細ラベル取得
+                const getDetailLabel = (event) => {
+                  if (event.jcs) return `JCS ${event.jcs}`;
+                  if (event.frequency) {
+                    const freqLabels = { hourly: '毎時間', several_daily: '1日数回', daily: '毎日', several_weekly: '週数回', weekly: '週1回', monthly: '月1回', rare: '稀' };
+                    return freqLabels[event.frequency] || event.frequency;
+                  }
+                  if (event.severity) return event.severity;
+                  if (event.presence) return event.presence;
+                  return '';
+                };
+
+                return (
+                  <div style={{
+                    marginBottom: '20px',
+                    padding: '16px',
+                    background: 'white',
+                    borderRadius: '12px',
+                    border: '1px solid #e5e7eb'
+                  }}>
+                    <h3 style={{fontSize: '14px', fontWeight: '600', color: '#1f2937', marginBottom: '16px'}}>
+                      臨床経過タイムライン（症状推移）
+                    </h3>
+
+                    {/* X軸（Day表示） */}
+                    <div style={{marginLeft: '160px', marginBottom: '8px', position: 'relative', height: '20px'}}>
+                      {[...Array(Math.ceil(dayRange / 5) + 1)].map((_, i) => {
+                        const day = minDay + i * 5;
+                        if (day > maxDay) return null;
+                        const leftPercent = ((day - minDay) / dayRange) * 100;
+                        return (
+                          <span
+                            key={i}
+                            style={{
+                              position: 'absolute',
+                              left: `${leftPercent}%`,
+                              transform: 'translateX(-50%)',
+                              fontSize: '10px',
+                              color: '#6b7280'
+                            }}
+                          >
+                            Day {day}
+                          </span>
+                        );
+                      })}
+                    </div>
+
+                    {/* 症状ごとのタイムライン */}
+                    <div style={{display: 'flex', flexDirection: 'column', gap: '12px'}}>
+                      {groupList.map((group, gIdx) => {
+                        const color = eventColors[group.type] || '#6b7280';
+                        const maxScore = getMaxScore(group.entries);
+                        const maxBarHeight = 40;
+
+                        // 有無タイプ（presence）は固定高さ
+                        const isPresenceType = group.inputType === 'presence';
+
+                        return (
+                          <div key={gIdx} style={{display: 'flex', alignItems: 'flex-end', minHeight: `${maxBarHeight + 20}px`}}>
+                            {/* 症状名ラベル */}
+                            <div style={{
+                              width: '160px',
+                              flexShrink: 0,
+                              fontSize: '11px',
+                              color: '#374151',
+                              paddingRight: '10px',
+                              textAlign: 'right',
+                              paddingBottom: '4px'
+                            }}>
+                              <div style={{
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '6px',
+                                background: color + '20',
+                                border: `1px solid ${color}`,
+                                borderRadius: '4px',
+                                padding: '2px 8px',
+                                maxWidth: '100%'
+                              }}>
+                                <span style={{
+                                  width: '8px',
+                                  height: '8px',
+                                  borderRadius: '50%',
+                                  background: color,
+                                  flexShrink: 0
+                                }} />
+                                <span style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+                                  {group.type}
+                                </span>
+                              </div>
+                            </div>
+
+                            {/* タイムラインエリア */}
+                            <div style={{
+                              flex: 1,
+                              position: 'relative',
+                              height: `${maxBarHeight + 10}px`,
+                              background: '#fafafa',
+                              borderRadius: '4px',
+                              borderBottom: '1px solid #e5e7eb'
+                            }}>
+                              {group.entries.map((entry, eIdx) => {
+                                const startDay = calcDaysFromOnset(entry.startDate);
+                                const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
+                                const isSingleDay = startDay === endDay;
+                                const score = getSeverityScore(entry);
+                                const detailLabel = getDetailLabel(entry);
+
+                                const leftPercent = ((startDay - minDay) / dayRange) * 100;
+                                const widthPercent = isSingleDay ? 1.5 : ((endDay - startDay) / dayRange) * 100;
+
+                                // スコアに応じた高さ（階段状）
+                                const heightPercent = isPresenceType ? (entry.presence === 'あり' ? 60 : 20) : (score / maxScore) * 100;
+                                const barHeight = Math.max((heightPercent / 100) * maxBarHeight, 8);
+
+                                if (isSingleDay) {
+                                  // 単発は丸で表示
+                                  return (
+                                    <div
+                                      key={eIdx}
+                                      style={{
+                                        position: 'absolute',
+                                        left: `${leftPercent}%`,
+                                        bottom: '0',
+                                        transform: 'translateX(-50%)',
+                                        width: `${Math.max(barHeight * 0.6, 12)}px`,
+                                        height: `${barHeight}px`,
+                                        background: color,
+                                        borderRadius: '50% 50% 0 0'
+                                      }}
+                                      title={`${group.type}: Day ${startDay}${detailLabel ? ` (${detailLabel})` : ''}`}
+                                    />
+                                  );
+                                }
+
+                                // 継続症状は階段状のバー
+                                return (
+                                  <div
+                                    key={eIdx}
+                                    style={{
+                                      position: 'absolute',
+                                      left: `${leftPercent}%`,
+                                      width: `${Math.max(widthPercent, 0.8)}%`,
+                                      height: `${barHeight}px`,
+                                      bottom: '0',
+                                      background: `linear-gradient(180deg, ${color} 0%, ${color}cc 100%)`,
+                                      borderRadius: '4px 4px 0 0',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      overflow: 'visible',
+                                      borderLeft: eIdx > 0 ? '1px solid rgba(255,255,255,0.5)' : 'none'
+                                    }}
+                                    title={`${group.type}: Day ${startDay}${endDay !== startDay ? `〜${endDay}` : ''}${detailLabel ? ` (${detailLabel})` : ''}`}
+                                  >
+                                    {detailLabel && widthPercent > 5 && (
+                                      <span style={{
+                                        fontSize: '8px',
+                                        color: 'white',
+                                        fontWeight: '600',
+                                        textShadow: '0 0 2px rgba(0,0,0,0.4)',
+                                        whiteSpace: 'nowrap'
+                                      }}>
+                                        {detailLabel}
+                                      </span>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* 凡例 */}
+                    <div style={{marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #e5e7eb', display: 'flex', flexWrap: 'wrap', gap: '12px', fontSize: '10px'}}>
+                      {Object.entries(eventColors).map(([type, color]) => {
+                        const hasType = clinicalEvents.some(e => e.eventType === type);
+                        if (!hasType) return null;
+                        return (
+                          <div key={type} style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
+                            <div style={{width: '10px', height: '10px', borderRadius: '50%', background: color}} />
+                            <span style={{color: '#6b7280'}}>{type}</span>
+                          </div>
+                        );
+                      })}
+                      <div style={{color: '#6b7280', marginLeft: '8px'}}>
+                        ※ バーの高さ = 重症度/頻度（同一症状内で相対的）
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* 治療タイムライン（臨床経過セクション内） */}
+              {(() => {
+                if (!patient.onsetDate) return null;
+                if (treatments.length === 0) return null;
+
+                // 同じ薬剤名でグループ化
+                const medicationGroups = {};
+                treatments.forEach(t => {
+                  const name = t.medicationName;
+                  if (!medicationGroups[name]) {
+                    medicationGroups[name] = {
+                      name: name,
+                      category: t.category,
+                      entries: []
+                    };
+                  }
+                  medicationGroups[name].entries.push(t);
+                });
+
+                Object.values(medicationGroups).forEach(group => {
+                  group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+                });
+
+                const groupList = Object.values(medicationGroups).sort((a, b) => {
+                  const aFirst = a.entries[0]?.startDate || '';
+                  const bFirst = b.entries[0]?.startDate || '';
+                  return new Date(aFirst) - new Date(bFirst);
+                });
+
+                // タイムラインの範囲を計算（臨床経過と合わせる）
+                const allEventDays = clinicalEvents.flatMap(e => {
+                  const start = calcDaysFromOnset(e.startDate);
+                  const end = e.endDate ? calcDaysFromOnset(e.endDate) : start;
+                  return [start, end];
+                }).filter(d => d !== null);
+
+                const allTreatmentDays = treatments.flatMap(t => {
+                  const start = calcDaysFromOnset(t.startDate);
+                  const end = t.endDate ? calcDaysFromOnset(t.endDate) : start;
+                  return [start, end];
+                }).filter(d => d !== null);
+
+                const allDays = [...allEventDays, ...allTreatmentDays];
+                if (allDays.length === 0) return null;
+
+                const minDay = Math.min(...allDays, 0);
+                const maxDay = Math.max(...allDays) + 3;
+                const dayRange = maxDay - minDay || 1;
+
+                const categoryColors = {
+                  '抗てんかん薬': '#f59e0b',
+                  'ステロイド': '#ec4899',
+                  '免疫グロブリン': '#3b82f6',
+                  '血漿交換': '#6366f1',
+                  '免疫抑制剤': '#8b5cf6',
+                  '抗ウイルス薬': '#14b8a6',
+                  '抗菌薬': '#eab308',
+                  '抗浮腫薬': '#0ea5e9',
+                  'その他': '#6b7280'
+                };
+
+                const getMaxDosage = (entries) => {
+                  const dosages = entries.map(e => parseFloat(e.dosage) || 0).filter(d => d > 0);
+                  return dosages.length > 0 ? Math.max(...dosages) : 1;
+                };
+
+                return (
+                  <div style={{
+                    marginTop: '20px',
+                    padding: '16px',
+                    background: 'white',
+                    borderRadius: '12px',
+                    border: '1px solid #e5e7eb'
+                  }}>
+                    <h3 style={{fontSize: '14px', fontWeight: '600', color: '#1f2937', marginBottom: '16px'}}>
+                      治療タイムライン（投与量推移）
+                    </h3>
+
+                    {/* X軸（Day表示） */}
+                    <div style={{marginLeft: '160px', marginBottom: '8px', position: 'relative', height: '20px'}}>
+                      {[...Array(Math.ceil(dayRange / 5) + 1)].map((_, i) => {
+                        const day = minDay + i * 5;
+                        if (day > maxDay) return null;
+                        const leftPercent = ((day - minDay) / dayRange) * 100;
+                        return (
+                          <span
+                            key={i}
+                            style={{
+                              position: 'absolute',
+                              left: `${leftPercent}%`,
+                              transform: 'translateX(-50%)',
+                              fontSize: '10px',
+                              color: '#6b7280'
+                            }}
+                          >
+                            Day {day}
+                          </span>
+                        );
+                      })}
+                    </div>
+
+                    {/* 薬剤ごとのタイムライン */}
+                    <div style={{display: 'flex', flexDirection: 'column', gap: '12px'}}>
+                      {groupList.map((group, gIdx) => {
+                        const color = categoryColors[group.category] || categoryColors['その他'];
+                        const maxDosage = getMaxDosage(group.entries);
+                        const maxBarHeight = 40;
+
+                        const allSingleDay = group.entries.every(e => {
+                          const start = calcDaysFromOnset(e.startDate);
+                          const end = e.endDate ? calcDaysFromOnset(e.endDate) : start;
+                          return start === end;
+                        });
+
+                        return (
+                          <div key={gIdx} style={{display: 'flex', alignItems: 'flex-end', minHeight: `${maxBarHeight + 20}px`}}>
+                            <div style={{
+                              width: '160px',
+                              flexShrink: 0,
+                              fontSize: '11px',
+                              color: '#374151',
+                              paddingRight: '10px',
+                              textAlign: 'right',
+                              paddingBottom: '4px'
+                            }}>
+                              <div style={{
+                                display: 'inline-block',
+                                background: color + '20',
+                                border: `1px solid ${color}`,
+                                borderRadius: '4px',
+                                padding: '2px 6px',
+                                maxWidth: '100%',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap'
+                              }} title={group.name}>
+                                {group.name}
+                              </div>
+                            </div>
+
+                            <div style={{
+                              flex: 1,
+                              position: 'relative',
+                              height: `${maxBarHeight + 10}px`,
+                              background: '#fafafa',
+                              borderRadius: '4px',
+                              borderBottom: '1px solid #e5e7eb'
+                            }}>
+                              {group.entries.map((entry, eIdx) => {
+                                const startDay = calcDaysFromOnset(entry.startDate);
+                                const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
+                                const isSingleDay = startDay === endDay;
+                                const dosage = parseFloat(entry.dosage) || 0;
+
+                                const leftPercent = ((startDay - minDay) / dayRange) * 100;
+                                const widthPercent = isSingleDay ? 1.5 : ((endDay - startDay) / dayRange) * 100;
+                                const heightPercent = dosage > 0 ? (dosage / maxDosage) * 100 : 50;
+                                const barHeight = Math.max((heightPercent / 100) * maxBarHeight, 8);
+
+                                if (isSingleDay && allSingleDay) {
+                                  return (
+                                    <div
+                                      key={eIdx}
+                                      style={{
+                                        position: 'absolute',
+                                        left: `${leftPercent}%`,
+                                        bottom: '0',
+                                        transform: 'translateX(-50%)',
+                                        width: 0,
+                                        height: 0,
+                                        borderLeft: '10px solid transparent',
+                                        borderRight: '10px solid transparent',
+                                        borderBottom: `${barHeight}px solid ${color}`
+                                      }}
+                                      title={`${group.name}: Day ${startDay}${dosage ? ` (${entry.dosage}${entry.dosageUnit || ''})` : ''}`}
+                                    />
+                                  );
+                                }
+
+                                return (
+                                  <div
+                                    key={eIdx}
+                                    style={{
+                                      position: 'absolute',
+                                      left: `${leftPercent}%`,
+                                      width: `${Math.max(widthPercent, 0.8)}%`,
+                                      height: `${barHeight}px`,
+                                      bottom: '0',
+                                      background: color,
+                                      borderRadius: '2px 2px 0 0',
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      justifyContent: 'center',
+                                      overflow: 'visible',
+                                      borderLeft: eIdx > 0 ? '1px solid rgba(255,255,255,0.5)' : 'none'
+                                    }}
+                                    title={`${group.name}: Day ${startDay}${endDay !== startDay ? `〜${endDay}` : ''}${dosage ? ` (${entry.dosage}${entry.dosageUnit || ''})` : ''}`}
+                                  >
+                                    {dosage > 0 && widthPercent > 4 && (
+                                      <span style={{
+                                        fontSize: '9px',
+                                        color: 'white',
+                                        fontWeight: '600',
+                                        textShadow: '0 0 2px rgba(0,0,0,0.4)',
+                                        whiteSpace: 'nowrap'
+                                      }}>
+                                        {entry.dosage}
+                                      </span>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* 凡例 */}
+                    <div style={{marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #e5e7eb', display: 'flex', flexWrap: 'wrap', gap: '12px', fontSize: '10px'}}>
+                      {Object.entries(categoryColors).map(([cat, color]) => {
+                        const hasCat = treatments.some(t => t.category === cat);
+                        if (!hasCat) return null;
+                        return (
+                          <div key={cat} style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
+                            <div style={{width: '14px', height: '14px', background: color, borderRadius: '2px'}} />
+                            <span style={{color: '#6b7280'}}>{cat}</span>
+                          </div>
+                        );
+                      })}
+                      <div style={{color: '#6b7280', marginLeft: '8px'}}>
+                        ※ バーの高さ = 投与量（同一薬剤内で相対的）
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* イベント一覧（編集用） */}
+              <div style={{display: 'flex', flexDirection: 'column', gap: '10px'}}>
+                {clinicalEvents.map((event) => {
+                  const startDay = calcDaysFromOnset(event.startDate);
+                  const endDay = event.endDate ? calcDaysFromOnset(event.endDate) : null;
+                  const isEditing = editingEventId === event.id;
+                  const config = eventTypeConfig[event.eventType] || { inputType: 'severity' };
+
+                  // 編集モード
+                  if (isEditing) {
+                    return (
+                      <div
+                        key={event.id}
+                        style={{
+                          background: '#fefce8',
+                          border: '2px solid #facc15',
+                          borderRadius: '10px',
+                          padding: '16px'
+                        }}
+                      >
+                        <div style={{marginBottom: '12px', fontWeight: '600', color: '#a16207', fontSize: '14px'}}>
+                          編集中: {event.eventType}
+                        </div>
+                        <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px'}}>
+                          <div>
+                            <label style={{fontSize: '11px', color: '#6b7280', display: 'block', marginBottom: '4px'}}>開始日</label>
+                            <input
+                              type="date"
+                              value={editEvent.startDate}
+                              onChange={(e) => setEditEvent({...editEvent, startDate: e.target.value})}
+                              style={{...styles.input, width: '100%', padding: '8px'}}
+                            />
+                          </div>
+                          <div>
+                            <label style={{fontSize: '11px', color: '#6b7280', display: 'block', marginBottom: '4px'}}>終了日</label>
+                            <input
+                              type="date"
+                              value={editEvent.endDate}
+                              onChange={(e) => setEditEvent({...editEvent, endDate: e.target.value})}
+                              style={{...styles.input, width: '100%', padding: '8px'}}
+                            />
+                          </div>
+                        </div>
+
+                        {/* JCS入力 */}
+                        {config.inputType === 'jcs' && (
+                          <div style={{marginTop: '10px'}}>
+                            <label style={{fontSize: '11px', color: '#6b7280', display: 'block', marginBottom: '4px'}}>JCSスケール</label>
+                            <select
+                              value={editEvent.jcs}
+                              onChange={(e) => setEditEvent({...editEvent, jcs: e.target.value})}
+                              style={{...styles.input, width: '100%', padding: '8px'}}
+                            >
+                              <option value="">選択</option>
+                              {jcsOptions.map(opt => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+
+                        {/* 頻度入力 */}
+                        {config.inputType === 'frequency' && (
+                          <div style={{marginTop: '10px'}}>
+                            <label style={{fontSize: '11px', color: '#6b7280', display: 'block', marginBottom: '4px'}}>頻度</label>
+                            <select
+                              value={editEvent.frequency}
+                              onChange={(e) => setEditEvent({...editEvent, frequency: e.target.value})}
+                              style={{...styles.input, width: '100%', padding: '8px'}}
+                            >
+                              <option value="">選択</option>
+                              {frequencyOptions.map(opt => (
+                                <option key={opt.value} value={opt.value}>{opt.label}</option>
+                              ))}
+                            </select>
+                          </div>
+                        )}
+
+                        {/* 有無入力 */}
+                        {config.inputType === 'presence' && (
+                          <div style={{marginTop: '10px'}}>
+                            <label style={{fontSize: '11px', color: '#6b7280', display: 'block', marginBottom: '4px'}}>有無</label>
+                            <select
+                              value={editEvent.presence}
+                              onChange={(e) => setEditEvent({...editEvent, presence: e.target.value})}
+                              style={{...styles.input, width: '100%', padding: '8px'}}
+                            >
+                              <option value="">選択</option>
+                              <option value="あり">あり</option>
+                              <option value="なし">なし</option>
+                            </select>
+                          </div>
+                        )}
+
+                        {/* 重症度入力 */}
+                        {config.inputType === 'severity' && (
+                          <div style={{marginTop: '10px'}}>
+                            <label style={{fontSize: '11px', color: '#6b7280', display: 'block', marginBottom: '4px'}}>重症度</label>
+                            <select
+                              value={editEvent.severity}
+                              onChange={(e) => setEditEvent({...editEvent, severity: e.target.value})}
+                              style={{...styles.input, width: '100%', padding: '8px'}}
+                            >
+                              <option value="">選択</option>
+                              <option value="軽症">軽症</option>
+                              <option value="中等症">中等症</option>
+                              <option value="重症">重症</option>
+                            </select>
+                          </div>
+                        )}
+
+                        <div style={{marginTop: '10px'}}>
+                          <label style={{fontSize: '11px', color: '#6b7280', display: 'block', marginBottom: '4px'}}>メモ</label>
+                          <input
+                            type="text"
+                            value={editEvent.note}
+                            onChange={(e) => setEditEvent({...editEvent, note: e.target.value})}
+                            style={{...styles.input, width: '100%', padding: '8px'}}
+                            placeholder="メモ"
+                          />
+                        </div>
+
+                        <div style={{display: 'flex', gap: '8px', marginTop: '12px', justifyContent: 'flex-end'}}>
+                          <button
+                            onClick={cancelEditEvent}
+                            style={{
+                              padding: '6px 14px',
+                              background: '#f3f4f6',
+                              border: '1px solid #d1d5db',
+                              borderRadius: '6px',
+                              cursor: 'pointer',
+                              fontSize: '13px'
+                            }}
+                          >
+                            キャンセル
+                          </button>
+                          <button
+                            onClick={updateClinicalEvent}
+                            style={{
+                              padding: '6px 14px',
+                              background: '#f59e0b',
+                              color: 'white',
+                              border: 'none',
+                              borderRadius: '6px',
+                              cursor: 'pointer',
+                              fontSize: '13px',
+                              fontWeight: '500'
+                            }}
+                          >
+                            保存
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  }
+
+                  // 通常表示モード
+                  return (
+                    <div
+                      key={event.id}
+                      style={{
+                        background: '#fffbeb',
+                        border: '1px solid #fcd34d',
+                        borderRadius: '10px',
+                        padding: '14px 16px',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'flex-start'
+                      }}
+                    >
+                      <div style={{flex: 1}}>
+                        <div style={{display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px', flexWrap: 'wrap'}}>
+                          <span style={{
+                            fontWeight: '600',
+                            color: '#92400e',
+                            fontSize: '14px'
+                          }}>
+                            {event.eventType}
+                          </span>
+                          {/* JCS表示 */}
+                          {event.jcs && (
+                            <span style={{
+                              fontSize: '11px',
+                              background: event.jcs.startsWith('III') ? '#fecaca' : event.jcs.startsWith('II') ? '#fed7aa' : event.jcs.startsWith('I-') ? '#fef3c7' : '#d9f99d',
+                              color: event.jcs.startsWith('III') ? '#dc2626' : event.jcs.startsWith('II') ? '#ea580c' : event.jcs.startsWith('I-') ? '#d97706' : '#65a30d',
+                              padding: '2px 8px',
+                              borderRadius: '4px',
+                              fontWeight: '500'
+                            }}>
+                              JCS {event.jcs}
+                            </span>
+                          )}
+                          {/* 頻度表示 */}
+                          {event.frequency && (
+                            <span style={{
+                              fontSize: '11px',
+                              background: '#dbeafe',
+                              color: '#1d4ed8',
+                              padding: '2px 8px',
+                              borderRadius: '4px'
+                            }}>
+                              {frequencyOptions.find(f => f.value === event.frequency)?.label || event.frequency}
+                            </span>
+                          )}
+                          {/* 有無表示 */}
+                          {event.presence && (
+                            <span style={{
+                              fontSize: '11px',
+                              background: event.presence === 'あり' ? '#fee2e2' : '#dcfce7',
+                              color: event.presence === 'あり' ? '#dc2626' : '#16a34a',
+                              padding: '2px 8px',
+                              borderRadius: '4px',
+                              fontWeight: '500'
+                            }}>
+                              {event.presence}
+                            </span>
+                          )}
+                          {/* 重症度表示 */}
+                          {event.severity && (
+                            <span style={{
+                              fontSize: '11px',
+                              background: event.severity === '重症' ? '#fecaca' : event.severity === '中等症' ? '#fed7aa' : '#d9f99d',
+                              color: event.severity === '重症' ? '#dc2626' : event.severity === '中等症' ? '#ea580c' : '#65a30d',
+                              padding: '2px 8px',
+                              borderRadius: '4px'
+                            }}>
+                              {event.severity}
+                            </span>
+                          )}
+                        </div>
+                        <div style={{fontSize: '13px', color: '#78716c'}}>
+                          <span>{event.startDate}</span>
+                          {startDay !== null && <span style={{color: '#a1a1aa'}}> (Day {startDay})</span>}
+                          {event.endDate && (
+                            <>
+                              <span> 〜 {event.endDate}</span>
+                              {endDay !== null && <span style={{color: '#a1a1aa'}}> (Day {endDay})</span>}
+                            </>
+                          )}
+                          {!event.endDate && event.inputType !== 'presence' && <span style={{color: '#ea580c'}}> 〜 継続中</span>}
+                        </div>
+                        {event.note && (
+                          <p style={{fontSize: '12px', color: '#78716c', marginTop: '6px', marginBottom: 0}}>
+                            {event.note}
+                          </p>
+                        )}
+                      </div>
+                      <div style={{display: 'flex', gap: '4px'}}>
+                        <button
+                          onClick={() => startEditEvent(event)}
+                          title="編集"
+                          style={{
+                            background: '#fefce8',
+                            border: '1px solid #fde047',
+                            borderRadius: '4px',
+                            color: '#a16207',
+                            cursor: 'pointer',
+                            padding: '4px 8px',
+                            fontSize: '11px'
+                          }}
+                        >
+                          ✏️ 編集
+                        </button>
+                        <button
+                          onClick={() => copyEvent(event)}
+                          title="この日付・種類でコピー"
+                          style={{
+                            background: '#f0f9ff',
+                            border: '1px solid #bae6fd',
+                            borderRadius: '4px',
+                            color: '#0369a1',
+                            cursor: 'pointer',
+                            padding: '4px 8px',
+                            fontSize: '11px'
+                          }}
+                        >
+                          📋 コピー
+                        </button>
+                        <button
+                          onClick={() => deleteClinicalEvent(event.id)}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: '#a1a1aa',
+                            cursor: 'pointer',
+                            padding: '4px',
+                            fontSize: '16px'
+                          }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* 治療薬一覧（編集・削除用） */}
+              {treatments.length > 0 && (
+                <div style={{marginTop: '24px'}}>
+                  <h4 style={{fontSize: '14px', fontWeight: '600', color: '#047857', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px'}}>
+                    <span>💊</span> 治療薬一覧
+                  </h4>
+                  <div style={{display: 'flex', flexDirection: 'column', gap: '10px'}}>
+                    {treatments.map((treatment) => {
+                      const startDay = calcDaysFromOnset(treatment.startDate);
+                      const endDay = treatment.endDate ? calcDaysFromOnset(treatment.endDate) : null;
+                      const isEditing = editingTreatmentId === treatment.id;
+
+                      const categoryColors = {
+                        '抗てんかん薬': { bg: '#fef3c7', border: '#fcd34d', text: '#92400e' },
+                        'ステロイド': { bg: '#fce7f3', border: '#f9a8d4', text: '#9d174d' },
+                        '免疫グロブリン': { bg: '#dbeafe', border: '#93c5fd', text: '#1e40af' },
+                        '血漿交換': { bg: '#e0e7ff', border: '#a5b4fc', text: '#3730a3' },
+                        '免疫抑制剤': { bg: '#f3e8ff', border: '#c4b5fd', text: '#6b21a8' },
+                        '抗ウイルス薬': { bg: '#ccfbf1', border: '#5eead4', text: '#0f766e' },
+                        '抗菌薬': { bg: '#fef9c3', border: '#fde047', text: '#a16207' },
+                        '抗浮腫薬': { bg: '#e0f2fe', border: '#7dd3fc', text: '#0369a1' },
+                        'その他': { bg: '#f3f4f6', border: '#d1d5db', text: '#374151' }
+                      };
+                      const colors = categoryColors[treatment.category] || categoryColors['その他'];
+
+                      if (isEditing) {
+                        return (
+                          <div key={treatment.id} style={{background: '#f0fdf4', border: '2px solid #22c55e', borderRadius: '10px', padding: '16px'}}>
+                            <div style={{marginBottom: '12px', fontWeight: '600', color: '#166534', fontSize: '14px'}}>編集中: {treatment.medicationName}</div>
+                            <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px'}}>
+                              <div>
+                                <label style={{fontSize: '11px', color: '#6b7280'}}>薬剤名</label>
+                                <input type="text" value={editTreatment.medicationName} onChange={(e) => setEditTreatment({...editTreatment, medicationName: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}} />
+                              </div>
+                              <div>
+                                <label style={{fontSize: '11px', color: '#6b7280'}}>カテゴリ</label>
+                                <select value={editTreatment.category} onChange={(e) => setEditTreatment({...editTreatment, category: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}}>
+                                  {Object.keys(treatmentCategories).map(cat => (<option key={cat} value={cat}>{cat}</option>))}
+                                </select>
+                              </div>
+                              <div>
+                                <label style={{fontSize: '11px', color: '#6b7280'}}>投与量</label>
+                                <input type="text" value={editTreatment.dosage} onChange={(e) => setEditTreatment({...editTreatment, dosage: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}} />
+                              </div>
+                              <div>
+                                <label style={{fontSize: '11px', color: '#6b7280'}}>単位</label>
+                                <select value={editTreatment.dosageUnit} onChange={(e) => setEditTreatment({...editTreatment, dosageUnit: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}}>
+                                  <option value="">選択</option>
+                                  {dosageUnits.map(unit => (<option key={unit} value={unit}>{unit}</option>))}
+                                </select>
+                              </div>
+                              <div>
+                                <label style={{fontSize: '11px', color: '#6b7280'}}>開始日</label>
+                                <input type="date" value={editTreatment.startDate} onChange={(e) => setEditTreatment({...editTreatment, startDate: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}} />
+                              </div>
+                              <div>
+                                <label style={{fontSize: '11px', color: '#6b7280'}}>終了日</label>
+                                <input type="date" value={editTreatment.endDate} onChange={(e) => setEditTreatment({...editTreatment, endDate: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}} />
+                              </div>
+                            </div>
+                            <div style={{display: 'flex', gap: '8px', marginTop: '12px', justifyContent: 'flex-end'}}>
+                              <button onClick={cancelEditTreatment} style={{padding: '6px 14px', background: '#f3f4f6', border: '1px solid #d1d5db', borderRadius: '6px', cursor: 'pointer'}}>キャンセル</button>
+                              <button onClick={updateTreatment} style={{padding: '6px 14px', background: '#22c55e', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontWeight: '500'}}>保存</button>
+                            </div>
+                          </div>
+                        );
+                      }
+
+                      return (
+                        <div key={treatment.id} style={{background: colors.bg, border: `1px solid ${colors.border}`, borderRadius: '10px', padding: '14px 16px', display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start'}}>
+                          <div style={{flex: 1}}>
+                            <div style={{display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px', flexWrap: 'wrap'}}>
+                              <span style={{fontWeight: '600', color: colors.text, fontSize: '14px'}}>{treatment.medicationName}</span>
+                              <span style={{fontSize: '11px', background: 'white', color: colors.text, padding: '2px 8px', borderRadius: '4px', border: `1px solid ${colors.border}`}}>{treatment.category}</span>
+                            </div>
+                            <div style={{display: 'flex', flexWrap: 'wrap', gap: '8px', fontSize: '12px', color: '#6b7280'}}>
+                              <span style={{fontWeight: '600', color: colors.text}}>{treatment.dosage} {treatment.dosageUnit}</span>
+                              <span>|</span>
+                              <span>{treatment.startDate}{treatment.endDate ? ` 〜 ${treatment.endDate}` : ''}</span>
+                              {startDay !== null && (<span style={{color: '#9ca3af'}}>(Day {startDay}{endDay !== null && endDay !== startDay ? `〜${endDay}` : ''})</span>)}
+                            </div>
+                          </div>
+                          <div style={{display: 'flex', alignItems: 'center', gap: '6px'}}>
+                            <button onClick={() => startEditTreatment(treatment)} style={{background: '#e0f2fe', border: '1px solid #7dd3fc', borderRadius: '4px', color: '#0369a1', cursor: 'pointer', padding: '4px 8px', fontSize: '11px'}}>✏️ 編集</button>
+                            <button onClick={() => deleteTreatment(treatment.id)} style={{background: 'transparent', border: 'none', color: '#a1a1aa', cursor: 'pointer', padding: '4px', fontSize: '16px'}}>×</button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+            </>
+          )}
+        </section>
+
+        {/* 経時データ分析セクション */}
+        <section style={styles.section}>
+          <div style={styles.sectionHeader}>
+            <h2 style={styles.sectionTitle}>経時データ分析</h2>
+            <button
+              onClick={() => setShowTimeSeriesOverlay(!showTimeSeriesOverlay)}
+              style={{...styles.addLabButton, background: showTimeSeriesOverlay ? '#bfdbfe' : '#dbeafe', color: '#1d4ed8'}}
+            >
+              <span>📈</span> {showTimeSeriesOverlay ? '閉じる' : '分析を開く'}
+            </button>
+          </div>
+
+          {showTimeSeriesOverlay && (
+            <div style={{
+              background: '#f8fafc',
+              borderRadius: '12px',
+              padding: '20px',
+              border: '1px solid #e2e8f0'
+            }}>
+              {/* 検査項目選択 */}
+              <div style={{marginBottom: '20px'}}>
+                <h4 style={{fontSize: '14px', fontWeight: '600', color: '#1e40af', marginBottom: '12px'}}>
+                  検査項目を選択
+                </h4>
+                <div style={{
+                  display: 'flex',
+                  flexWrap: 'wrap',
+                  gap: '8px',
+                  maxHeight: '120px',
+                  overflow: 'auto',
+                  padding: '8px',
+                  background: 'white',
+                  borderRadius: '8px',
+                  border: '1px solid #e2e8f0'
+                }}>
+                  {(() => {
+                    // labResultsから全項目を抽出
+                    const allItems = new Set();
+                    labResults.forEach(lab => {
+                      lab.data?.forEach(item => allItems.add(item.item));
+                    });
+                    return Array.from(allItems).sort().map(item => (
+                      <label
+                        key={item}
+                        style={{
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '4px',
+                          padding: '4px 10px',
+                          background: selectedLabItemsForChart.includes(item) ? '#dbeafe' : '#f1f5f9',
+                          borderRadius: '16px',
+                          cursor: 'pointer',
+                          fontSize: '12px',
+                          border: selectedLabItemsForChart.includes(item) ? '1px solid #3b82f6' : '1px solid transparent'
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={selectedLabItemsForChart.includes(item)}
+                          onChange={() => {
+                            setSelectedLabItemsForChart(prev =>
+                              prev.includes(item)
+                                ? prev.filter(i => i !== item)
+                                : [...prev, item]
+                            );
+                          }}
+                          style={{display: 'none'}}
+                        />
+                        {item}
+                      </label>
+                    ));
+                  })()}
+                  {labResults.length === 0 && (
+                    <span style={{color: '#6b7280', fontSize: '12px'}}>検査データがありません</span>
+                  )}
+                </div>
+              </div>
+
+              {/* 治療薬選択 */}
+              <div style={{marginBottom: '20px'}}>
+                <div style={{display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px'}}>
+                  <label style={{display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer'}}>
+                    <input
+                      type="checkbox"
+                      checked={showTreatmentsOnChart}
+                      onChange={(e) => setShowTreatmentsOnChart(e.target.checked)}
+                    />
+                    <span style={{fontSize: '14px', fontWeight: '600', color: '#047857'}}>治療薬を表示</span>
+                  </label>
+                </div>
+                {showTreatmentsOnChart && treatments.length > 0 && (
+                  <div style={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: '8px',
+                    padding: '8px',
+                    background: 'white',
+                    borderRadius: '8px',
+                    border: '1px solid #d1fae5'
+                  }}>
+                    {(() => {
+                      const allMeds = [...new Set(treatments.map(t => t.medicationName))];
+                      return allMeds.map(med => (
+                        <label
+                          key={med}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            padding: '4px 10px',
+                            background: selectedTreatmentsForChart.includes(med) ? '#d1fae5' : '#f1f5f9',
+                            borderRadius: '16px',
+                            cursor: 'pointer',
+                            fontSize: '12px',
+                            border: selectedTreatmentsForChart.includes(med) ? '1px solid #10b981' : '1px solid transparent'
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedTreatmentsForChart.includes(med)}
+                            onChange={() => {
+                              setSelectedTreatmentsForChart(prev =>
+                                prev.includes(med)
+                                  ? prev.filter(m => m !== med)
+                                  : [...prev, med]
+                              );
+                            }}
+                            style={{display: 'none'}}
+                          />
+                          {med}
+                        </label>
+                      ));
+                    })()}
+                  </div>
+                )}
+              </div>
+
+              {/* 臨床経過選択 */}
+              <div style={{marginBottom: '20px'}}>
+                <div style={{display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px'}}>
+                  <label style={{display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer'}}>
+                    <input
+                      type="checkbox"
+                      checked={showEventsOnChart}
+                      onChange={(e) => setShowEventsOnChart(e.target.checked)}
+                    />
+                    <span style={{fontSize: '14px', fontWeight: '600', color: '#b45309'}}>臨床経過を表示</span>
+                  </label>
+                </div>
+                {showEventsOnChart && clinicalEvents.length > 0 && (
+                  <div style={{
+                    display: 'flex',
+                    flexWrap: 'wrap',
+                    gap: '8px',
+                    padding: '8px',
+                    background: 'white',
+                    borderRadius: '8px',
+                    border: '1px solid #fde68a'
+                  }}>
+                    {(() => {
+                      const allEventTypes = [...new Set(clinicalEvents.map(e => e.eventType))];
+                      return allEventTypes.map(eventType => (
+                        <label
+                          key={eventType}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            padding: '4px 10px',
+                            background: selectedEventsForChart.includes(eventType) ? '#fef3c7' : '#f1f5f9',
+                            borderRadius: '16px',
+                            cursor: 'pointer',
+                            fontSize: '12px',
+                            border: selectedEventsForChart.includes(eventType) ? '1px solid #f59e0b' : '1px solid transparent'
+                          }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={selectedEventsForChart.includes(eventType)}
+                            onChange={() => {
+                              setSelectedEventsForChart(prev =>
+                                prev.includes(eventType)
+                                  ? prev.filter(et => et !== eventType)
+                                  : [...prev, eventType]
+                              );
+                            }}
+                            style={{display: 'none'}}
+                          />
+                          {eventType}
+                        </label>
+                      ));
+                    })()}
+                  </div>
+                )}
+              </div>
+
+              {/* 表示オプション */}
+              {(showTreatmentsOnChart || showEventsOnChart) && (
+                <div style={{
+                  marginBottom: '20px',
+                  padding: '12px',
+                  background: '#f0f9ff',
+                  borderRadius: '8px',
+                  border: '1px solid #bae6fd'
+                }}>
+                  <div style={{display: 'flex', flexWrap: 'wrap', gap: '20px', alignItems: 'center'}}>
+                    <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                      <span style={{fontSize: '13px', fontWeight: '500', color: '#0369a1'}}>表示方法:</span>
+                      <label style={{display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer'}}>
+                        <input
+                          type="radio"
+                          name="displayMode"
+                          checked={timelineDisplayMode === 'separate'}
+                          onChange={() => setTimelineDisplayMode('separate')}
+                        />
+                        <span style={{fontSize: '13px'}}>分離表示</span>
+                      </label>
+                      <label style={{display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer'}}>
+                        <input
+                          type="radio"
+                          name="displayMode"
+                          checked={timelineDisplayMode === 'overlay'}
+                          onChange={() => setTimelineDisplayMode('overlay')}
+                        />
+                        <span style={{fontSize: '13px'}}>重ね表示</span>
+                      </label>
+                    </div>
+                    {timelineDisplayMode === 'separate' && (
+                      <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                        <span style={{fontSize: '13px', fontWeight: '500', color: '#0369a1'}}>経過表の位置:</span>
+                        <label style={{display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer'}}>
+                          <input
+                            type="radio"
+                            name="timelinePosition"
+                            checked={timelinePosition === 'above'}
+                            onChange={() => setTimelinePosition('above')}
+                          />
+                          <span style={{fontSize: '13px'}}>グラフの上</span>
+                        </label>
+                        <label style={{display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer'}}>
+                          <input
+                            type="radio"
+                            name="timelinePosition"
+                            checked={timelinePosition === 'below'}
+                            onChange={() => setTimelinePosition('below')}
+                          />
+                          <span style={{fontSize: '13px'}}>グラフの下</span>
+                        </label>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* チャート表示 */}
+              {(selectedLabItemsForChart.length > 0 ||
+                (showTreatmentsOnChart && selectedTreatmentsForChart.length > 0) ||
+                (showEventsOnChart && selectedEventsForChart.length > 0)) && patient.onsetDate && (
+                <div
+                  id="clinical-course-container"
+                  style={{
+                    background: 'white',
+                    padding: '20px',
+                    borderRadius: '12px',
+                    border: '1px solid #e2e8f0'
+                  }}
+                >
+                  {(() => {
+                    const labColors = ['#8B0000', '#000080', '#006400', '#B8860B', '#800080', '#008B8B', '#FF4500', '#2F4F4F'];
+                    const treatmentBarColors = {
+                      '抗てんかん薬': { bg: '#FFF3CD', border: '#FFC107' },
+                      'ステロイド': { bg: '#D4EDDA', border: '#28A745' },
+                      '免疫グロブリン': { bg: '#CCE5FF', border: '#007BFF' },
+                      '血漿交換': { bg: '#E2D5F1', border: '#6F42C1' },
+                      '免疫抑制剤': { bg: '#F8D7DA', border: '#DC3545' },
+                      '抗ウイルス薬': { bg: '#D1ECF1', border: '#17A2B8' },
+                      '抗菌薬': { bg: '#FFF3CD', border: '#FFC107' },
+                      '抗浮腫薬': { bg: '#E2E3E5', border: '#6C757D' },
+                      'その他': { bg: '#F8F9FA', border: '#ADB5BD' }
+                    };
+                    const eventBarColors = {
+                      '意識障害': { bg: '#FFCCCC', border: '#CC0000' },
+                      'てんかん発作': { bg: '#FFE5CC', border: '#FF6600' },
+                      '不随意運動': { bg: '#FFF0CC', border: '#CC9900' },
+                      '麻痺': { bg: '#FFFFCC', border: '#999900' },
+                      '感覚障害': { bg: '#E5FFCC', border: '#669900' },
+                      '失語': { bg: '#CCFFCC', border: '#009900' },
+                      '認知機能障害': { bg: '#CCFFE5', border: '#009966' },
+                      '精神症状': { bg: '#CCF0FF', border: '#0099CC' },
+                      '発熱': { bg: '#FFCCCC', border: '#CC0000' },
+                      '頭痛': { bg: '#FFE5CC', border: '#FF6600' },
+                      '髄膜刺激症状': { bg: '#E5FFCC', border: '#669900' },
+                      '人工呼吸器管理': { bg: '#E5CCFF', border: '#6600CC' },
+                      'ICU入室': { bg: '#FFCCE5', border: '#CC0066' }
+                    };
+
+                    // タイムラインの日数範囲を計算
+                    const allDays = [];
+                    labResults.forEach(lab => {
+                      const day = calcDaysFromOnset(lab.date);
+                      if (day !== null) allDays.push(day);
+                    });
+                    if (showTreatmentsOnChart) {
+                      treatments.filter(t => selectedTreatmentsForChart.includes(t.medicationName)).forEach(t => {
+                        const start = calcDaysFromOnset(t.startDate);
+                        const end = t.endDate ? calcDaysFromOnset(t.endDate) : start;
+                        if (start !== null) allDays.push(start, end);
+                      });
+                    }
+                    if (showEventsOnChart) {
+                      clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
+                        const start = calcDaysFromOnset(e.startDate);
+                        const end = e.endDate ? calcDaysFromOnset(e.endDate) : start;
+                        if (start !== null) allDays.push(start, end);
+                      });
+                    }
+
+                    if (allDays.length === 0) {
+                      return (
+                        <div style={{textAlign: 'center', padding: '40px', color: '#6b7280'}}>
+                          表示するデータがありません。発症日が設定されていることを確認してください。
+                        </div>
+                      );
+                    }
+
+                    const minDay = Math.min(...allDays, 0);
+                    const maxDay = Math.max(...allDays) + 3;
+                    const dayRange = maxDay - minDay || 1;
+
+                    // 重症度スコア計算関数
+                    const getSeverityScore = (event) => {
+                      if (event.jcs) {
+                        if (event.jcs === '0') return 0;
+                        if (event.jcs.startsWith('I-')) return parseInt(event.jcs.split('-')[1]) || 1;
+                        if (event.jcs.startsWith('II-')) return 10 + (parseInt(event.jcs.split('-')[1]) / 10 || 1);
+                        if (event.jcs.startsWith('III-')) return 20 + (parseInt(event.jcs.split('-')[1]) / 100 || 1);
+                        return 1;
+                      }
+                      if (event.frequency) {
+                        const freqScores = { hourly: 10, several_daily: 8, daily: 6, several_weekly: 4, weekly: 2, monthly: 1, rare: 0.5 };
+                        return freqScores[event.frequency] || 1;
+                      }
+                      if (event.severity) {
+                        const sevScores = { '重症': 3, '中等症': 2, '軽症': 1 };
+                        return sevScores[event.severity] || 1;
+                      }
+                      if (event.presence) {
+                        return event.presence === 'あり' ? 1 : 0;
+                      }
+                      return 1;
+                    };
+
+                    // CSV出力用データ生成関数
+                    const generateTimelineCSV = () => {
+                      const rows = [];
+                      rows.push(['臨床経過データ', patient.displayId]);
+                      rows.push([]);
+
+                      // 治療薬データ
+                      if (showTreatmentsOnChart && selectedTreatmentsForChart.length > 0) {
+                        rows.push(['【治療薬】']);
+                        rows.push(['薬剤名', '開始Day', '終了Day', '投与量', '単位', '開始日', '終了日']);
+                        treatments.filter(t => selectedTreatmentsForChart.includes(t.medicationName)).forEach(t => {
+                          const startDay = calcDaysFromOnset(t.startDate);
+                          const endDay = t.endDate ? calcDaysFromOnset(t.endDate) : startDay;
+                          rows.push([
+                            t.medicationName,
+                            startDay,
+                            endDay,
+                            t.dosage || '',
+                            t.dosageUnit || '',
+                            t.startDate,
+                            t.endDate || ''
+                          ]);
+                        });
+                        rows.push([]);
+                      }
+
+                      // 臨床経過データ
+                      if (showEventsOnChart && selectedEventsForChart.length > 0) {
+                        rows.push(['【臨床経過】']);
+                        rows.push(['イベント', '開始Day', '終了Day', '詳細', '開始日', '終了日']);
+                        clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
+                          const startDay = calcDaysFromOnset(e.startDate);
+                          const endDay = e.endDate ? calcDaysFromOnset(e.endDate) : startDay;
+                          let detail = e.jcs || e.frequency || e.severity || e.presence || '';
+                          rows.push([
+                            e.eventType,
+                            startDay,
+                            endDay,
+                            detail,
+                            e.startDate,
+                            e.endDate || ''
+                          ]);
+                        });
+                        rows.push([]);
+                      }
+
+                      // 検査データ
+                      if (selectedLabItemsForChart.length > 0) {
+                        rows.push(['【検査データ】']);
+                        const header = ['Day', '日付', ...selectedLabItemsForChart];
+                        rows.push(header);
+                        labResults.sort((a, b) => new Date(a.date) - new Date(b.date)).forEach(lab => {
+                          const day = calcDaysFromOnset(lab.date);
+                          if (day !== null) {
+                            const row = [day, lab.date];
+                            selectedLabItemsForChart.forEach(item => {
+                              const labItem = lab.data?.find(d => d.item === item);
+                              row.push(labItem ? labItem.value : '');
+                            });
+                            rows.push(row);
+                          }
+                        });
+                      }
+
+                      return rows;
+                    };
+
+                    // CSVダウンロード
+                    const downloadCSV = () => {
+                      const rows = generateTimelineCSV();
+                      const bom = '\uFEFF';
+                      const csvContent = rows.map(row => row.join(',')).join('\n');
+                      const blob = new Blob([bom + csvContent], { type: 'text/csv;charset=utf-8;' });
+                      const url = URL.createObjectURL(blob);
+                      const link = document.createElement('a');
+                      link.href = url;
+                      link.download = `${patient.displayId}_臨床経過.csv`;
+                      link.click();
+                      URL.revokeObjectURL(url);
+                    };
+
+                    // SVGダウンロード
+                    const downloadSVG = () => {
+                      const container = document.getElementById('clinical-course-container');
+                      if (!container) return;
+
+                      // 治療薬と臨床経過のカテゴリ色
+                      const categoryColors = {
+                        '抗てんかん薬': '#f59e0b', 'ステロイド': '#22c55e', '免疫グロブリン': '#3b82f6',
+                        '血漿交換': '#6366f1', '免疫抑制剤': '#ec4899', '抗ウイルス薬': '#14b8a6',
+                        '抗菌薬': '#eab308', '抗浮腫薬': '#0ea5e9', 'その他': '#6b7280'
+                      };
+                      const eventSvgColors = {
+                        '意識障害': '#dc2626', 'てんかん発作': '#ea580c', '不随意運動': '#d97706',
+                        '麻痺': '#ca8a04', '感覚障害': '#65a30d', '失語': '#16a34a',
+                        '認知機能障害': '#0d9488', '精神症状': '#0891b2', '発熱': '#ef4444',
+                        '頭痛': '#f97316', '髄膜刺激症状': '#84cc16', '人工呼吸器管理': '#7c3aed', 'ICU入室': '#9333ea'
+                      };
+
+                      const width = 800;
+                      const leftMargin = 120;
+                      const graphWidth = width - leftMargin - 40;
+                      let yPos = 40;
+                      const barHeight = 30;
+                      const maxBarHeight = 40;
+
+                      let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="600" style="font-family: sans-serif;">`;
+                      svgContent += `<text x="${width/2}" y="25" text-anchor="middle" font-size="16" font-weight="bold">臨床経過 - ${patient.displayId}</text>`;
+
+                      // 治療薬タイムライン
+                      if (showTreatmentsOnChart && selectedTreatmentsForChart.length > 0) {
+                        const groups = {};
+                        treatments.filter(t => selectedTreatmentsForChart.includes(t.medicationName)).forEach(t => {
+                          if (!groups[t.medicationName]) {
+                            groups[t.medicationName] = { name: t.medicationName, category: t.category, entries: [], unit: t.dosageUnit || '' };
+                          }
+                          groups[t.medicationName].entries.push(t);
+                        });
+
+                        Object.values(groups).forEach(group => {
+                          group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+                          const color = categoryColors[group.category] || '#6b7280';
+                          const shortName = group.name.replace(/（.*）/g, '').replace(/\(.*\)/g, '');
+                          const unitText = group.unit ? `[${group.unit.replace('/日', '')}]` : '';
+                          const maxDosage = Math.max(...group.entries.map(e => parseFloat(e.dosage) || 0), 1);
+
+                          svgContent += `<text x="${leftMargin - 8}" y="${yPos + maxBarHeight - 5}" text-anchor="end" font-size="10">${shortName}${unitText}</text>`;
+                          svgContent += `<line x1="${leftMargin}" y1="${yPos + maxBarHeight}" x2="${width - 40}" y2="${yPos + maxBarHeight}" stroke="#d1d5db" stroke-width="1"/>`;
+
+                          group.entries.forEach(entry => {
+                            const startDay = calcDaysFromOnset(entry.startDate);
+                            const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
+                            const x = leftMargin + ((startDay - minDay) / dayRange) * graphWidth;
+                            const w = Math.max(((endDay - startDay) / dayRange) * graphWidth, 8);
+                            const dosage = parseFloat(entry.dosage) || 0;
+                            const h = Math.max((dosage / maxDosage) * maxBarHeight, 8);
+                            const y = yPos + maxBarHeight - h;
+                            svgContent += `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${color}" rx="2"/>`;
+                            if (w > 20 && h > 12) {
+                              svgContent += `<text x="${x + w/2}" y="${y + h/2 + 3}" text-anchor="middle" font-size="8" fill="white">${entry.dosage}</text>`;
+                            }
+                          });
+                          yPos += maxBarHeight + 15;
+                        });
+                      }
+
+                      // 臨床経過タイムライン
+                      if (showEventsOnChart && selectedEventsForChart.length > 0) {
+                        const groups = {};
+                        clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
+                          if (!groups[e.eventType]) {
+                            groups[e.eventType] = { type: e.eventType, entries: [] };
+                          }
+                          groups[e.eventType].entries.push(e);
+                        });
+
+                        Object.values(groups).forEach(group => {
+                          group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+                          const color = eventSvgColors[group.type] || '#6b7280';
+
+                          svgContent += `<text x="${leftMargin - 8}" y="${yPos + barHeight/2 + 4}" text-anchor="end" font-size="10">${group.type}</text>`;
+
+                          group.entries.forEach(entry => {
+                            const startDay = calcDaysFromOnset(entry.startDate);
+                            const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
+                            const x = leftMargin + ((startDay - minDay) / dayRange) * graphWidth;
+                            const w = Math.max(((endDay - startDay) / dayRange) * graphWidth, 8);
+                            svgContent += `<rect x="${x}" y="${yPos}" width="${w}" height="${barHeight}" fill="${color}" fill-opacity="0.3" stroke="${color}" stroke-width="1" rx="2"/>`;
+                          });
+                          yPos += barHeight + 8;
+                        });
+                      }
+
+                      // X軸
+                      yPos += 10;
+                      svgContent += `<line x1="${leftMargin}" y1="${yPos}" x2="${width - 40}" y2="${yPos}" stroke="#333" stroke-width="1"/>`;
+                      for (let d = Math.ceil(minDay / 5) * 5; d <= maxDay; d += 5) {
+                        const x = leftMargin + ((d - minDay) / dayRange) * graphWidth;
+                        svgContent += `<line x1="${x}" y1="${yPos}" x2="${x}" y2="${yPos + 5}" stroke="#333" stroke-width="1"/>`;
+                        svgContent += `<text x="${x}" y="${yPos + 15}" text-anchor="middle" font-size="9">${d}</text>`;
+                      }
+                      svgContent += `<text x="${width/2}" y="${yPos + 30}" text-anchor="middle" font-size="10">Days</text>`;
+
+                      svgContent += '</svg>';
+
+                      const blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
+                      const url = URL.createObjectURL(blob);
+                      const link = document.createElement('a');
+                      link.href = url;
+                      link.download = `${patient.displayId}_臨床経過.svg`;
+                      link.click();
+                      URL.revokeObjectURL(url);
+                    };
+
+                    // タイムライン描画コンポーネント（スクリーンショット風）
+                    const renderClinicalTimeline = () => {
+                      const hasTreatments = showTreatmentsOnChart && selectedTreatmentsForChart.length > 0;
+                      const hasEvents = showEventsOnChart && selectedEventsForChart.length > 0;
+
+                      if (!hasTreatments && !hasEvents) return null;
+
+                      // 左マージン（薬剤名表示エリア）
+                      const leftMargin = 120;
+                      // カテゴリ別の色
+                      const categoryColors = {
+                        '抗てんかん薬': '#f59e0b',
+                        'ステロイド': '#22c55e',
+                        '免疫グロブリン': '#3b82f6',
+                        '血漿交換': '#6366f1',
+                        '免疫抑制剤': '#ec4899',
+                        '抗ウイルス薬': '#14b8a6',
+                        '抗菌薬': '#eab308',
+                        '抗浮腫薬': '#0ea5e9',
+                        'その他': '#6b7280'
+                      };
+
+                      return (
+                        <div style={{ marginBottom: '0' }}>
+                          {/* 治療薬タイムライン（用量を高さで表現） */}
+                          {hasTreatments && (
+                            <div style={{ marginBottom: hasEvents ? '16px' : '0' }}>
+                              {(() => {
+                                // 選択された薬剤でグループ化
+                                const groups = {};
+                                treatments.filter(t => selectedTreatmentsForChart.includes(t.medicationName)).forEach(t => {
+                                  if (!groups[t.medicationName]) {
+                                    groups[t.medicationName] = { name: t.medicationName, category: t.category, entries: [], unit: t.dosageUnit || '' };
+                                  }
+                                  groups[t.medicationName].entries.push(t);
+                                });
+                                Object.values(groups).forEach(g => g.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate)));
+
+                                return Object.values(groups).map((group, gIdx) => {
+                                  const color = categoryColors[group.category] || '#6b7280';
+                                  const maxBarHeight = 40;
+                                  const maxDosage = Math.max(...group.entries.map(e => parseFloat(e.dosage) || 0), 1);
+                                  // 短縮名を取得（括弧内を除去）
+                                  const shortName = group.name.replace(/（.*）/g, '').replace(/\(.*\)/g, '');
+                                  const unitText = group.unit ? `[${group.unit.replace('/日', '')}]` : '';
+
+                                  return (
+                                    <div key={gIdx} style={{display: 'flex', alignItems: 'flex-end', height: `${maxBarHeight + 12}px`, marginBottom: '4px'}}>
+                                      <div style={{
+                                        width: `${leftMargin}px`,
+                                        flexShrink: 0,
+                                        fontSize: '11px',
+                                        color: '#333',
+                                        paddingRight: '8px',
+                                        textAlign: 'right',
+                                        fontWeight: '500',
+                                        paddingBottom: '4px'
+                                      }} title={group.name}>
+                                        {shortName}{unitText}
+                                      </div>
+                                      <div style={{
+                                        flex: 1,
+                                        position: 'relative',
+                                        height: `${maxBarHeight}px`,
+                                        borderBottom: '1px solid #d1d5db'
+                                      }}>
+                                        {group.entries.map((entry, eIdx) => {
+                                          const startDay = calcDaysFromOnset(entry.startDate);
+                                          const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
+                                          const leftPercent = ((startDay - minDay) / dayRange) * 100;
+                                          const widthPercent = Math.max(((endDay - startDay) / dayRange) * 100, 2);
+                                          const dosage = parseFloat(entry.dosage) || 0;
+                                          const heightPercent = (dosage / maxDosage) * 100;
+                                          const barHeight = Math.max((heightPercent / 100) * maxBarHeight, 8);
+                                          const dosageText = entry.dosage || '';
+
+                                          return (
+                                            <div
+                                              key={eIdx}
+                                              style={{
+                                                position: 'absolute',
+                                                left: `${leftPercent}%`,
+                                                width: `${widthPercent}%`,
+                                                height: `${barHeight}px`,
+                                                bottom: '0',
+                                                background: color,
+                                                borderRadius: '2px 2px 0 0',
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                justifyContent: 'center',
+                                                fontSize: '9px',
+                                                fontWeight: '600',
+                                                color: 'white',
+                                                textShadow: '0 0 2px rgba(0,0,0,0.5)',
+                                                overflow: 'hidden',
+                                                boxSizing: 'border-box'
+                                              }}
+                                              title={`${group.name}: Day ${startDay}〜${endDay} (${entry.dosage}${entry.dosageUnit || ''})`}
+                                            >
+                                              {widthPercent > 4 && barHeight > 14 && dosageText}
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  );
+                                });
+                              })()}
+                            </div>
+                          )}
+
+                          {/* 臨床経過タイムライン */}
+                          {hasEvents && (
+                            <div>
+                              {(() => {
+                                // 選択されたイベントでグループ化
+                                const groups = {};
+                                clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
+                                  if (!groups[e.eventType]) {
+                                    groups[e.eventType] = { type: e.eventType, entries: [] };
+                                  }
+                                  groups[e.eventType].entries.push(e);
+                                });
+                                Object.values(groups).forEach(g => g.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate)));
+
+                                return Object.values(groups).map((group, gIdx) => {
+                                  const barStyle = eventBarColors[group.type] || { bg: '#F8F9FA', border: '#ADB5BD' };
+                                  const barHeight = 22;
+
+                                  return (
+                                    <div key={gIdx} style={{display: 'flex', alignItems: 'center', height: `${barHeight + 6}px`, marginBottom: '2px'}}>
+                                      <div style={{
+                                        width: `${leftMargin}px`,
+                                        flexShrink: 0,
+                                        fontSize: '11px',
+                                        color: '#333',
+                                        paddingRight: '8px',
+                                        textAlign: 'right',
+                                        fontWeight: '500'
+                                      }}>
+                                        {group.type}
+                                      </div>
+                                      <div style={{
+                                        flex: 1,
+                                        position: 'relative',
+                                        height: `${barHeight}px`
+                                      }}>
+                                        {group.entries.map((entry, eIdx) => {
+                                          const startDay = calcDaysFromOnset(entry.startDate);
+                                          const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
+                                          const leftPercent = ((startDay - minDay) / dayRange) * 100;
+                                          const widthPercent = Math.max(((endDay - startDay) / dayRange) * 100, 2);
+
+                                          // 詳細テキスト
+                                          let detailText = '';
+                                          if (entry.jcs) detailText = entry.jcs;
+                                          else if (entry.frequency) {
+                                            const freqLabels = { hourly: '毎時', several_daily: '数回/日', daily: '毎日', several_weekly: '数回/週', weekly: '週1', monthly: '月1', rare: '稀' };
+                                            detailText = freqLabels[entry.frequency] || '';
+                                          }
+                                          else if (entry.severity) detailText = entry.severity;
+
+                                          return (
+                                            <div
+                                              key={eIdx}
+                                              style={{
+                                                position: 'absolute',
+                                                left: `${leftPercent}%`,
+                                                width: `${widthPercent}%`,
+                                                height: '100%',
+                                                background: barStyle.bg,
+                                                border: `1px solid ${barStyle.border}`,
+                                                borderRadius: '2px',
+                                                display: 'flex',
+                                                alignItems: 'center',
+                                                justifyContent: 'center',
+                                                fontSize: '9px',
+                                                fontWeight: '500',
+                                                color: '#333',
+                                                overflow: 'hidden',
+                                                boxSizing: 'border-box'
+                                              }}
+                                              title={`${group.type}: Day ${startDay}〜${endDay}${detailText ? ` (${detailText})` : ''}`}
+                                            >
+                                              {widthPercent > 5 && detailText}
+                                            </div>
+                                          );
+                                        })}
+                                      </div>
+                                    </div>
+                                  );
+                                });
+                              })()}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    };
+
+                    // ダミー用（古いrenderTimeline参照を維持）
+                    const renderTimeline = renderClinicalTimeline;
+
+                    // 検査データのグラフ（X軸をタイムラインと揃える）
+                    const renderLabChartAligned = () => {
+                      if (selectedLabItemsForChart.length === 0) return null;
+
+                      const datasets = [];
+                      selectedLabItemsForChart.forEach((item, idx) => {
+                        const dataPoints = [];
+                        labResults.forEach(lab => {
+                          const labItem = lab.data?.find(d => d.item === item);
+                          if (labItem) {
+                            const day = calcDaysFromOnset(lab.date);
+                            if (day !== null) {
+                              dataPoints.push({ x: day, y: labItem.value });
+                            }
+                          }
+                        });
+                        if (dataPoints.length > 0) {
+                          dataPoints.sort((a, b) => a.x - b.x);
+                          datasets.push({
+                            label: item,
+                            data: dataPoints,
+                            borderColor: labColors[idx % labColors.length],
+                            backgroundColor: labColors[idx % labColors.length],
+                            tension: 0.2,
+                            pointRadius: 4,
+                            pointHoverRadius: 6,
+                            borderWidth: 2
+                          });
+                        }
+                      });
+
+                      if (datasets.length === 0) return null;
+
+                      return (
+                        <div style={{ marginLeft: '120px' }}>
+                          <Line
+                            ref={overlayChartRef}
+                            data={{ datasets }}
+                            options={{
+                              responsive: true,
+                              maintainAspectRatio: true,
+                              aspectRatio: 2.5,
+                              interaction: {
+                                mode: 'index',
+                                intersect: false
+                              },
+                              plugins: {
+                                legend: {
+                                  position: 'right',
+                                  labels: {
+                                    usePointStyle: true,
+                                    padding: 12,
+                                    font: { size: 11 }
+                                  }
+                                },
+                                title: {
+                                  display: false
+                                }
+                              },
+                              scales: {
+                                x: {
+                                  type: 'linear',
+                                  min: minDay,
+                                  max: maxDay,
+                                  title: {
+                                    display: true,
+                                    text: 'days',
+                                    font: { size: 11 }
+                                  },
+                                  ticks: {
+                                    stepSize: 5,
+                                    font: { size: 10 }
+                                  },
+                                  grid: {
+                                    color: '#e5e7eb'
+                                  }
+                                },
+                                y: {
+                                  type: 'linear',
+                                  position: 'left',
+                                  grid: {
+                                    color: '#e5e7eb'
+                                  },
+                                  ticks: {
+                                    font: { size: 10 }
+                                  }
+                                }
+                              }
+                            }}
+                          />
+                        </div>
+                      );
+                    };
+
+                    // 古いダミー関数（参照維持用）
+                    const renderLabChart = renderLabChartAligned;
+
+                    // オーバーレイモードのグラフも同様にダミー化
+                    const renderOverlayChart = () => {
+                      // overlay modeではこれまで通り全部重ねる
+                      const datasets = [];
+                      selectedLabItemsForChart.forEach((item, idx) => {
+                        const dataPoints = [];
+                        labResults.forEach(lab => {
+                          const labItem = lab.data?.find(d => d.item === item);
+                          if (labItem) {
+                            const day = calcDaysFromOnset(lab.date);
+                            if (day !== null) {
+                              dataPoints.push({ x: day, y: labItem.value });
+                            }
+                          }
+                        });
+                        if (dataPoints.length > 0) {
+                          dataPoints.sort((a, b) => a.x - b.x);
+                          datasets.push({
+                            label: item,
+                            data: dataPoints,
+                            borderColor: labColors[idx % labColors.length],
+                            backgroundColor: labColors[idx % labColors.length] + '20',
+                            tension: 0.2,
+                            yAxisID: 'y',
+                            pointRadius: 4,
+                            pointHoverRadius: 6
+                          });
+                        }
+                      });
+
+                      const overlayTreatmentColors = ['#22c55e', '#14b8a6', '#0ea5e9', '#6366f1', '#a855f7', '#f43f5e'];
+                      if (showTreatmentsOnChart) {
+                        selectedTreatmentsForChart.forEach((medName, idx) => {
+                          const medTreatments = treatments.filter(t => t.medicationName === medName);
+                          const dataPoints = [];
+                          medTreatments.forEach(t => {
+                            const startDay = calcDaysFromOnset(t.startDate);
+                            const endDay = t.endDate ? calcDaysFromOnset(t.endDate) : startDay;
+                            const dosage = parseFloat(t.dosage) || 0;
+                            if (startDay !== null) {
+                              dataPoints.push({ x: startDay, y: dosage });
+                              if (endDay !== startDay) dataPoints.push({ x: endDay, y: dosage });
+                            }
+                          });
+                          if (dataPoints.length > 0) {
+                            dataPoints.sort((a, b) => a.x - b.x);
+                            datasets.push({
+                              label: `💊 ${medName}`,
+                              data: dataPoints,
+                              borderColor: overlayTreatmentColors[idx % overlayTreatmentColors.length],
+                              backgroundColor: overlayTreatmentColors[idx % overlayTreatmentColors.length] + '30',
+                              stepped: 'before',
+                              fill: true,
+                              yAxisID: 'y1',
+                              borderWidth: 2,
+                              pointRadius: 3
+                            });
+                          }
+                        });
+                      }
+
+                      const overlayEventColors = ['#dc2626', '#ea580c', '#d97706', '#ca8a04', '#65a30d', '#16a34a', '#0d9488'];
+                      if (showEventsOnChart) {
+                        selectedEventsForChart.forEach((eventType, idx) => {
+                          const typeEvents = clinicalEvents.filter(e => e.eventType === eventType);
+                          const dataPoints = [];
+                          typeEvents.forEach(e => {
+                            const startDay = calcDaysFromOnset(e.startDate);
+                            const endDay = e.endDate ? calcDaysFromOnset(e.endDate) : startDay;
+                            const score = getSeverityScore(e);
+                            if (startDay !== null) {
+                              dataPoints.push({ x: startDay, y: score });
+                              if (endDay !== startDay) dataPoints.push({ x: endDay, y: score });
+                            }
+                          });
+                          if (dataPoints.length > 0) {
+                            dataPoints.sort((a, b) => a.x - b.x);
+                            datasets.push({
+                              label: `📋 ${eventType}`,
+                              data: dataPoints,
+                              borderColor: overlayEventColors[idx % overlayEventColors.length],
+                              backgroundColor: overlayEventColors[idx % overlayEventColors.length] + '20',
+                              stepped: 'before',
+                              fill: true,
+                              yAxisID: 'y2',
+                              borderWidth: 2,
+                              borderDash: [5, 5],
+                              pointRadius: 4
+                            });
+                          }
+                        });
+                      }
+
+                      if (datasets.length === 0) return null;
+
+                      const hasLabData = selectedLabItemsForChart.length > 0;
+                      const hasTreatmentData = showTreatmentsOnChart && selectedTreatmentsForChart.length > 0;
+                      const hasEventData = showEventsOnChart && selectedEventsForChart.length > 0;
+                      const scales = { x: { type: 'linear', title: { display: true, text: 'days' } } };
+                      if (hasLabData) scales.y = { type: 'linear', position: 'left', title: { display: true, text: '検査値' } };
+                      if (hasTreatmentData) scales.y1 = { type: 'linear', position: 'right', title: { display: true, text: '投与量' }, grid: { drawOnChartArea: false } };
+                      if (hasEventData) scales.y2 = { type: 'linear', position: hasLabData ? 'right' : 'left', title: { display: true, text: '重症度' }, grid: { drawOnChartArea: false } };
+
+                      return (
+                        <Line
+                          ref={overlayChartRef}
+                          data={{ datasets }}
+                          options={{
+                            responsive: true,
+                            interaction: { mode: 'index', intersect: false },
+                            plugins: {
+                              legend: { position: 'top', labels: { usePointStyle: true, padding: 15 } },
+                              title: { display: true, text: `${patient.displayId} - 経時データ分析` }
+                            },
+                            scales
+                          }}
+                        />
+                      );
+                    };
+
+                    // 分離モードとオーバーレイモードで表示を切り替え
+                    const isSeparateMode = timelineDisplayMode === 'separate';
+                    const showTimelineAbove = isSeparateMode && timelinePosition === 'above';
+                    const showTimelineBelow = isSeparateMode && timelinePosition === 'below';
+
+                    return (
+                      <div>
+                        {/* タイトル */}
+                        <h3 style={{
+                          textAlign: 'center',
+                          fontSize: '16px',
+                          fontWeight: '600',
+                          color: '#1f2937',
+                          marginBottom: '16px',
+                          paddingBottom: '12px',
+                          borderBottom: '1px solid #e5e7eb'
+                        }}>
+                          臨床経過
+                        </h3>
+
+                        {/* 経過表（上に配置） */}
+                        {showTimelineAbove && renderClinicalTimeline()}
+                        {showTimelineAbove && (showTreatmentsOnChart || showEventsOnChart) && <div style={{height: '16px'}} />}
+
+                        {/* グラフ */}
+                        {isSeparateMode ? renderLabChartAligned() : renderOverlayChart()}
+
+                        {/* 経過表（下に配置） */}
+                        {showTimelineBelow && selectedLabItemsForChart.length > 0 && <div style={{height: '16px'}} />}
+                        {showTimelineBelow && renderClinicalTimeline()}
+
+                        {/* エクスポートボタン */}
+                        <div style={{
+                          display: 'flex',
+                          gap: '12px',
+                          marginTop: '20px',
+                          justifyContent: 'center',
+                          paddingTop: '16px',
+                          borderTop: '1px solid #e5e7eb'
+                        }}>
+                          <button
+                            onClick={() => {
+                              if (overlayChartRef.current) {
+                                const url = overlayChartRef.current.toBase64Image();
+                                const link = document.createElement('a');
+                                link.download = `${patient.displayId}_臨床経過グラフ.png`;
+                                link.href = url;
+                                link.click();
+                              }
+                            }}
+                            style={{
+                              padding: '10px 20px',
+                              background: '#0ea5e9',
+                              color: 'white',
+                              border: 'none',
+                              borderRadius: '8px',
+                              cursor: 'pointer',
+                              fontSize: '13px',
+                              fontWeight: '500',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '6px'
+                            }}
+                          >
+                            <span>🖼️</span> グラフ画像
+                          </button>
+                          <button
+                            onClick={downloadCSV}
+                            style={{
+                              padding: '10px 20px',
+                              background: '#10b981',
+                              color: 'white',
+                              border: 'none',
+                              borderRadius: '8px',
+                              cursor: 'pointer',
+                              fontSize: '13px',
+                              fontWeight: '500',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '6px'
+                            }}
+                          >
+                            <span>📊</span> CSV
+                          </button>
+                          <button
+                            onClick={downloadSVG}
+                            style={{
+                              padding: '10px 20px',
+                              background: '#8b5cf6',
+                              color: 'white',
+                              border: 'none',
+                              borderRadius: '8px',
+                              cursor: 'pointer',
+                              fontSize: '13px',
+                              fontWeight: '500',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '6px'
+                            }}
+                          >
+                            <span>🎨</span> SVG（編集用）
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {!patient.onsetDate && (
+                <div style={{
+                  textAlign: 'center',
+                  padding: '30px',
+                  background: '#fef3c7',
+                  borderRadius: '8px',
+                  color: '#92400e'
+                }}>
+                  経時データ分析には発症日の設定が必要です。<br/>
+                  基本情報で発症日を設定してください。
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+
+        {/* 検査データセクション */}
+        <section style={styles.section}>
+          <div style={styles.sectionHeader}>
+            <h2 style={styles.sectionTitle}>検査データ</h2>
+            <div style={{display: 'flex', gap: '10px'}}>
+              <button onClick={() => setShowAddLabModal(true)} style={styles.addLabButton}>
+                <span>📷</span> 写真から追加
+              </button>
+              <button onClick={() => setShowExcelModal(true)} style={{...styles.addLabButton, background: '#e0f2fe', color: '#0369a1'}}>
+                <span>📊</span> Excelから追加
+              </button>
+            </div>
+          </div>
+
+          {labResults.length === 0 ? (
+            <div style={styles.emptyLab}>
+              <p>検査データはまだありません</p>
+              <p style={{fontSize: '13px', marginTop: '8px'}}>
+                「写真から追加」で検査結果を取り込めます
+              </p>
+            </div>
+          ) : (
+            <div style={styles.labTimeline}>
+              {labResults.map((lab) => (
+                <div key={lab.id} style={styles.labCard}>
+                  <div style={styles.labCardHeader}>
+                    <span style={styles.labDate}>{lab.date}</span>
+                    <div style={{display: 'flex', alignItems: 'center', gap: '12px'}}>
+                      <span style={styles.labItemCount}>{lab.data?.length || 0} 項目</span>
+                      <button
+                        onClick={() => {
+                          if (editingLabId === lab.id) {
+                            setEditingLabId(null);
+                            setEditLabItem({ item: '', value: '', unit: '' });
+                          } else {
+                            setEditingLabId(lab.id);
+                          }
+                        }}
+                        style={{...styles.editButton, padding: '4px 12px', fontSize: '12px'}}
+                      >
+                        {editingLabId === lab.id ? '完了' : '編集'}
+                      </button>
+                      <button
+                        onClick={() => deleteLabResult(lab.id)}
+                        style={styles.deleteButton}
+                      >
+                        削除
+                      </button>
+                    </div>
+                  </div>
+                  <div style={styles.labDataGrid}>
+                    {lab.data?.map((item, idx) => (
+                      <div key={idx} style={{...styles.labDataItem, position: 'relative'}}>
+                        <span style={styles.labItemName}>{item.item}</span>
+                        <span style={styles.labItemValue}>
+                          {item.value}
+                          <span style={styles.labItemUnit}> {item.unit}</span>
+                        </span>
+                        {editingLabId === lab.id && (
+                          <button
+                            onClick={() => removeItemFromLabResult(lab.id, idx)}
+                            style={{
+                              position: 'absolute',
+                              top: '-6px',
+                              right: '-6px',
+                              width: '20px',
+                              height: '20px',
+                              borderRadius: '50%',
+                              border: 'none',
+                              background: '#ef4444',
+                              color: 'white',
+                              fontSize: '12px',
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                            }}
+                          >
+                            ×
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                  {/* 編集モード：項目追加フォーム */}
+                  {editingLabId === lab.id && (
+                    <div style={{
+                      marginTop: '16px',
+                      padding: '16px',
+                      background: '#f0fdf4',
+                      borderRadius: '8px',
+                      border: '1px solid #bbf7d0'
+                    }}>
+                      <p style={{fontSize: '13px', fontWeight: '500', marginBottom: '12px', color: '#166534'}}>
+                        項目を追加
+                      </p>
+                      <div style={{display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'flex-end'}}>
+                        <div>
+                          <label style={{fontSize: '11px', color: '#6b7280'}}>項目名</label>
+                          <input
+                            type="text"
+                            value={editLabItem.item}
+                            onChange={(e) => setEditLabItem({...editLabItem, item: e.target.value})}
+                            style={{...styles.input, width: '120px', padding: '8px'}}
+                            placeholder="例: CRP"
+                          />
+                        </div>
+                        <div>
+                          <label style={{fontSize: '11px', color: '#6b7280'}}>値</label>
+                          <input
+                            type="text"
+                            value={editLabItem.value}
+                            onChange={(e) => setEditLabItem({...editLabItem, value: e.target.value})}
+                            style={{...styles.input, width: '100px', padding: '8px'}}
+                            placeholder="例: 0.5"
+                          />
+                        </div>
+                        <div>
+                          <label style={{fontSize: '11px', color: '#6b7280'}}>単位</label>
+                          <input
+                            type="text"
+                            value={editLabItem.unit}
+                            onChange={(e) => setEditLabItem({...editLabItem, unit: e.target.value})}
+                            style={{...styles.input, width: '80px', padding: '8px'}}
+                            placeholder="例: mg/dL"
+                          />
+                        </div>
+                        <button
+                          onClick={() => addItemToLabResult(lab.id)}
+                          disabled={!editLabItem.item || !editLabItem.value}
+                          style={{
+                            ...styles.saveButton,
+                            padding: '8px 16px',
+                            opacity: (!editLabItem.item || !editLabItem.value) ? 0.5 : 1
+                          }}
+                        >
+                          追加
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      </main>
+
+      {/* 臨床経過イベント追加モーダル */}
+      {showAddEventModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '500px'}}>
+            <h2 style={styles.modalTitle}>臨床経過イベントを追加</h2>
+
+            <div style={styles.inputGroup}>
+              <label style={styles.inputLabel}>イベント種類 *</label>
+              <select
+                value={newEvent.eventType}
+                onChange={(e) => setNewEvent({...newEvent, eventType: e.target.value})}
+                style={{...styles.input, width: '100%'}}
+              >
+                <option value="">選択してください</option>
+                {availableEventTypes.map(type => (
+                  <option key={type} value={type}>{type}</option>
+                ))}
+              </select>
+            </div>
+
+            {newEvent.eventType === 'その他' && (
+              <div style={{...styles.inputGroup, marginTop: '12px'}}>
+                <label style={styles.inputLabel}>カスタムイベント名 *</label>
+                <input
+                  type="text"
+                  value={newEvent.customEventType}
+                  onChange={(e) => setNewEvent({...newEvent, customEventType: e.target.value})}
+                  style={styles.input}
+                  placeholder="例: 嚥下障害"
+                />
+              </div>
+            )}
+
+            <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '16px'}}>
+              <div style={styles.inputGroup}>
+                <label style={styles.inputLabel}>開始日 *</label>
+                <input
+                  type="date"
+                  value={newEvent.startDate}
+                  onChange={(e) => setNewEvent({
+                    ...newEvent,
+                    startDate: e.target.value,
+                    endDate: e.target.value // 終了日も同じ日に自動設定
+                  })}
+                  style={styles.input}
+                />
+              </div>
+              <div style={styles.inputGroup}>
+                <label style={styles.inputLabel}>
+                  終了日{eventTypeConfig[newEvent.eventType]?.inputType === 'presence' ? '（該当なし）' : '（任意）'}
+                </label>
+                <input
+                  type="date"
+                  value={newEvent.endDate}
+                  onChange={(e) => setNewEvent({...newEvent, endDate: e.target.value})}
+                  style={styles.input}
+                  disabled={eventTypeConfig[newEvent.eventType]?.inputType === 'presence'}
+                />
+              </div>
+            </div>
+
+            {/* JCSスケール入力（意識障害の場合） */}
+            {eventTypeConfig[newEvent.eventType]?.inputType === 'jcs' && (
+              <div style={{...styles.inputGroup, marginTop: '16px'}}>
+                <label style={styles.inputLabel}>JCSスケール *</label>
+                <select
+                  value={newEvent.jcs}
+                  onChange={(e) => setNewEvent({...newEvent, jcs: e.target.value})}
+                  style={{...styles.input, width: '100%'}}
+                >
+                  <option value="">選択してください</option>
+                  {jcsOptions.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* 頻度入力（てんかん発作、不随意運動の場合） */}
+            {eventTypeConfig[newEvent.eventType]?.inputType === 'frequency' && (
+              <div style={{...styles.inputGroup, marginTop: '16px'}}>
+                <label style={styles.inputLabel}>頻度 *</label>
+                <div style={{display: 'flex', flexWrap: 'wrap', gap: '8px'}}>
+                  {frequencyOptions.map(opt => (
+                    <label
+                      key={opt.value}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        padding: '8px 12px',
+                        borderRadius: '6px',
+                        cursor: 'pointer',
+                        background: newEvent.frequency === opt.value ? '#dbeafe' : '#f8fafc',
+                        border: newEvent.frequency === opt.value ? '2px solid #3b82f6' : '1px solid #e2e8f0'
+                      }}
+                    >
+                      <input
+                        type="radio"
+                        name="frequency"
+                        value={opt.value}
+                        checked={newEvent.frequency === opt.value}
+                        onChange={(e) => setNewEvent({...newEvent, frequency: e.target.value})}
+                        style={{display: 'none'}}
+                      />
+                      <span style={{fontSize: '13px'}}>{opt.label}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 有無入力（頭痛、髄膜刺激症状、人工呼吸器、ICUの場合） */}
+            {eventTypeConfig[newEvent.eventType]?.inputType === 'presence' && (
+              <div style={{...styles.inputGroup, marginTop: '16px'}}>
+                <label style={styles.inputLabel}>有無 *</label>
+                <div style={{display: 'flex', gap: '10px'}}>
+                  {['あり', 'なし'].map(val => (
+                    <label
+                      key={val}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        padding: '10px 20px',
+                        borderRadius: '6px',
+                        cursor: 'pointer',
+                        background: newEvent.presence === val ? (val === 'あり' ? '#fee2e2' : '#dcfce7') : '#f8fafc',
+                        border: newEvent.presence === val ? `2px solid ${val === 'あり' ? '#ef4444' : '#22c55e'}` : '1px solid #e2e8f0'
+                      }}
+                    >
+                      <input
+                        type="radio"
+                        name="presence"
+                        value={val}
+                        checked={newEvent.presence === val}
+                        onChange={(e) => setNewEvent({...newEvent, presence: e.target.value})}
+                        style={{display: 'none'}}
+                      />
+                      <span style={{fontSize: '14px', fontWeight: '500'}}>{val}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 重症度入力（その他のイベントの場合） */}
+            {(eventTypeConfig[newEvent.eventType]?.inputType === 'severity' || newEvent.eventType === 'その他') && (
+              <div style={{...styles.inputGroup, marginTop: '16px'}}>
+                <label style={styles.inputLabel}>重症度（任意）</label>
+                <div style={{display: 'flex', gap: '10px'}}>
+                  {['軽症', '中等症', '重症'].map(sev => (
+                    <label
+                      key={sev}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        padding: '8px 12px',
+                        borderRadius: '6px',
+                        cursor: 'pointer',
+                        background: newEvent.severity === sev ? '#fef3c7' : '#f8fafc',
+                        border: newEvent.severity === sev ? '2px solid #f59e0b' : '1px solid #e2e8f0'
+                      }}
+                    >
+                      <input
+                        type="radio"
+                        name="severity"
+                        value={sev}
+                        checked={newEvent.severity === sev}
+                        onChange={(e) => setNewEvent({...newEvent, severity: e.target.value})}
+                        style={{display: 'none'}}
+                      />
+                      <span style={{fontSize: '13px'}}>{sev}</span>
+                    </label>
+                  ))}
+                  {newEvent.severity && (
+                    <button
+                      onClick={() => setNewEvent({...newEvent, severity: ''})}
+                      style={{
+                        background: 'transparent',
+                        border: 'none',
+                        color: '#6b7280',
+                        cursor: 'pointer',
+                        fontSize: '12px'
+                      }}
+                    >
+                      クリア
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div style={{...styles.inputGroup, marginTop: '16px'}}>
+              <label style={styles.inputLabel}>メモ（任意）</label>
+              <textarea
+                value={newEvent.note}
+                onChange={(e) => setNewEvent({...newEvent, note: e.target.value})}
+                style={{...styles.input, minHeight: '80px', resize: 'vertical'}}
+                placeholder="詳細な経過や治療内容など"
+              />
+            </div>
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => {
+                  setShowAddEventModal(false);
+                  setNewEvent({
+                    eventType: '',
+                    customEventType: '',
+                    startDate: '',
+                    endDate: '',
+                    severity: '',
+                    jcs: '',
+                    frequency: '',
+                    presence: '',
+                    note: ''
+                  });
+                }}
+                style={styles.cancelButton}
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={addClinicalEvent}
+                disabled={
+                  !newEvent.eventType ||
+                  !newEvent.startDate ||
+                  (newEvent.eventType === 'その他' && !newEvent.customEventType) ||
+                  (eventTypeConfig[newEvent.eventType]?.inputType === 'jcs' && !newEvent.jcs) ||
+                  (eventTypeConfig[newEvent.eventType]?.inputType === 'frequency' && !newEvent.frequency) ||
+                  (eventTypeConfig[newEvent.eventType]?.inputType === 'presence' && !newEvent.presence)
+                }
+                style={{
+                  ...styles.primaryButton,
+                  backgroundColor: '#f59e0b',
+                  opacity: (!newEvent.eventType || !newEvent.startDate) ? 0.5 : 1
+                }}
+              >
+                追加
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 治療薬追加モーダル */}
+      {showAddTreatmentModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '550px'}}>
+            <h2 style={styles.modalTitle}>治療薬を追加</h2>
+
+            <div style={styles.inputGroup}>
+              <label style={styles.inputLabel}>カテゴリ *</label>
+              <select
+                value={newTreatment.category}
+                onChange={(e) => {
+                  const category = e.target.value;
+                  const defaultUnit = treatmentCategories[category]?.defaultUnit || '';
+                  setNewTreatment({
+                    ...newTreatment,
+                    category: category,
+                    medicationName: '',
+                    customMedication: '',
+                    dosageUnit: defaultUnit
+                  });
+                }}
+                style={{...styles.input, width: '100%'}}
+              >
+                <option value="">選択してください</option>
+                {Object.keys(treatmentCategories).map(cat => (
+                  <option key={cat} value={cat}>{cat}</option>
+                ))}
+              </select>
+            </div>
+
+            {newTreatment.category && (
+              <div style={{...styles.inputGroup, marginTop: '12px'}}>
+                <label style={styles.inputLabel}>薬剤名 *</label>
+                {treatmentCategories[newTreatment.category]?.medications.length > 0 ? (
+                  <select
+                    value={newTreatment.medicationName}
+                    onChange={(e) => setNewTreatment({...newTreatment, medicationName: e.target.value})}
+                    style={{...styles.input, width: '100%'}}
+                  >
+                    <option value="">選択してください</option>
+                    {treatmentCategories[newTreatment.category].medications.map(med => (
+                      <option key={med} value={med}>{med}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    type="text"
+                    value={newTreatment.customMedication}
+                    onChange={(e) => setNewTreatment({...newTreatment, customMedication: e.target.value})}
+                    style={styles.input}
+                    placeholder="薬剤名を入力"
+                  />
+                )}
+              </div>
+            )}
+
+            {newTreatment.medicationName === 'その他' && (
+              <div style={{...styles.inputGroup, marginTop: '12px'}}>
+                <label style={styles.inputLabel}>薬剤名（その他） *</label>
+                <input
+                  type="text"
+                  value={newTreatment.customMedication}
+                  onChange={(e) => setNewTreatment({...newTreatment, customMedication: e.target.value})}
+                  style={styles.input}
+                  placeholder="薬剤名を入力"
+                />
+              </div>
+            )}
+
+            <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '16px'}}>
+              <div style={styles.inputGroup}>
+                <label style={styles.inputLabel}>投与量</label>
+                <input
+                  type="text"
+                  value={newTreatment.dosage}
+                  onChange={(e) => setNewTreatment({...newTreatment, dosage: e.target.value})}
+                  style={styles.input}
+                  placeholder="例: 500"
+                />
+              </div>
+              <div style={styles.inputGroup}>
+                <label style={styles.inputLabel}>単位</label>
+                <select
+                  value={newTreatment.dosageUnit}
+                  onChange={(e) => setNewTreatment({...newTreatment, dosageUnit: e.target.value})}
+                  style={{...styles.input, width: '100%'}}
+                >
+                  <option value="">選択してください</option>
+                  {dosageUnits.map(unit => (
+                    <option key={unit} value={unit}>{unit}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '16px'}}>
+              <div style={styles.inputGroup}>
+                <label style={styles.inputLabel}>開始日 *</label>
+                <input
+                  type="date"
+                  value={newTreatment.startDate}
+                  onChange={(e) => setNewTreatment({
+                    ...newTreatment,
+                    startDate: e.target.value,
+                    endDate: e.target.value // 終了日も同じ日に自動設定
+                  })}
+                  style={styles.input}
+                />
+              </div>
+              <div style={styles.inputGroup}>
+                <label style={styles.inputLabel}>終了日（任意）</label>
+                <input
+                  type="date"
+                  value={newTreatment.endDate}
+                  onChange={(e) => setNewTreatment({...newTreatment, endDate: e.target.value})}
+                  style={styles.input}
+                />
+              </div>
+            </div>
+
+            <div style={{...styles.inputGroup, marginTop: '16px'}}>
+              <label style={styles.inputLabel}>メモ（任意）</label>
+              <textarea
+                value={newTreatment.note}
+                onChange={(e) => setNewTreatment({...newTreatment, note: e.target.value})}
+                style={{...styles.input, minHeight: '60px', resize: 'vertical'}}
+                placeholder="投与方法、効果、副作用など"
+              />
+            </div>
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => {
+                  setShowAddTreatmentModal(false);
+                  setNewTreatment({
+                    category: '',
+                    medicationName: '',
+                    customMedication: '',
+                    dosage: '',
+                    dosageUnit: '',
+                    startDate: '',
+                    endDate: '',
+                    note: ''
+                  });
+                }}
+                style={styles.cancelButton}
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={addTreatment}
+                disabled={
+                  !newTreatment.category ||
+                  !newTreatment.startDate ||
+                  (!newTreatment.medicationName && !newTreatment.customMedication) ||
+                  (newTreatment.medicationName === 'その他' && !newTreatment.customMedication)
+                }
+                style={{
+                  ...styles.primaryButton,
+                  backgroundColor: '#059669',
+                  opacity: (!newTreatment.category || !newTreatment.startDate) ? 0.5 : 1
+                }}
+              >
+                追加
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 臨床経過タイムラインモーダル */}
+      {showClinicalTimeline && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '95vw', maxHeight: '90vh', overflow: 'auto'}}>
+            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px'}}>
+              <h2 style={styles.modalTitle}>臨床経過タイムライン - {patient?.displayId}</h2>
+              <button
+                onClick={() => setShowClinicalTimeline(false)}
+                style={{
+                  background: 'transparent',
+                  border: 'none',
+                  fontSize: '24px',
+                  cursor: 'pointer',
+                  color: '#6b7280'
+                }}
+              >
+                ×
+              </button>
+            </div>
+
+            <div ref={timelineRef} style={{background: 'white', padding: '20px'}}>
+              {/* 患者情報 */}
+              <div style={{
+                marginBottom: '24px',
+                padding: '16px',
+                background: '#f9fafb',
+                borderRadius: '8px',
+                display: 'flex',
+                gap: '24px',
+                flexWrap: 'wrap'
+              }}>
+                <div><strong>患者ID:</strong> {patient?.displayId}</div>
+                <div><strong>診断:</strong> {patient?.diagnosis}</div>
+                <div><strong>群:</strong> {patient?.group || '未設定'}</div>
+                <div><strong>発症日:</strong> {patient?.onsetDate || '未設定'}</div>
+              </div>
+
+              {(() => {
+                if (!patient.onsetDate) {
+                  return <p style={{color: '#6b7280'}}>発症日が設定されていないため、タイムラインを表示できません。</p>;
+                }
+
+                // 全データのDay範囲を計算
+                const allDays = [
+                  ...treatments.flatMap(t => [
+                    calcDaysFromOnset(t.startDate),
+                    t.endDate ? calcDaysFromOnset(t.endDate) : calcDaysFromOnset(t.startDate)
+                  ]),
+                  ...clinicalEvents.flatMap(e => [
+                    calcDaysFromOnset(e.startDate),
+                    e.endDate ? calcDaysFromOnset(e.endDate) : calcDaysFromOnset(e.startDate)
+                  ])
+                ].filter(d => d !== null);
+
+                if (allDays.length === 0) {
+                  return <p style={{color: '#6b7280'}}>表示するデータがありません。</p>;
+                }
+
+                const minDay = Math.min(...allDays, 0);
+                const maxDay = Math.max(...allDays) + 3;
+                const dayRange = maxDay - minDay || 1;
+
+                // カテゴリの色
+                const treatmentColors = {
+                  '抗てんかん薬': '#f59e0b',
+                  'ステロイド': '#ec4899',
+                  '免疫グロブリン': '#3b82f6',
+                  '血漿交換': '#6366f1',
+                  '免疫抑制剤': '#8b5cf6',
+                  '抗ウイルス薬': '#14b8a6',
+                  '抗菌薬': '#eab308',
+                  '抗浮腫薬': '#0ea5e9',
+                  'その他': '#6b7280'
+                };
+
+                const eventColors = {
+                  '意識障害': '#dc2626',
+                  'てんかん発作': '#ea580c',
+                  '不随意運動': '#d97706',
+                  '麻痺': '#ca8a04',
+                  '感覚障害': '#65a30d',
+                  '失語': '#16a34a',
+                  '認知機能障害': '#0d9488',
+                  '精神症状': '#0891b2',
+                  '発熱': '#ef4444',
+                  '頭痛': '#f97316',
+                  '髄膜刺激症状': '#84cc16',
+                  '人工呼吸器管理': '#7c3aed',
+                  'ICU入室': '#9333ea'
+                };
+
+                return (
+                  <>
+                    {/* X軸（Day表示） */}
+                    <div style={{marginLeft: '180px', marginBottom: '8px', position: 'relative', height: '24px', borderBottom: '1px solid #e5e7eb'}}>
+                      {[...Array(Math.ceil(dayRange / 5) + 1)].map((_, i) => {
+                        const day = minDay + i * 5;
+                        if (day > maxDay) return null;
+                        const leftPercent = ((day - minDay) / dayRange) * 100;
+                        return (
+                          <div key={i} style={{position: 'absolute', left: `${leftPercent}%`, transform: 'translateX(-50%)'}}>
+                            <span style={{fontSize: '11px', color: '#374151', fontWeight: '500'}}>Day {day}</span>
+                            <div style={{width: '1px', height: '8px', background: '#d1d5db', margin: '0 auto'}} />
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* 臨床症状セクション */}
+                    {clinicalEvents.length > 0 && (
+                      <>
+                        <div style={{fontSize: '13px', fontWeight: '600', color: '#374151', marginBottom: '8px', marginTop: '16px'}}>
+                          臨床症状
+                        </div>
+                        <div style={{display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '20px'}}>
+                          {clinicalEvents.map((event, idx) => {
+                            const startDay = calcDaysFromOnset(event.startDate);
+                            const endDay = event.endDate ? calcDaysFromOnset(event.endDate) : startDay;
+                            const isSingleDay = startDay === endDay;
+                            const color = eventColors[event.eventType] || '#6b7280';
+
+                            const leftPercent = ((startDay - minDay) / dayRange) * 100;
+                            const widthPercent = isSingleDay ? 0 : ((endDay - startDay) / dayRange) * 100;
+
+                            // 症状の詳細表示
+                            let detailText = '';
+                            if (event.jcs) detailText = `JCS ${event.jcs}`;
+                            else if (event.frequency) {
+                              const freqLabels = {hourly: '毎時間', several_daily: '1日数回', daily: '毎日', several_weekly: '週数回', weekly: '週1回', monthly: '月1回', rare: '稀'};
+                              detailText = freqLabels[event.frequency] || event.frequency;
+                            }
+                            else if (event.presence) detailText = event.presence;
+                            else if (event.severity) detailText = event.severity;
+
+                            return (
+                              <div key={idx} style={{display: 'flex', alignItems: 'center', height: '26px'}}>
+                                <div style={{
+                                  width: '180px',
+                                  flexShrink: 0,
+                                  fontSize: '11px',
+                                  color: '#374151',
+                                  paddingRight: '12px',
+                                  textAlign: 'right',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'flex-end',
+                                  gap: '6px'
+                                }}>
+                                  <span style={{
+                                    width: '8px',
+                                    height: '8px',
+                                    borderRadius: '50%',
+                                    background: color,
+                                    flexShrink: 0
+                                  }} />
+                                  <span style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+                                    {event.eventType}
+                                  </span>
+                                </div>
+
+                                <div style={{
+                                  flex: 1,
+                                  position: 'relative',
+                                  height: '100%',
+                                  background: '#fafafa'
+                                }}>
+                                  {isSingleDay ? (
+                                    <div
+                                      style={{
+                                        position: 'absolute',
+                                        left: `${leftPercent}%`,
+                                        top: '50%',
+                                        transform: 'translate(-50%, -50%)',
+                                        width: '10px',
+                                        height: '10px',
+                                        background: color,
+                                        borderRadius: '50%'
+                                      }}
+                                      title={`${event.eventType}: Day ${startDay}${detailText ? ` (${detailText})` : ''}`}
+                                    />
+                                  ) : (
+                                    <div
+                                      style={{
+                                        position: 'absolute',
+                                        left: `${leftPercent}%`,
+                                        width: `${Math.max(widthPercent, 0.5)}%`,
+                                        height: '18px',
+                                        top: '50%',
+                                        transform: 'translateY(-50%)',
+                                        background: `linear-gradient(90deg, ${color} 0%, ${color}88 100%)`,
+                                        borderRadius: '9px',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center'
+                                      }}
+                                      title={`${event.eventType}: Day ${startDay}〜${endDay}${detailText ? ` (${detailText})` : ''}`}
+                                    >
+                                      {detailText && widthPercent > 5 && (
+                                        <span style={{fontSize: '9px', color: 'white', fontWeight: '500'}}>
+                                          {detailText}
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+
+                    {/* 治療セクション */}
+                    {treatments.length > 0 && (
+                      <>
+                        <div style={{fontSize: '13px', fontWeight: '600', color: '#374151', marginBottom: '8px'}}>
+                          治療
+                        </div>
+                        <div style={{display: 'flex', flexDirection: 'column', gap: '4px'}}>
+                          {treatments.sort((a, b) => new Date(a.startDate) - new Date(b.startDate)).map((t, idx) => {
+                            const startDay = calcDaysFromOnset(t.startDate);
+                            const endDay = t.endDate ? calcDaysFromOnset(t.endDate) : startDay;
+                            const isSingleDay = startDay === endDay;
+                            const color = treatmentColors[t.category] || treatmentColors['その他'];
+
+                            const leftPercent = ((startDay - minDay) / dayRange) * 100;
+                            const widthPercent = isSingleDay ? 0 : ((endDay - startDay) / dayRange) * 100;
+
+                            return (
+                              <div key={idx} style={{display: 'flex', alignItems: 'center', height: '26px'}}>
+                                <div style={{
+                                  width: '180px',
+                                  flexShrink: 0,
+                                  fontSize: '11px',
+                                  color: '#374151',
+                                  paddingRight: '12px',
+                                  textAlign: 'right',
+                                  overflow: 'hidden',
+                                  textOverflow: 'ellipsis',
+                                  whiteSpace: 'nowrap'
+                                }} title={t.medicationName}>
+                                  {t.medicationName}
+                                </div>
+
+                                <div style={{
+                                  flex: 1,
+                                  position: 'relative',
+                                  height: '100%',
+                                  background: '#fafafa'
+                                }}>
+                                  {isSingleDay ? (
+                                    <div
+                                      style={{
+                                        position: 'absolute',
+                                        left: `${leftPercent}%`,
+                                        top: '50%',
+                                        transform: 'translate(-50%, -50%)',
+                                        width: 0,
+                                        height: 0,
+                                        borderLeft: '8px solid transparent',
+                                        borderRight: '8px solid transparent',
+                                        borderBottom: `14px solid ${color}`
+                                      }}
+                                      title={`${t.medicationName}: Day ${startDay}${t.dosage ? ` (${t.dosage}${t.dosageUnit || ''})` : ''}`}
+                                    />
+                                  ) : (
+                                    <div
+                                      style={{
+                                        position: 'absolute',
+                                        left: `${leftPercent}%`,
+                                        width: `${Math.max(widthPercent, 0.5)}%`,
+                                        height: '18px',
+                                        top: '50%',
+                                        transform: 'translateY(-50%)',
+                                        background: color,
+                                        borderRadius: '4px',
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center'
+                                      }}
+                                      title={`${t.medicationName}: Day ${startDay}〜${endDay}${t.dosage ? ` (${t.dosage}${t.dosageUnit || ''})` : ''}`}
+                                    >
+                                      {t.dosage && widthPercent > 5 && (
+                                        <span style={{fontSize: '9px', color: 'white', fontWeight: '500'}}>
+                                          {t.dosage}{t.dosageUnit ? t.dosageUnit.replace('/日', '') : ''}
+                                        </span>
+                                      )}
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+
+                    {/* 凡例 */}
+                    <div style={{marginTop: '24px', paddingTop: '16px', borderTop: '1px solid #e5e7eb'}}>
+                      <div style={{fontSize: '12px', fontWeight: '600', color: '#374151', marginBottom: '8px'}}>凡例</div>
+                      <div style={{display: 'flex', flexWrap: 'wrap', gap: '16px'}}>
+                        <div>
+                          <div style={{fontSize: '10px', color: '#6b7280', marginBottom: '4px'}}>症状</div>
+                          <div style={{display: 'flex', flexWrap: 'wrap', gap: '8px'}}>
+                            {Object.entries(eventColors).map(([name, color]) => {
+                              const hasEvent = clinicalEvents.some(e => e.eventType === name);
+                              if (!hasEvent) return null;
+                              return (
+                                <div key={name} style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
+                                  <div style={{width: '10px', height: '10px', borderRadius: '50%', background: color}} />
+                                  <span style={{fontSize: '10px', color: '#6b7280'}}>{name}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                        <div>
+                          <div style={{fontSize: '10px', color: '#6b7280', marginBottom: '4px'}}>治療</div>
+                          <div style={{display: 'flex', flexWrap: 'wrap', gap: '8px'}}>
+                            {Object.entries(treatmentColors).map(([name, color]) => {
+                              const hasTreat = treatments.some(t => t.category === name);
+                              if (!hasTreat) return null;
+                              return (
+                                <div key={name} style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
+                                  <div style={{width: '12px', height: '8px', borderRadius: '2px', background: color}} />
+                                  <span style={{fontSize: '10px', color: '#6b7280'}}>{name}</span>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                        <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                          <div style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
+                            <div style={{
+                              width: 0,
+                              height: 0,
+                              borderLeft: '6px solid transparent',
+                              borderRight: '6px solid transparent',
+                              borderBottom: '10px solid #6b7280'
+                            }} />
+                            <span style={{fontSize: '10px', color: '#6b7280'}}>単発治療</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                );
+              })()}
+            </div>
+
+            <div style={{display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px'}}>
+              <button
+                onClick={() => setShowClinicalTimeline(false)}
+                style={styles.cancelButton}
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 検査データ追加モーダル */}
+      {showAddLabModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '620px'}}>
+            <h2 style={styles.modalTitle}>検査データを追加</h2>
+
+            <div style={styles.inputGroup}>
+              <label style={styles.inputLabel}>検査日 *</label>
+              <input
+                type="date"
+                value={labDate}
+                onChange={(e) => setLabDate(e.target.value)}
+                style={styles.input}
+              />
+            </div>
+
+            <div style={styles.uploadSection}>
+              <label style={styles.inputLabel}>検査結果の写真</label>
+              <div style={styles.uploadArea}>
+                {!selectedImage ? (
+                  <label style={styles.uploadLabel}>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      onChange={handleImageUpload}
+                      style={{ display: 'none' }}
+                    />
+                    <div 
+                      style={styles.uploadContent}
+                      onMouseOver={(e) => e.currentTarget.style.borderColor = '#94a3b8'}
+                      onMouseOut={(e) => e.currentTarget.style.borderColor = '#cbd5e1'}
+                    >
+                      <span style={styles.uploadIcon}>📷</span>
+                      <span style={{fontWeight: '500', color: '#475569'}}>
+                        クリックして画像を選択
+                      </span>
+                      <span style={styles.uploadHint}>
+                        ※ 個人情報（氏名・ID等）は自動的に除外されます<br/>
+                        検査値のみが抽出されます
+                      </span>
+                    </div>
+                  </label>
+                ) : (
+                  <div style={styles.previewContainer}>
+                    <img src={selectedImage} alt="Preview" style={styles.previewImage} />
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {isProcessing && (
+              <div style={styles.processingState}>
+                <div style={styles.progressBar}>
+                  <div style={{...styles.progressFill, width: `${ocrProgress}%`}} />
+                </div>
+                <span style={{fontWeight: '500', color: '#1d4ed8'}}>
+                  検査値を読み取り中... {ocrProgress}%
+                </span>
+                <span style={styles.processingNote}>
+                  個人情報を除外し、検査値のみ抽出しています
+                </span>
+              </div>
+            )}
+
+            {ocrResults !== null && !isProcessing && (
+              <div style={styles.ocrResults}>
+                <h3 style={styles.ocrTitle}>
+                  ✓ 抽出された検査値 ({ocrResults.length} 項目)
+                </h3>
+                <p style={styles.ocrNote}>
+                  🔒 個人情報（氏名・ID・住所等）は除外済み
+                </p>
+                {ocrResults.length > 0 ? (
+                  <div style={styles.ocrGrid}>
+                    {ocrResults.map((item, idx) => (
+                      <div key={idx} style={styles.ocrItem}>
+                        <span style={styles.ocrItemName}>{item.item}</span>
+                        <span style={styles.ocrItemValue}>{item.value} {item.unit}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p style={{fontSize: '13px', color: '#64748b'}}>
+                    検査値が検出されませんでした。下の手動入力をご利用ください。
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* 手動入力セクション */}
+            <div style={styles.manualEntrySection}>
+              <div style={styles.manualEntryTitle}>検査値を手動で追加</div>
+              <div style={styles.manualEntryRow}>
+                <input
+                  type="text"
+                  placeholder="項目名 (例: CRP)"
+                  value={manualItem.item}
+                  onChange={(e) => setManualItem({...manualItem, item: e.target.value})}
+                  style={{...styles.manualInput, flex: 1}}
+                />
+                <input
+                  type="number"
+                  placeholder="値"
+                  value={manualItem.value}
+                  onChange={(e) => setManualItem({...manualItem, value: e.target.value})}
+                  style={{...styles.manualInput, width: '80px'}}
+                />
+                <input
+                  type="text"
+                  placeholder="単位"
+                  value={manualItem.unit}
+                  onChange={(e) => setManualItem({...manualItem, unit: e.target.value})}
+                  style={{...styles.manualInput, width: '80px'}}
+                />
+                <button onClick={addManualItem} style={styles.addItemButton}>
+                  追加
+                </button>
+              </div>
+            </div>
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => {
+                  setShowAddLabModal(false);
+                  setOcrResults(null);
+                  setSelectedImage(null);
+                  setLabDate('');
+                }}
+                style={styles.cancelButton}
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={saveLabResults}
+                style={{
+                  ...styles.primaryButton,
+                  opacity: (!ocrResults || ocrResults.length === 0 || !labDate) ? 0.5 : 1
+                }}
+                disabled={!ocrResults || ocrResults.length === 0 || !labDate}
+              >
+                保存
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Excelインポートモーダル */}
+      {showExcelModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '800px'}}>
+            <h2 style={styles.modalTitle}>Excelから検査データをインポート</h2>
+
+            {!excelData ? (
+              <div style={styles.uploadArea}>
+                <label style={styles.uploadLabel}>
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls"
+                    onChange={handleExcelUpload}
+                    style={{ display: 'none' }}
+                  />
+                  <div style={styles.uploadContent}>
+                    <span style={styles.uploadIcon}>📊</span>
+                    <span style={{fontWeight: '500', color: '#475569'}}>
+                      クリックしてExcelファイルを選択
+                    </span>
+                    <span style={styles.uploadHint}>
+                      .xlsx または .xls ファイルに対応
+                    </span>
+                  </div>
+                </label>
+              </div>
+            ) : (
+              <>
+                {/* シート選択 */}
+                <div style={{marginBottom: '20px'}}>
+                  <label style={styles.inputLabel}>シートを選択</label>
+                  <select
+                    value={selectedSheet}
+                    onChange={(e) => handleSheetChange(e.target.value)}
+                    style={{...styles.input, width: '100%', marginTop: '8px'}}
+                  >
+                    {excelSheets.map(sheet => (
+                      <option key={sheet} value={sheet}>{sheet}</option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* プレビュー */}
+                {parsedExcelData.length > 0 ? (
+                  <div style={{maxHeight: '400px', overflowY: 'auto'}}>
+                    <p style={{fontSize: '14px', color: '#059669', marginBottom: '16px', fontWeight: '600'}}>
+                      ✓ {parsedExcelData.length}日分のデータが見つかりました
+                    </p>
+                    {parsedExcelData.map((dayData, idx) => (
+                      <div key={idx} style={{...styles.labCard, marginBottom: '12px'}}>
+                        <div style={styles.labCardHeader}>
+                          <span style={styles.labDate}>
+                            {dayData.date} ({dayData.day})
+                            {dayData.specimen && <span style={{marginLeft: '8px', fontSize: '12px', color: '#6b7280'}}>- {dayData.specimen}</span>}
+                          </span>
+                          <span style={styles.labItemCount}>{dayData.data.length} 項目</span>
+                        </div>
+                        <div style={styles.labDataGrid}>
+                          {dayData.data.slice(0, 8).map((item, i) => (
+                            <div key={i} style={styles.labDataItem}>
+                              <span style={styles.labItemName}>{item.item}</span>
+                              <span style={styles.labItemValue}>
+                                {item.value}
+                                <span style={styles.labItemUnit}> {item.unit}</span>
+                              </span>
+                            </div>
+                          ))}
+                          {dayData.data.length > 8 && (
+                            <div style={{...styles.labDataItem, background: '#f1f5f9', justifyContent: 'center'}}>
+                              <span style={{color: '#64748b', fontSize: '12px'}}>
+                                +{dayData.data.length - 8} 項目
+                              </span>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p style={{color: '#64748b', textAlign: 'center', padding: '40px'}}>
+                    このシートには検査データが見つかりませんでした
+                  </p>
+                )}
+              </>
+            )}
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => {
+                  setShowExcelModal(false);
+                  setExcelData(null);
+                  setExcelSheets([]);
+                  setParsedExcelData([]);
+                }}
+                style={styles.cancelButton}
+              >
+                キャンセル
+              </button>
+              {excelData && parsedExcelData.length > 0 && (
+                <button
+                  onClick={importExcelData}
+                  style={{...styles.primaryButton, opacity: isImporting ? 0.7 : 1}}
+                  disabled={isImporting}
+                >
+                  {isImporting ? 'インポート中...' : `${parsedExcelData.length}日分をインポート`}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// メインアプリケーション
+// ============================================================
+function App() {
+  const { user } = useAuth();
+  const [selectedPatient, setSelectedPatient] = useState(null);
+
+  if (!user) {
+    return <LoginView />;
+  }
+
+  if (selectedPatient) {
+    return (
+      <PatientDetailView
+        patient={selectedPatient}
+        onBack={() => setSelectedPatient(null)}
+      />
+    );
+  }
+
+  return <PatientsListView onSelectPatient={setSelectedPatient} />;
+}
+
+// AuthProviderでラップしてエクスポート
+export default function AppWithAuth() {
+  return (
+    <AuthProvider>
+      <App />
+    </AuthProvider>
+  );
+}
