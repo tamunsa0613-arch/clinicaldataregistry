@@ -1180,6 +1180,8 @@ function PatientsListView({ onSelectPatient }) {
   });
   const [loading, setLoading] = useState(true);
   const [isExporting, setIsExporting] = useState(false);
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportFormat, setExportFormat] = useState('long'); // 'long', 'wide', 'integrated'
 
   // 分析機能用state
   const [showAnalysisModal, setShowAnalysisModal] = useState(false);
@@ -1366,21 +1368,31 @@ function PatientsListView({ onSelectPatient }) {
     return Math.ceil((target - onset) / (1000 * 60 * 60 * 24));
   };
 
-  const exportAllData = async () => {
+  // エクスポート実行（形式選択後）
+  const executeExport = async (format) => {
     if (patients.length === 0) {
       alert('エクスポートするデータがありません');
       return;
     }
 
     setIsExporting(true);
+    setShowExportModal(false);
 
     try {
-      // 全患者の検査データを取得
-      const allLabData = [];
-      const allTreatmentData = [];
-      const allEventData = [];
+      // 全患者のデータを取得
+      const allPatientData = [];
 
       for (const patient of patients) {
+        const patientInfo = {
+          id: patient.displayId,
+          group: patient.group || '',
+          diagnosis: patient.diagnosis || '',
+          onsetDate: patient.onsetDate || '',
+          labResults: [],
+          treatments: [],
+          events: []
+        };
+
         // 検査データ
         const labQuery = query(
           collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
@@ -1390,26 +1402,12 @@ function PatientsListView({ onSelectPatient }) {
 
         labSnapshot.docs.forEach(labDoc => {
           const labData = labDoc.data();
-          const labDate = labData.date;
-          const specimen = labData.specimen || '';
-          const dayFromOnset = calcDays(patient.onsetDate, labDate);
-
-          if (labData.data && Array.isArray(labData.data)) {
-            labData.data.forEach(item => {
-              allLabData.push({
-                PatientID: patient.displayId,
-                Group: patient.group || '',
-                Diagnosis: patient.diagnosis || '',
-                OnsetDate: patient.onsetDate || '',
-                LabDate: labDate,
-                DayFromOnset: dayFromOnset,
-                Specimen: specimen,
-                Item: item.item,
-                Value: item.value,
-                Unit: item.unit || ''
-              });
-            });
-          }
+          patientInfo.labResults.push({
+            date: labData.date,
+            specimen: labData.specimen || '',
+            dayFromOnset: calcDays(patient.onsetDate, labData.date),
+            items: labData.data || []
+          });
         });
 
         // 治療薬データ
@@ -1420,22 +1418,7 @@ function PatientsListView({ onSelectPatient }) {
         const treatmentSnapshot = await getDocs(treatmentQuery);
 
         treatmentSnapshot.docs.forEach(treatDoc => {
-          const t = treatDoc.data();
-          allTreatmentData.push({
-            PatientID: patient.displayId,
-            Group: patient.group || '',
-            Diagnosis: patient.diagnosis || '',
-            OnsetDate: patient.onsetDate || '',
-            Category: t.category || '',
-            MedicationName: t.medicationName || '',
-            Dosage: t.dosage || '',
-            DosageUnit: t.dosageUnit || '',
-            StartDate: t.startDate || '',
-            StartDayFromOnset: calcDays(patient.onsetDate, t.startDate),
-            EndDate: t.endDate || '',
-            EndDayFromOnset: calcDays(patient.onsetDate, t.endDate),
-            Note: t.note || ''
-          });
+          patientInfo.treatments.push(treatDoc.data());
         });
 
         // 臨床経過データ
@@ -1446,59 +1429,271 @@ function PatientsListView({ onSelectPatient }) {
         const eventSnapshot = await getDocs(eventQuery);
 
         eventSnapshot.docs.forEach(eventDoc => {
-          const e = eventDoc.data();
-          allEventData.push({
-            PatientID: patient.displayId,
-            Group: patient.group || '',
-            Diagnosis: patient.diagnosis || '',
-            OnsetDate: patient.onsetDate || '',
-            EventType: e.eventType || '',
-            StartDate: e.startDate || '',
-            StartDayFromOnset: calcDays(patient.onsetDate, e.startDate),
-            EndDate: e.endDate || '',
-            EndDayFromOnset: calcDays(patient.onsetDate, e.endDate),
-            JCS: e.jcs || '',
-            Frequency: e.frequency || '',
-            Presence: e.presence || '',
-            Severity: e.severity || '',
-            Note: e.note || ''
-          });
+          patientInfo.events.push(eventDoc.data());
         });
+
+        allPatientData.push(patientInfo);
       }
 
-      // 日付
       const dateStr = new Date().toISOString().split('T')[0];
 
-      // 検査データCSV
-      if (allLabData.length > 0) {
-        const labHeaders = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'LabDate', 'DayFromOnset', 'Specimen', 'Item', 'Value', 'Unit'];
-        downloadCSV(allLabData, labHeaders, `lab_data_${dateStr}.csv`);
+      if (format === 'long') {
+        // ロング形式（従来形式）: 1行1検査項目
+        exportLongFormat(allPatientData, dateStr);
+      } else if (format === 'wide') {
+        // ワイド形式: 患者×日付ごとに1行、検査項目を列に展開
+        exportWideFormat(allPatientData, dateStr);
+      } else if (format === 'integrated') {
+        // 統合形式: 患者ごとに時系列でまとめた形式
+        exportIntegratedFormat(allPatientData, dateStr);
       }
 
-      // 治療薬データCSV
-      if (allTreatmentData.length > 0) {
-        const treatHeaders = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'Category', 'MedicationName', 'Dosage', 'DosageUnit', 'StartDate', 'StartDayFromOnset', 'EndDate', 'EndDayFromOnset', 'Note'];
-        downloadCSV(allTreatmentData, treatHeaders, `treatment_data_${dateStr}.csv`);
-      }
-
-      // 臨床経過データCSV
-      if (allEventData.length > 0) {
-        const eventHeaders = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'EventType', 'StartDate', 'StartDayFromOnset', 'EndDate', 'EndDayFromOnset', 'JCS', 'Frequency', 'Presence', 'Severity', 'Note'];
-        downloadCSV(allEventData, eventHeaders, `clinical_events_${dateStr}.csv`);
-      }
-
-      const totalCount = allLabData.length + allTreatmentData.length + allEventData.length;
-      if (totalCount === 0) {
-        alert('エクスポートするデータがありません');
-      } else {
-        alert(`エクスポート完了:\n・検査データ: ${allLabData.length}件\n・治療薬データ: ${allTreatmentData.length}件\n・臨床経過データ: ${allEventData.length}件`);
-      }
     } catch (err) {
       console.error('Export error:', err);
       alert('エクスポートに失敗しました');
     }
 
     setIsExporting(false);
+  };
+
+  // ロング形式エクスポート（従来形式）
+  const exportLongFormat = (allPatientData, dateStr) => {
+    const allLabData = [];
+    const allTreatmentData = [];
+    const allEventData = [];
+
+    allPatientData.forEach(patient => {
+      // 検査データ
+      patient.labResults.forEach(lab => {
+        lab.items.forEach(item => {
+          allLabData.push({
+            PatientID: patient.id,
+            Group: patient.group,
+            Diagnosis: patient.diagnosis,
+            OnsetDate: patient.onsetDate,
+            LabDate: lab.date,
+            DayFromOnset: lab.dayFromOnset,
+            Specimen: lab.specimen,
+            Item: item.item,
+            Value: item.value,
+            Unit: item.unit || ''
+          });
+        });
+      });
+
+      // 治療薬データ
+      patient.treatments.forEach(t => {
+        allTreatmentData.push({
+          PatientID: patient.id,
+          Group: patient.group,
+          Diagnosis: patient.diagnosis,
+          OnsetDate: patient.onsetDate,
+          Category: t.category || '',
+          MedicationName: t.medicationName || '',
+          Dosage: t.dosage || '',
+          DosageUnit: t.dosageUnit || '',
+          StartDate: t.startDate || '',
+          StartDayFromOnset: calcDays(patient.onsetDate, t.startDate),
+          EndDate: t.endDate || '',
+          EndDayFromOnset: calcDays(patient.onsetDate, t.endDate),
+          Note: t.note || ''
+        });
+      });
+
+      // 臨床経過データ
+      patient.events.forEach(e => {
+        allEventData.push({
+          PatientID: patient.id,
+          Group: patient.group,
+          Diagnosis: patient.diagnosis,
+          OnsetDate: patient.onsetDate,
+          EventType: e.eventType || '',
+          StartDate: e.startDate || '',
+          StartDayFromOnset: calcDays(patient.onsetDate, e.startDate),
+          EndDate: e.endDate || '',
+          EndDayFromOnset: calcDays(patient.onsetDate, e.endDate),
+          JCS: e.jcs || '',
+          Frequency: e.frequency || '',
+          Presence: e.presence || '',
+          Severity: e.severity || '',
+          Note: e.note || ''
+        });
+      });
+    });
+
+    if (allLabData.length > 0) {
+      const labHeaders = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'LabDate', 'DayFromOnset', 'Specimen', 'Item', 'Value', 'Unit'];
+      downloadCSV(allLabData, labHeaders, `lab_data_long_${dateStr}.csv`);
+    }
+
+    if (allTreatmentData.length > 0) {
+      const treatHeaders = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'Category', 'MedicationName', 'Dosage', 'DosageUnit', 'StartDate', 'StartDayFromOnset', 'EndDate', 'EndDayFromOnset', 'Note'];
+      downloadCSV(allTreatmentData, treatHeaders, `treatment_data_${dateStr}.csv`);
+    }
+
+    if (allEventData.length > 0) {
+      const eventHeaders = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'EventType', 'StartDate', 'StartDayFromOnset', 'EndDate', 'EndDayFromOnset', 'JCS', 'Frequency', 'Presence', 'Severity', 'Note'];
+      downloadCSV(allEventData, eventHeaders, `clinical_events_${dateStr}.csv`);
+    }
+
+    const total = allLabData.length + allTreatmentData.length + allEventData.length;
+    if (total === 0) {
+      alert('エクスポートするデータがありません');
+    } else {
+      alert(`ロング形式エクスポート完了:\n・検査データ: ${allLabData.length}件\n・治療薬データ: ${allTreatmentData.length}件\n・臨床経過データ: ${allEventData.length}件`);
+    }
+  };
+
+  // ワイド形式エクスポート: 患者×日付ごとに1行、検査項目を列に
+  const exportWideFormat = (allPatientData, dateStr) => {
+    // 全検査項目を収集
+    const allItems = new Set();
+    allPatientData.forEach(patient => {
+      patient.labResults.forEach(lab => {
+        lab.items.forEach(item => {
+          allItems.add(item.item);
+        });
+      });
+    });
+    const itemList = Array.from(allItems).sort();
+
+    if (itemList.length === 0) {
+      alert('検査データがありません');
+      return;
+    }
+
+    // ワイド形式データ作成
+    const wideData = [];
+    allPatientData.forEach(patient => {
+      patient.labResults.forEach(lab => {
+        const row = {
+          PatientID: patient.id,
+          Group: patient.group,
+          Diagnosis: patient.diagnosis,
+          OnsetDate: patient.onsetDate,
+          LabDate: lab.date,
+          DayFromOnset: lab.dayFromOnset,
+          Specimen: lab.specimen
+        };
+
+        // 検査項目を列に展開
+        itemList.forEach(itemName => {
+          const found = lab.items.find(i => i.item === itemName);
+          row[itemName] = found ? found.value : '';
+        });
+
+        wideData.push(row);
+      });
+    });
+
+    // 患者ID→日付順でソート
+    wideData.sort((a, b) => {
+      if (a.PatientID !== b.PatientID) return a.PatientID.localeCompare(b.PatientID);
+      return (a.LabDate || '').localeCompare(b.LabDate || '');
+    });
+
+    const headers = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'LabDate', 'DayFromOnset', 'Specimen', ...itemList];
+    downloadCSV(wideData, headers, `lab_data_wide_${dateStr}.csv`);
+
+    alert(`ワイド形式エクスポート完了:\n・${wideData.length}行 × ${itemList.length}検査項目`);
+  };
+
+  // 統合形式エクスポート: 患者ごとに全データを時系列でまとめる
+  const exportIntegratedFormat = (allPatientData, dateStr) => {
+    const integratedData = [];
+
+    allPatientData.forEach(patient => {
+      // 全イベントを時系列でまとめる
+      const timeline = [];
+
+      // 検査データ
+      patient.labResults.forEach(lab => {
+        lab.items.forEach(item => {
+          timeline.push({
+            date: lab.date,
+            dayFromOnset: lab.dayFromOnset,
+            type: '検査',
+            category: lab.specimen || '血液',
+            name: item.item,
+            value: item.value,
+            unit: item.unit || '',
+            startDate: lab.date,
+            endDate: '',
+            note: ''
+          });
+        });
+      });
+
+      // 治療薬データ
+      patient.treatments.forEach(t => {
+        timeline.push({
+          date: t.startDate,
+          dayFromOnset: calcDays(patient.onsetDate, t.startDate),
+          type: '治療',
+          category: t.category || '',
+          name: t.medicationName || '',
+          value: t.dosage || '',
+          unit: t.dosageUnit || '',
+          startDate: t.startDate || '',
+          endDate: t.endDate || '',
+          note: t.note || ''
+        });
+      });
+
+      // 臨床経過データ
+      patient.events.forEach(e => {
+        timeline.push({
+          date: e.startDate,
+          dayFromOnset: calcDays(patient.onsetDate, e.startDate),
+          type: '臨床経過',
+          category: e.eventType || '',
+          name: e.jcs ? `JCS ${e.jcs}` : (e.frequency || e.presence || ''),
+          value: e.severity || '',
+          unit: '',
+          startDate: e.startDate || '',
+          endDate: e.endDate || '',
+          note: e.note || ''
+        });
+      });
+
+      // 日付順でソート
+      timeline.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+      // データ行に変換
+      timeline.forEach(item => {
+        integratedData.push({
+          PatientID: patient.id,
+          Group: patient.group,
+          Diagnosis: patient.diagnosis,
+          OnsetDate: patient.onsetDate,
+          Date: item.date,
+          DayFromOnset: item.dayFromOnset,
+          DataType: item.type,
+          Category: item.category,
+          Name: item.name,
+          Value: item.value,
+          Unit: item.unit,
+          StartDate: item.startDate,
+          EndDate: item.endDate,
+          Note: item.note
+        });
+      });
+    });
+
+    if (integratedData.length === 0) {
+      alert('エクスポートするデータがありません');
+      return;
+    }
+
+    const headers = ['PatientID', 'Group', 'Diagnosis', 'OnsetDate', 'Date', 'DayFromOnset', 'DataType', 'Category', 'Name', 'Value', 'Unit', 'StartDate', 'EndDate', 'Note'];
+    downloadCSV(integratedData, headers, `integrated_data_${dateStr}.csv`);
+
+    alert(`統合形式エクスポート完了:\n・${integratedData.length}件のデータ（検査・治療・臨床経過を統合）`);
+  };
+
+  // 従来のexportAllData関数（後方互換性のため残す）
+  const exportAllData = () => {
+    setShowExportModal(true);
   };
 
   // 分析モーダルを開く際にデータを読み込む
@@ -2191,6 +2386,157 @@ function PatientsListView({ onSelectPatient }) {
                 disabled={!newPatient.diagnosis}
               >
                 登録
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CSVエクスポート形式選択モーダル */}
+      {showExportModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '600px'}}>
+            <h2 style={styles.modalTitle}>CSVエクスポート形式を選択</h2>
+
+            <div style={{display: 'flex', flexDirection: 'column', gap: '16px', marginBottom: '24px'}}>
+              {/* ロング形式 */}
+              <div
+                onClick={() => setExportFormat('long')}
+                style={{
+                  padding: '16px',
+                  border: exportFormat === 'long' ? '2px solid #3b82f6' : '1px solid #e2e8f0',
+                  borderRadius: '12px',
+                  cursor: 'pointer',
+                  background: exportFormat === 'long' ? '#eff6ff' : 'white',
+                  transition: 'all 0.2s'
+                }}
+              >
+                <div style={{display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px'}}>
+                  <input
+                    type="radio"
+                    checked={exportFormat === 'long'}
+                    onChange={() => setExportFormat('long')}
+                  />
+                  <strong style={{fontSize: '15px'}}>ロング形式（統計解析向け）</strong>
+                </div>
+                <p style={{fontSize: '13px', color: '#6b7280', margin: '0 0 0 28px'}}>
+                  1行1検査項目。R/Python/SPSSなどでの統計解析に最適。<br/>
+                  検査・治療・臨床経過を別ファイルで出力。
+                </p>
+                <div style={{
+                  marginTop: '12px',
+                  marginLeft: '28px',
+                  padding: '8px',
+                  background: '#f8fafc',
+                  borderRadius: '6px',
+                  fontSize: '11px',
+                  fontFamily: 'monospace'
+                }}>
+                  PatientID, Date, Item, Value, Unit<br/>
+                  P001, 2024-01-01, WBC, 8500, /μL<br/>
+                  P001, 2024-01-01, CRP, 2.5, mg/dL<br/>
+                  P001, 2024-01-02, WBC, 7200, /μL
+                </div>
+              </div>
+
+              {/* ワイド形式 */}
+              <div
+                onClick={() => setExportFormat('wide')}
+                style={{
+                  padding: '16px',
+                  border: exportFormat === 'wide' ? '2px solid #3b82f6' : '1px solid #e2e8f0',
+                  borderRadius: '12px',
+                  cursor: 'pointer',
+                  background: exportFormat === 'wide' ? '#eff6ff' : 'white',
+                  transition: 'all 0.2s'
+                }}
+              >
+                <div style={{display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px'}}>
+                  <input
+                    type="radio"
+                    checked={exportFormat === 'wide'}
+                    onChange={() => setExportFormat('wide')}
+                  />
+                  <strong style={{fontSize: '15px'}}>ワイド形式（Excel閲覧向け）</strong>
+                </div>
+                <p style={{fontSize: '13px', color: '#6b7280', margin: '0 0 0 28px'}}>
+                  1行=患者×日付、列=各検査項目。<br/>
+                  Excelでそのまま閲覧・グラフ作成しやすい形式。
+                </p>
+                <div style={{
+                  marginTop: '12px',
+                  marginLeft: '28px',
+                  padding: '8px',
+                  background: '#f8fafc',
+                  borderRadius: '6px',
+                  fontSize: '11px',
+                  fontFamily: 'monospace'
+                }}>
+                  PatientID, Date, WBC, CRP, AST, ALT<br/>
+                  P001, 2024-01-01, 8500, 2.5, 25, 18<br/>
+                  P001, 2024-01-02, 7200, 1.2, 22, 16<br/>
+                  P002, 2024-01-01, 6800, 0.5, 30, 28
+                </div>
+              </div>
+
+              {/* 統合形式 */}
+              <div
+                onClick={() => setExportFormat('integrated')}
+                style={{
+                  padding: '16px',
+                  border: exportFormat === 'integrated' ? '2px solid #3b82f6' : '1px solid #e2e8f0',
+                  borderRadius: '12px',
+                  cursor: 'pointer',
+                  background: exportFormat === 'integrated' ? '#eff6ff' : 'white',
+                  transition: 'all 0.2s'
+                }}
+              >
+                <div style={{display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px'}}>
+                  <input
+                    type="radio"
+                    checked={exportFormat === 'integrated'}
+                    onChange={() => setExportFormat('integrated')}
+                  />
+                  <strong style={{fontSize: '15px'}}>統合タイムライン形式</strong>
+                </div>
+                <p style={{fontSize: '13px', color: '#6b7280', margin: '0 0 0 28px'}}>
+                  検査・治療・臨床経過を1ファイルにまとめて時系列順に出力。<br/>
+                  患者ごとの経過を俯瞰的に把握したい場合に最適。
+                </p>
+                <div style={{
+                  marginTop: '12px',
+                  marginLeft: '28px',
+                  padding: '8px',
+                  background: '#f8fafc',
+                  borderRadius: '6px',
+                  fontSize: '11px',
+                  fontFamily: 'monospace'
+                }}>
+                  PatientID, Date, DataType, Category, Name, Value<br/>
+                  P001, 2024-01-01, 検査, 血液, WBC, 8500<br/>
+                  P001, 2024-01-01, 治療, ステロイド, mPSL, 1000<br/>
+                  P001, 2024-01-02, 臨床経過, 意識障害, JCS 10,
+                </div>
+              </div>
+            </div>
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => setShowExportModal(false)}
+                style={styles.cancelButton}
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={() => executeExport(exportFormat)}
+                disabled={isExporting}
+                style={{
+                  ...styles.primaryButton,
+                  backgroundColor: '#28a745',
+                  opacity: isExporting ? 0.7 : 1
+                }}
+              >
+                {isExporting ? 'エクスポート中...' : 'エクスポート実行'}
               </button>
             </div>
           </div>
