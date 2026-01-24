@@ -2775,6 +2775,10 @@ function PatientDetailView({ patient, onBack }) {
     group: patient?.group || '',
     onsetDate: patient?.onsetDate || '',
   });
+  // 患者ID編集用state
+  const [editingDisplayId, setEditingDisplayId] = useState(false);
+  const [newDisplayId, setNewDisplayId] = useState(patient?.displayId || '');
+  const [displayIdError, setDisplayIdError] = useState('');
   const [manualItems, setManualItems] = useState([]);
   const [manualItem, setManualItem] = useState({ item: '', value: '', unit: '' });
 
@@ -3736,6 +3740,51 @@ function PatientDetailView({ patient, onBack }) {
     }
   };
 
+  // 患者ID保存（重複チェック付き）
+  const saveDisplayId = async () => {
+    const trimmedId = newDisplayId.trim();
+
+    // 空チェック
+    if (!trimmedId) {
+      setDisplayIdError('IDを入力してください');
+      return;
+    }
+
+    // 変更なしの場合
+    if (trimmedId === patient.displayId) {
+      setEditingDisplayId(false);
+      setDisplayIdError('');
+      return;
+    }
+
+    try {
+      // 重複チェック: 同じユーザーの他の患者で同じIDが使われていないか確認
+      const patientsRef = collection(db, 'users', user.uid, 'patients');
+      const snapshot = await getDocs(patientsRef);
+      const isDuplicate = snapshot.docs.some(doc =>
+        doc.id !== patient.id && doc.data().displayId === trimmedId
+      );
+
+      if (isDuplicate) {
+        setDisplayIdError(`ID "${trimmedId}" は既に使用されています`);
+        return;
+      }
+
+      // 更新実行
+      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+        displayId: trimmedId,
+      });
+
+      // ローカルのpatientオブジェクトも更新
+      patient.displayId = trimmedId;
+      setEditingDisplayId(false);
+      setDisplayIdError('');
+    } catch (err) {
+      console.error('Error updating displayId:', err);
+      setDisplayIdError('IDの更新に失敗しました');
+    }
+  };
+
   return (
     <div style={styles.mainContainer}>
       <header style={styles.header}>
@@ -3743,7 +3792,92 @@ function PatientDetailView({ patient, onBack }) {
           <button onClick={onBack} style={styles.backButton}>
             ← 戻る
           </button>
-          <h1 style={styles.headerTitle}>{patient?.displayId}</h1>
+          {editingDisplayId ? (
+            <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+              <input
+                type="text"
+                value={newDisplayId}
+                onChange={(e) => {
+                  setNewDisplayId(e.target.value);
+                  setDisplayIdError('');
+                }}
+                style={{
+                  padding: '6px 12px',
+                  fontSize: '18px',
+                  fontWeight: '600',
+                  border: displayIdError ? '2px solid #ef4444' : '2px solid #3b82f6',
+                  borderRadius: '6px',
+                  width: '150px',
+                }}
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') saveDisplayId();
+                  if (e.key === 'Escape') {
+                    setEditingDisplayId(false);
+                    setNewDisplayId(patient?.displayId || '');
+                    setDisplayIdError('');
+                  }
+                }}
+              />
+              <button
+                onClick={saveDisplayId}
+                style={{
+                  padding: '6px 12px',
+                  background: '#22c55e',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '13px',
+                }}
+              >
+                保存
+              </button>
+              <button
+                onClick={() => {
+                  setEditingDisplayId(false);
+                  setNewDisplayId(patient?.displayId || '');
+                  setDisplayIdError('');
+                }}
+                style={{
+                  padding: '6px 12px',
+                  background: '#6b7280',
+                  color: 'white',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '13px',
+                }}
+              >
+                キャンセル
+              </button>
+              {displayIdError && (
+                <span style={{color: '#ef4444', fontSize: '13px'}}>{displayIdError}</span>
+              )}
+            </div>
+          ) : (
+            <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+              <h1 style={styles.headerTitle}>{patient?.displayId}</h1>
+              <button
+                onClick={() => {
+                  setNewDisplayId(patient?.displayId || '');
+                  setEditingDisplayId(true);
+                }}
+                style={{
+                  padding: '4px 8px',
+                  background: 'transparent',
+                  color: '#6b7280',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontSize: '12px',
+                }}
+                title="IDを編集"
+              >
+                ID編集
+              </button>
+            </div>
+          )}
           <span style={styles.diagnosisBadge}>{patient?.diagnosis}</span>
         </div>
         <div style={{display: 'flex', gap: '10px'}}>
