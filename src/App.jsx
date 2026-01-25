@@ -1446,6 +1446,9 @@ function PatientsListView({ onSelectPatient }) {
       } else if (format === 'integrated') {
         // 統合形式: 患者ごとに時系列でまとめた形式
         exportIntegratedFormat(allPatientData, dateStr);
+      } else if (format === 'excel_by_sheet') {
+        // Excel形式: 患者ごとにシートを分けた臨床形式
+        exportExcelBySheet(allPatientData, dateStr);
       }
 
     } catch (err) {
@@ -1689,6 +1692,168 @@ function PatientsListView({ onSelectPatient }) {
     downloadCSV(integratedData, headers, `integrated_data_${dateStr}.csv`);
 
     alert(`統合形式エクスポート完了:\n・${integratedData.length}件のデータ（検査・治療・臨床経過を統合）`);
+  };
+
+  // Excel形式エクスポート: 患者ごとにシートを分けた臨床形式
+  const exportExcelBySheet = (allPatientData, dateStr) => {
+    // XLSXワークブック作成
+    const wb = XLSX.utils.book_new();
+
+    // 1. 患者情報シート
+    const patientInfoData = allPatientData.map(p => ({
+      PatientID: p.id,
+      Diagnosis: p.diagnosis,
+      Group: p.group,
+      OnsetDate: p.onsetDate
+    }));
+    const patientInfoSheet = XLSX.utils.json_to_sheet(patientInfoData);
+    XLSX.utils.book_append_sheet(wb, patientInfoSheet, '患者情報');
+
+    // 2. 患者ごと×検体ごとにシートを作成
+    allPatientData.forEach(patient => {
+      if (patient.labResults.length === 0) return;
+
+      // 検体タイプでグループ化
+      const specimenGroups = {};
+      patient.labResults.forEach(lab => {
+        const specimen = lab.specimen || 'Other';
+        if (!specimenGroups[specimen]) {
+          specimenGroups[specimen] = [];
+        }
+        specimenGroups[specimen].push(lab);
+      });
+
+      // 各検体タイプごとにシート作成
+      Object.entries(specimenGroups).forEach(([specimen, labs]) => {
+        // 日付順にソート
+        labs.sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+
+        // 全検査項目を収集
+        const allItems = new Set();
+        labs.forEach(lab => {
+          lab.items.forEach(item => allItems.add(item.item));
+        });
+        const itemList = Array.from(allItems).sort();
+
+        if (itemList.length === 0) return;
+
+        // Day番号を計算
+        const dayLabels = labs.map((lab, idx) => {
+          const day = lab.dayFromOnset;
+          return day !== '' && day !== null ? `Day${day}` : `Day${idx + 1}`;
+        });
+
+        // シートデータを構築
+        const sheetData = [];
+
+        // ヘッダー行: Patient ID と検体タイプ
+        const headerRow = [`Patient ID: ${patient.id}`, '', `検体: ${specimen}`];
+        labs.forEach(() => headerRow.push(''));
+        sheetData.push(headerRow);
+
+        // 空行
+        sheetData.push([]);
+
+        // 日付ラベル行
+        const dayRow = ['検査項目', '単位', ...dayLabels];
+        sheetData.push(dayRow);
+
+        // 実際の日付行
+        const dateRow = ['採取日', 'YYYY/MM/DD', ...labs.map(lab => lab.date || '')];
+        sheetData.push(dateRow);
+
+        // 空行
+        sheetData.push([]);
+
+        // 検査項目ごとにデータ行を追加
+        itemList.forEach(itemName => {
+          // 単位を取得（最初に見つかったものを使用）
+          let unit = '';
+          for (const lab of labs) {
+            const found = lab.items.find(i => i.item === itemName);
+            if (found && found.unit) {
+              unit = found.unit;
+              break;
+            }
+          }
+
+          // 各日付の値を取得
+          const values = labs.map(lab => {
+            const found = lab.items.find(i => i.item === itemName);
+            return found ? found.value : '';
+          });
+
+          sheetData.push([itemName, unit, ...values]);
+        });
+
+        // シート名（最大31文字、特殊文字除去）
+        let sheetName = `${patient.id}_${specimen}`;
+        sheetName = sheetName.replace(/[\\\/\?\*\[\]:]/g, '_').substring(0, 31);
+
+        const ws = XLSX.utils.aoa_to_sheet(sheetData);
+
+        // 列幅設定
+        ws['!cols'] = [
+          { wch: 15 }, // 検査項目
+          { wch: 12 }, // 単位
+          ...labs.map(() => ({ wch: 12 })) // 各日付
+        ];
+
+        XLSX.utils.book_append_sheet(wb, ws, sheetName);
+      });
+    });
+
+    // 3. 治療薬シート
+    const treatmentData = [];
+    allPatientData.forEach(patient => {
+      patient.treatments.forEach(t => {
+        treatmentData.push({
+          PatientID: patient.id,
+          Category: t.category || '',
+          Medication: t.medicationName || '',
+          Dosage: t.dosage || '',
+          Unit: t.dosageUnit || '',
+          StartDate: t.startDate || '',
+          StartDay: calcDays(patient.onsetDate, t.startDate),
+          EndDate: t.endDate || '',
+          EndDay: calcDays(patient.onsetDate, t.endDate),
+          Note: t.note || ''
+        });
+      });
+    });
+    if (treatmentData.length > 0) {
+      const treatmentSheet = XLSX.utils.json_to_sheet(treatmentData);
+      XLSX.utils.book_append_sheet(wb, treatmentSheet, '治療薬');
+    }
+
+    // 4. 臨床経過シート
+    const eventData = [];
+    allPatientData.forEach(patient => {
+      patient.events.forEach(e => {
+        eventData.push({
+          PatientID: patient.id,
+          EventType: e.eventType || '',
+          StartDate: e.startDate || '',
+          StartDay: calcDays(patient.onsetDate, e.startDate),
+          EndDate: e.endDate || '',
+          EndDay: calcDays(patient.onsetDate, e.endDate),
+          JCS: e.jcs || '',
+          Frequency: e.frequency || '',
+          Severity: e.severity || '',
+          Note: e.note || ''
+        });
+      });
+    });
+    if (eventData.length > 0) {
+      const eventSheet = XLSX.utils.json_to_sheet(eventData);
+      XLSX.utils.book_append_sheet(wb, eventSheet, '臨床経過');
+    }
+
+    // ファイル出力
+    XLSX.writeFile(wb, `clinical_data_${dateStr}.xlsx`);
+
+    const sheetCount = wb.SheetNames.length;
+    alert(`Excel形式エクスポート完了:\n・${sheetCount}シート（患者情報 + 患者別検査データ + 治療薬 + 臨床経過）`);
   };
 
   // 従来のexportAllData関数（後方互換性のため残す）
@@ -2516,6 +2681,53 @@ function PatientsListView({ onSelectPatient }) {
                   P001, 2024-01-01, 検査, 血液, WBC, 8500<br/>
                   P001, 2024-01-01, 治療, ステロイド, mPSL, 1000<br/>
                   P001, 2024-01-02, 臨床経過, 意識障害, JCS 10,
+                </div>
+              </div>
+
+              {/* Excel形式 */}
+              <div
+                onClick={() => setExportFormat('excel_by_sheet')}
+                style={{
+                  padding: '16px',
+                  border: exportFormat === 'excel_by_sheet' ? '2px solid #22c55e' : '1px solid #e2e8f0',
+                  borderRadius: '12px',
+                  cursor: 'pointer',
+                  background: exportFormat === 'excel_by_sheet' ? '#f0fdf4' : 'white',
+                  transition: 'all 0.2s'
+                }}
+              >
+                <div style={{display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '8px'}}>
+                  <input
+                    type="radio"
+                    checked={exportFormat === 'excel_by_sheet'}
+                    onChange={() => setExportFormat('excel_by_sheet')}
+                  />
+                  <strong style={{fontSize: '15px'}}>Excel形式（患者別シート）</strong>
+                  <span style={{
+                    background: '#22c55e',
+                    color: 'white',
+                    padding: '2px 8px',
+                    borderRadius: '4px',
+                    fontSize: '11px'
+                  }}>推奨</span>
+                </div>
+                <p style={{fontSize: '13px', color: '#6b7280', margin: '0 0 0 28px'}}>
+                  患者ごと×検体ごとにシートを分けたExcelファイル。<br/>
+                  行=検査項目、列=日付（Day1, Day3...）の臨床的な形式。
+                </p>
+                <div style={{
+                  marginTop: '12px',
+                  marginLeft: '28px',
+                  padding: '8px',
+                  background: '#f8fafc',
+                  borderRadius: '6px',
+                  fontSize: '11px'
+                }}>
+                  <div style={{marginBottom: '4px'}}><strong>シート構成:</strong></div>
+                  <div>・患者情報（全患者一覧）</div>
+                  <div>・P001_CSF, P001_Serum...（患者×検体）</div>
+                  <div>・治療薬（全患者）</div>
+                  <div>・臨床経過（全患者）</div>
                 </div>
               </div>
             </div>
