@@ -5949,11 +5949,8 @@ function PatientDetailView({ patient, onBack }) {
                       URL.revokeObjectURL(url);
                     };
 
-                    // SVGダウンロード
+                    // SVGダウンロード（検査データ・治療薬・臨床経過すべて含む）
                     const downloadSVG = () => {
-                      const container = document.getElementById('clinical-course-container');
-                      if (!container) return;
-
                       // 治療薬と臨床経過のカテゴリ色
                       const categoryColors = {
                         '抗てんかん薬': '#f59e0b', 'ステロイド': '#22c55e', '免疫グロブリン': '#3b82f6',
@@ -5966,16 +5963,44 @@ function PatientDetailView({ patient, onBack }) {
                         '認知機能障害': '#0d9488', '精神症状': '#0891b2', '発熱': '#ef4444',
                         '頭痛': '#f97316', '髄膜刺激症状': '#84cc16', '人工呼吸器管理': '#7c3aed', 'ICU入室': '#9333ea'
                       };
+                      const labColors = ['#3b82f6', '#ef4444', '#22c55e', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6', '#6366f1'];
 
-                      const width = 800;
-                      const leftMargin = 120;
-                      const graphWidth = width - leftMargin - 40;
-                      let yPos = 40;
+                      const width = 900;
+                      const leftMargin = 130;
+                      const rightMargin = 60;
+                      const graphWidth = width - leftMargin - rightMargin;
+                      let yPos = 50;
                       const barHeight = 30;
                       const maxBarHeight = 40;
 
-                      let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="600" style="font-family: sans-serif;">`;
-                      svgContent += `<text x="${width/2}" y="25" text-anchor="middle" font-size="16" font-weight="bold">臨床経過 - ${patient.displayId}</text>`;
+                      // 高さを動的に計算
+                      const hasTreatments = showTreatmentsOnChart && selectedTreatmentsForChart.length > 0;
+                      const hasEvents = showEventsOnChart && selectedEventsForChart.length > 0;
+                      const hasLabData = selectedLabItemsForChart.length > 0;
+
+                      let totalHeight = 80; // タイトル + マージン
+                      if (hasTreatments) {
+                        const treatmentGroups = {};
+                        treatments.filter(t => selectedTreatmentsForChart.includes(t.medicationName)).forEach(t => {
+                          treatmentGroups[t.medicationName] = true;
+                        });
+                        totalHeight += Object.keys(treatmentGroups).length * (maxBarHeight + 15) + 20;
+                      }
+                      if (hasEvents) {
+                        const eventGroups = {};
+                        clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
+                          eventGroups[e.eventType] = true;
+                        });
+                        totalHeight += Object.keys(eventGroups).length * (barHeight + 8) + 20;
+                      }
+                      if (hasLabData) {
+                        totalHeight += 250; // グラフエリア
+                      }
+                      totalHeight += 60; // X軸 + 余白
+
+                      let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${totalHeight}" style="font-family: sans-serif; background: white;">`;
+                      svgContent += `<rect width="${width}" height="${totalHeight}" fill="white"/>`;
+                      svgContent += `<text x="${width/2}" y="30" text-anchor="middle" font-size="16" font-weight="bold">臨床経過 - ${patient.displayId}</text>`;
 
                       // 治療薬タイムライン
                       if (showTreatmentsOnChart && selectedTreatmentsForChart.length > 0) {
@@ -6041,15 +6066,86 @@ function PatientDetailView({ patient, onBack }) {
                         });
                       }
 
+                      // 検査データグラフ
+                      if (hasLabData) {
+                        yPos += 20;
+                        svgContent += `<text x="${leftMargin}" y="${yPos}" font-size="11" font-weight="bold">【検査値】</text>`;
+                        yPos += 10;
+
+                        const chartHeight = 200;
+                        const chartTop = yPos;
+                        const chartBottom = yPos + chartHeight;
+
+                        // グラフ背景とグリッド
+                        svgContent += `<rect x="${leftMargin}" y="${chartTop}" width="${graphWidth}" height="${chartHeight}" fill="#f9fafb" stroke="#e5e7eb"/>`;
+                        for (let i = 1; i < 5; i++) {
+                          const gridY = chartTop + (chartHeight / 5) * i;
+                          svgContent += `<line x1="${leftMargin}" y1="${gridY}" x2="${leftMargin + graphWidth}" y2="${gridY}" stroke="#e5e7eb" stroke-dasharray="3,3"/>`;
+                        }
+
+                        // 各検査項目のデータを描画
+                        selectedLabItemsForChart.forEach((itemName, itemIdx) => {
+                          const color = labColors[itemIdx % labColors.length];
+                          const dataPoints = [];
+
+                          labResults.forEach(lab => {
+                            const day = calcDaysFromOnset(lab.date);
+                            const labItem = lab.data?.find(d => d.item === itemName);
+                            if (day !== null && labItem && labItem.value !== '' && !isNaN(parseFloat(labItem.value))) {
+                              dataPoints.push({ day, value: parseFloat(labItem.value) });
+                            }
+                          });
+
+                          if (dataPoints.length === 0) return;
+
+                          dataPoints.sort((a, b) => a.day - b.day);
+
+                          // 値の範囲を計算
+                          const values = dataPoints.map(p => p.value);
+                          const minVal = Math.min(...values);
+                          const maxVal = Math.max(...values);
+                          const valRange = maxVal - minVal || 1;
+
+                          // パスを生成
+                          let pathD = '';
+                          dataPoints.forEach((point, idx) => {
+                            const x = leftMargin + ((point.day - minDay) / dayRange) * graphWidth;
+                            const y = chartBottom - ((point.value - minVal) / valRange) * (chartHeight - 20) - 10;
+                            if (idx === 0) {
+                              pathD = `M ${x} ${y}`;
+                            } else {
+                              pathD += ` L ${x} ${y}`;
+                            }
+                          });
+
+                          svgContent += `<path d="${pathD}" fill="none" stroke="${color}" stroke-width="2"/>`;
+
+                          // データポイント
+                          dataPoints.forEach(point => {
+                            const x = leftMargin + ((point.day - minDay) / dayRange) * graphWidth;
+                            const y = chartBottom - ((point.value - minVal) / valRange) * (chartHeight - 20) - 10;
+                            svgContent += `<circle cx="${x}" cy="${y}" r="4" fill="${color}"/>`;
+                          });
+
+                          // 凡例
+                          const legendX = leftMargin + graphWidth + 10;
+                          const legendY = chartTop + 15 + itemIdx * 18;
+                          svgContent += `<line x1="${legendX}" y1="${legendY}" x2="${legendX + 15}" y2="${legendY}" stroke="${color}" stroke-width="2"/>`;
+                          svgContent += `<text x="${legendX + 20}" y="${legendY + 4}" font-size="9">${itemName}</text>`;
+                        });
+
+                        yPos = chartBottom + 10;
+                      }
+
                       // X軸
                       yPos += 10;
-                      svgContent += `<line x1="${leftMargin}" y1="${yPos}" x2="${width - 40}" y2="${yPos}" stroke="#333" stroke-width="1"/>`;
+                      svgContent += `<line x1="${leftMargin}" y1="${yPos}" x2="${leftMargin + graphWidth}" y2="${yPos}" stroke="#333" stroke-width="1"/>`;
                       for (let d = Math.ceil(minDay / 5) * 5; d <= maxDay; d += 5) {
                         const x = leftMargin + ((d - minDay) / dayRange) * graphWidth;
                         svgContent += `<line x1="${x}" y1="${yPos}" x2="${x}" y2="${yPos + 5}" stroke="#333" stroke-width="1"/>`;
                         svgContent += `<text x="${x}" y="${yPos + 15}" text-anchor="middle" font-size="9">${d}</text>`;
                       }
-                      svgContent += `<text x="${width/2}" y="${yPos + 30}" text-anchor="middle" font-size="10">Days</text>`;
+                      svgContent += `<text x="${leftMargin + graphWidth/2}" y="${yPos + 30}" text-anchor="middle" font-size="10">Days from onset</text>`;
 
                       svgContent += '</svg>';
 
