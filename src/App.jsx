@@ -6619,13 +6619,186 @@ function PatientDetailView({ patient, onBack }) {
                         }}>
                           <button
                             onClick={() => {
-                              if (overlayChartRef.current) {
-                                const url = overlayChartRef.current.toBase64Image();
-                                const link = document.createElement('a');
-                                link.download = `${patient.displayId}_臨床経過グラフ.png`;
-                                link.href = url;
-                                link.click();
-                              }
+                              // SVGを生成してPNGに変換
+                              const generatePNG = () => {
+                                const categoryColors = {
+                                  '抗てんかん薬': '#f59e0b', 'ステロイド': '#22c55e', '免疫グロブリン': '#3b82f6',
+                                  '血漿交換': '#6366f1', '免疫抑制剤': '#ec4899', '抗ウイルス薬': '#14b8a6',
+                                  '抗菌薬': '#eab308', '抗浮腫薬': '#0ea5e9', 'その他': '#6b7280'
+                                };
+                                const eventPngColors = {
+                                  '意識障害': '#dc2626', 'てんかん発作': '#ea580c', '不随意運動': '#d97706',
+                                  '麻痺': '#ca8a04', '感覚障害': '#65a30d', '失語': '#16a34a',
+                                  '認知機能障害': '#0d9488', '精神症状': '#0891b2', '発熱': '#ef4444',
+                                  '頭痛': '#f97316', '髄膜刺激症状': '#84cc16', '人工呼吸器管理': '#7c3aed', 'ICU入室': '#9333ea'
+                                };
+                                const labPngColors = ['#3b82f6', '#ef4444', '#22c55e', '#f59e0b', '#8b5cf6', '#ec4899', '#14b8a6', '#6366f1'];
+
+                                const width = 900;
+                                const leftMargin = 130;
+                                const rightMargin = 80;
+                                const graphWidth = width - leftMargin - rightMargin;
+                                let yPos = 50;
+                                const barHeight = 30;
+                                const maxBarHeight = 40;
+
+                                const hasTreatments = showTreatmentsOnChart && selectedTreatmentsForChart.length > 0;
+                                const hasEvents = showEventsOnChart && selectedEventsForChart.length > 0;
+                                const hasLabData = selectedLabItemsForChart.length > 0;
+
+                                let totalHeight = 80;
+                                if (hasTreatments) {
+                                  const tGroups = {};
+                                  treatments.filter(t => selectedTreatmentsForChart.includes(t.medicationName)).forEach(t => { tGroups[t.medicationName] = true; });
+                                  totalHeight += Object.keys(tGroups).length * (maxBarHeight + 15) + 20;
+                                }
+                                if (hasEvents) {
+                                  const eGroups = {};
+                                  clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => { eGroups[e.eventType] = true; });
+                                  totalHeight += Object.keys(eGroups).length * (barHeight + 8) + 20;
+                                }
+                                if (hasLabData) totalHeight += 250;
+                                totalHeight += 60;
+
+                                let svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${totalHeight}" style="font-family: sans-serif; background: white;">`;
+                                svg += `<rect width="${width}" height="${totalHeight}" fill="white"/>`;
+                                svg += `<text x="${width/2}" y="30" text-anchor="middle" font-size="16" font-weight="bold">臨床経過 - ${patient.displayId}</text>`;
+
+                                // 治療薬タイムライン
+                                if (hasTreatments) {
+                                  const groups = {};
+                                  treatments.filter(t => selectedTreatmentsForChart.includes(t.medicationName)).forEach(t => {
+                                    if (!groups[t.medicationName]) groups[t.medicationName] = { name: t.medicationName, category: t.category, entries: [], unit: t.dosageUnit || '' };
+                                    groups[t.medicationName].entries.push(t);
+                                  });
+                                  Object.values(groups).forEach(group => {
+                                    group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+                                    const color = categoryColors[group.category] || '#6b7280';
+                                    const shortName = group.name.replace(/（.*）/g, '').replace(/\(.*\)/g, '');
+                                    const unitText = group.unit ? `[${group.unit.replace('/日', '')}]` : '';
+                                    const maxDosage = Math.max(...group.entries.map(e => parseFloat(e.dosage) || 0), 1);
+                                    svg += `<text x="${leftMargin - 8}" y="${yPos + maxBarHeight - 5}" text-anchor="end" font-size="10">${shortName}${unitText}</text>`;
+                                    svg += `<line x1="${leftMargin}" y1="${yPos + maxBarHeight}" x2="${leftMargin + graphWidth}" y2="${yPos + maxBarHeight}" stroke="#d1d5db" stroke-width="1"/>`;
+                                    group.entries.forEach(entry => {
+                                      const startDay = calcDaysFromOnset(entry.startDate);
+                                      const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
+                                      const x = leftMargin + ((startDay - minDay) / dayRange) * graphWidth;
+                                      const w = Math.max(((endDay - startDay) / dayRange) * graphWidth, 8);
+                                      const dosage = parseFloat(entry.dosage) || 0;
+                                      const h = Math.max((dosage / maxDosage) * maxBarHeight, 8);
+                                      const y = yPos + maxBarHeight - h;
+                                      svg += `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${color}" rx="2"/>`;
+                                      if (w > 20 && h > 12) svg += `<text x="${x + w/2}" y="${y + h/2 + 3}" text-anchor="middle" font-size="8" fill="white">${entry.dosage}</text>`;
+                                    });
+                                    yPos += maxBarHeight + 15;
+                                  });
+                                }
+
+                                // 臨床経過タイムライン
+                                if (hasEvents) {
+                                  const groups = {};
+                                  clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
+                                    if (!groups[e.eventType]) groups[e.eventType] = { type: e.eventType, entries: [] };
+                                    groups[e.eventType].entries.push(e);
+                                  });
+                                  Object.values(groups).forEach(group => {
+                                    group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
+                                    const color = eventPngColors[group.type] || '#6b7280';
+                                    svg += `<text x="${leftMargin - 8}" y="${yPos + barHeight/2 + 4}" text-anchor="end" font-size="10">${group.type}</text>`;
+                                    group.entries.forEach(entry => {
+                                      const startDay = calcDaysFromOnset(entry.startDate);
+                                      const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
+                                      const x = leftMargin + ((startDay - minDay) / dayRange) * graphWidth;
+                                      const w = Math.max(((endDay - startDay) / dayRange) * graphWidth, 8);
+                                      svg += `<rect x="${x}" y="${yPos}" width="${w}" height="${barHeight}" fill="${color}" fill-opacity="0.3" stroke="${color}" stroke-width="1" rx="2"/>`;
+                                    });
+                                    yPos += barHeight + 8;
+                                  });
+                                }
+
+                                // 検査データグラフ
+                                if (hasLabData) {
+                                  yPos += 20;
+                                  svg += `<text x="${leftMargin}" y="${yPos}" font-size="11" font-weight="bold">【検査値】</text>`;
+                                  yPos += 10;
+                                  const chartHeight = 200;
+                                  const chartTop = yPos;
+                                  const chartBottom = yPos + chartHeight;
+                                  svg += `<rect x="${leftMargin}" y="${chartTop}" width="${graphWidth}" height="${chartHeight}" fill="#f9fafb" stroke="#e5e7eb"/>`;
+                                  for (let i = 1; i < 5; i++) {
+                                    const gridY = chartTop + (chartHeight / 5) * i;
+                                    svg += `<line x1="${leftMargin}" y1="${gridY}" x2="${leftMargin + graphWidth}" y2="${gridY}" stroke="#e5e7eb" stroke-dasharray="3,3"/>`;
+                                  }
+                                  selectedLabItemsForChart.forEach((itemName, itemIdx) => {
+                                    const color = labPngColors[itemIdx % labPngColors.length];
+                                    const dataPoints = [];
+                                    labResults.forEach(lab => {
+                                      const day = calcDaysFromOnset(lab.date);
+                                      const labItem = lab.data?.find(d => d.item === itemName);
+                                      if (day !== null && labItem && labItem.value !== '' && !isNaN(parseFloat(labItem.value))) {
+                                        dataPoints.push({ day, value: parseFloat(labItem.value) });
+                                      }
+                                    });
+                                    if (dataPoints.length === 0) return;
+                                    dataPoints.sort((a, b) => a.day - b.day);
+                                    const values = dataPoints.map(p => p.value);
+                                    const minVal = Math.min(...values);
+                                    const maxVal = Math.max(...values);
+                                    const valRange = maxVal - minVal || 1;
+                                    let pathD = '';
+                                    dataPoints.forEach((point, idx) => {
+                                      const x = leftMargin + ((point.day - minDay) / dayRange) * graphWidth;
+                                      const y = chartBottom - ((point.value - minVal) / valRange) * (chartHeight - 20) - 10;
+                                      pathD += idx === 0 ? `M ${x} ${y}` : ` L ${x} ${y}`;
+                                    });
+                                    svg += `<path d="${pathD}" fill="none" stroke="${color}" stroke-width="2"/>`;
+                                    dataPoints.forEach(point => {
+                                      const x = leftMargin + ((point.day - minDay) / dayRange) * graphWidth;
+                                      const y = chartBottom - ((point.value - minVal) / valRange) * (chartHeight - 20) - 10;
+                                      svg += `<circle cx="${x}" cy="${y}" r="4" fill="${color}"/>`;
+                                    });
+                                    const legendX = leftMargin + graphWidth + 10;
+                                    const legendY = chartTop + 15 + itemIdx * 18;
+                                    svg += `<line x1="${legendX}" y1="${legendY}" x2="${legendX + 15}" y2="${legendY}" stroke="${color}" stroke-width="2"/>`;
+                                    svg += `<text x="${legendX + 20}" y="${legendY + 4}" font-size="9">${itemName}</text>`;
+                                  });
+                                  yPos = chartBottom + 10;
+                                }
+
+                                // X軸
+                                yPos += 10;
+                                svg += `<line x1="${leftMargin}" y1="${yPos}" x2="${leftMargin + graphWidth}" y2="${yPos}" stroke="#333" stroke-width="1"/>`;
+                                for (let d = Math.ceil(minDay / 5) * 5; d <= maxDay; d += 5) {
+                                  const x = leftMargin + ((d - minDay) / dayRange) * graphWidth;
+                                  svg += `<line x1="${x}" y1="${yPos}" x2="${x}" y2="${yPos + 5}" stroke="#333" stroke-width="1"/>`;
+                                  svg += `<text x="${x}" y="${yPos + 15}" text-anchor="middle" font-size="9">${d}</text>`;
+                                }
+                                svg += `<text x="${leftMargin + graphWidth/2}" y="${yPos + 30}" text-anchor="middle" font-size="10">Days from onset</text>`;
+                                svg += '</svg>';
+
+                                // SVGをPNGに変換
+                                const canvas = document.createElement('canvas');
+                                canvas.width = width * 2;
+                                canvas.height = totalHeight * 2;
+                                const ctx = canvas.getContext('2d');
+                                ctx.scale(2, 2);
+                                const img = new Image();
+                                const svgBlob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
+                                const svgUrl = URL.createObjectURL(svgBlob);
+                                img.onload = () => {
+                                  ctx.fillStyle = 'white';
+                                  ctx.fillRect(0, 0, width, totalHeight);
+                                  ctx.drawImage(img, 0, 0);
+                                  URL.revokeObjectURL(svgUrl);
+                                  const pngUrl = canvas.toDataURL('image/png');
+                                  const link = document.createElement('a');
+                                  link.download = `${patient.displayId}_臨床経過.png`;
+                                  link.href = pngUrl;
+                                  link.click();
+                                };
+                                img.src = svgUrl;
+                              };
+                              generatePNG();
                             }}
                             style={{
                               padding: '10px 20px',
@@ -6641,7 +6814,7 @@ function PatientDetailView({ patient, onBack }) {
                               gap: '6px'
                             }}
                           >
-                            <span>🖼️</span> グラフ画像
+                            <span>🖼️</span> 画像（PNG）
                           </button>
                           <button
                             onClick={downloadCSV}
