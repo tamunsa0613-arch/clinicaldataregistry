@@ -3514,7 +3514,8 @@ function PatientDetailView({ patient, onBack }) {
         '免疫吸着療法（IA）',
         'その他'
       ],
-      defaultUnit: '回'
+      defaultUnit: '回',
+      noDosage: true  // 用量なし（回数のみ）
     },
     '免疫抑制剤': {
       medications: [
@@ -5460,17 +5461,21 @@ function PatientDetailView({ patient, onBack }) {
                                   {Object.keys(treatmentCategories).map(cat => (<option key={cat} value={cat}>{cat}</option>))}
                                 </select>
                               </div>
-                              <div>
-                                <label style={{fontSize: '11px', color: '#6b7280'}}>投与量</label>
-                                <input type="text" value={editTreatment.dosage} onChange={(e) => setEditTreatment({...editTreatment, dosage: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}} />
-                              </div>
-                              <div>
-                                <label style={{fontSize: '11px', color: '#6b7280'}}>単位</label>
-                                <select value={editTreatment.dosageUnit} onChange={(e) => setEditTreatment({...editTreatment, dosageUnit: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}}>
-                                  <option value="">選択</option>
-                                  {dosageUnits.map(unit => (<option key={unit} value={unit}>{unit}</option>))}
-                                </select>
-                              </div>
+                              {!treatmentCategories[editTreatment.category]?.noDosage && (
+                                <>
+                                  <div>
+                                    <label style={{fontSize: '11px', color: '#6b7280'}}>投与量</label>
+                                    <input type="text" value={editTreatment.dosage} onChange={(e) => setEditTreatment({...editTreatment, dosage: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}} />
+                                  </div>
+                                  <div>
+                                    <label style={{fontSize: '11px', color: '#6b7280'}}>単位</label>
+                                    <select value={editTreatment.dosageUnit} onChange={(e) => setEditTreatment({...editTreatment, dosageUnit: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}}>
+                                      <option value="">選択</option>
+                                      {dosageUnits.map(unit => (<option key={unit} value={unit}>{unit}</option>))}
+                                    </select>
+                                  </div>
+                                </>
+                              )}
                               <div>
                                 <label style={{fontSize: '11px', color: '#6b7280'}}>開始日</label>
                                 <input type="date" value={editTreatment.startDate} onChange={(e) => setEditTreatment({...editTreatment, startDate: e.target.value})} style={{...styles.input, width: '100%', padding: '8px'}} />
@@ -7339,31 +7344,34 @@ function PatientDetailView({ patient, onBack }) {
               </div>
             )}
 
-            <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '16px'}}>
-              <div style={styles.inputGroup}>
-                <label style={styles.inputLabel}>投与量</label>
-                <input
-                  type="text"
-                  value={newTreatment.dosage}
-                  onChange={(e) => setNewTreatment({...newTreatment, dosage: e.target.value})}
-                  style={styles.input}
-                  placeholder="例: 500"
-                />
+            {/* 用量フィールド（血漿交換など noDosage カテゴリでは非表示） */}
+            {!treatmentCategories[newTreatment.category]?.noDosage && (
+              <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '16px'}}>
+                <div style={styles.inputGroup}>
+                  <label style={styles.inputLabel}>投与量</label>
+                  <input
+                    type="text"
+                    value={newTreatment.dosage}
+                    onChange={(e) => setNewTreatment({...newTreatment, dosage: e.target.value})}
+                    style={styles.input}
+                    placeholder="例: 500"
+                  />
+                </div>
+                <div style={styles.inputGroup}>
+                  <label style={styles.inputLabel}>単位</label>
+                  <select
+                    value={newTreatment.dosageUnit}
+                    onChange={(e) => setNewTreatment({...newTreatment, dosageUnit: e.target.value})}
+                    style={{...styles.input, width: '100%'}}
+                  >
+                    <option value="">選択してください</option>
+                    {dosageUnits.map(unit => (
+                      <option key={unit} value={unit}>{unit}</option>
+                    ))}
+                  </select>
+                </div>
               </div>
-              <div style={styles.inputGroup}>
-                <label style={styles.inputLabel}>単位</label>
-                <select
-                  value={newTreatment.dosageUnit}
-                  onChange={(e) => setNewTreatment({...newTreatment, dosageUnit: e.target.value})}
-                  style={{...styles.input, width: '100%'}}
-                >
-                  <option value="">選択してください</option>
-                  {dosageUnits.map(unit => (
-                    <option key={unit} value={unit}>{unit}</option>
-                  ))}
-                </select>
-              </div>
-            </div>
+            )}
 
             <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', marginTop: '16px'}}>
               <div style={styles.inputGroup}>
