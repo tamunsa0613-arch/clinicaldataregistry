@@ -1694,7 +1694,7 @@ function PatientsListView({ onSelectPatient }) {
     reader.readAsArrayBuffer(file);
   };
 
-  // 臨床経過シートをパース（発作頻度推移など）
+  // 臨床経過シートをパース（発作頻度推移、臨床症状推移など）
   const parseClinicalEventSheet = (workbook, sheetName) => {
     const sheet = workbook.Sheets[sheetName];
     const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
@@ -1704,15 +1704,51 @@ function PatientsListView({ onSelectPatient }) {
     const headerRow = jsonData[0];
     const results = [];
 
-    // ヘッダーから時間ポイントを抽出（ベースライン、1ヶ月後など）
+    // ヘッダーから「症状」列のインデックスを検出
+    let symptomColumnIndex = -1;
+    let dataStartIndex = 2; // デフォルト: 3列目からデータ
+
+    for (let i = 0; i < headerRow.length; i++) {
+      const header = headerRow[i]?.toString() || '';
+      if (header === '症状' || header === 'イベント' || header === 'イベント種類') {
+        symptomColumnIndex = i;
+        dataStartIndex = i + 1;
+        break;
+      }
+    }
+
+    // ヘッダーから時間ポイントを抽出
     const timePoints = [];
-    for (let i = 2; i < headerRow.length; i++) {
+    for (let i = dataStartIndex; i < headerRow.length; i++) {
       if (headerRow[i]) {
         timePoints.push({ index: i, label: headerRow[i].toString() });
       }
     }
 
-    // 各患者の行を処理
+    // 症状名からイベントタイプへのマッピング
+    const symptomToEventType = {
+      '倦怠感': '副腎不全',
+      '寒がり': '甲状腺機能低下',
+      '便秘': 'その他',
+      '動悸': '甲状腺機能亢進',
+      '手指振戦': '甲状腺機能亢進',
+      '発汗過多': '甲状腺機能亢進',
+      '意識障害': '意識障害',
+      '多尿': '尿崩症',
+      '口渇': '尿崩症',
+      '低血圧': '副腎不全',
+      '食欲低下': '副腎不全',
+      '発熱': '発熱',
+      '頭痛': '頭痛',
+      '低ナトリウム血症': '低ナトリウム血症',
+      '高ナトリウム血症': '高ナトリウム血症',
+      '高血糖': '高血糖',
+      '低血糖': '低血糖',
+      'てんかん発作': 'てんかん発作',
+      '発作': 'てんかん発作',
+    };
+
+    // 各行を処理
     for (let rowIdx = 1; rowIdx < jsonData.length; rowIdx++) {
       const row = jsonData[rowIdx];
       if (!row || !row[0]) continue;
@@ -1727,10 +1763,20 @@ function PatientsListView({ onSelectPatient }) {
         patientId.includes(p.displayId || '')
       );
 
-      // イベントタイプを決定（シート名から推測）
-      let eventType = 'てんかん発作';
-      if (sheetName.includes('意識')) eventType = '意識障害';
-      else if (sheetName.includes('発熱')) eventType = '発熱';
+      // イベントタイプを決定
+      let eventType = 'その他';
+      let symptomName = '';
+
+      if (symptomColumnIndex >= 0 && row[symptomColumnIndex]) {
+        // 症状列がある場合はその値を使用
+        symptomName = row[symptomColumnIndex].toString();
+        eventType = symptomToEventType[symptomName] || symptomName;
+      } else {
+        // シート名から推測
+        if (sheetName.includes('発作') || sheetName.includes('頻度')) eventType = 'てんかん発作';
+        else if (sheetName.includes('意識')) eventType = '意識障害';
+        else if (sheetName.includes('発熱')) eventType = '発熱';
+      }
 
       // 各時間ポイントのデータを抽出
       const events = [];
@@ -1740,7 +1786,8 @@ function PatientsListView({ onSelectPatient }) {
           events.push({
             timeLabel: tp.label,
             value: value,
-            eventType: eventType
+            eventType: eventType,
+            symptomName: symptomName || eventType
           });
         }
       }
@@ -1751,7 +1798,8 @@ function PatientsListView({ onSelectPatient }) {
           patientId,
           matchedPatient,
           events,
-          eventType
+          eventType,
+          symptomName: symptomName || eventType
         });
       }
     }
@@ -1826,7 +1874,21 @@ function PatientsListView({ onSelectPatient }) {
       const itemName = row[0].toString().trim();
       const unit = row[unitColumnIndex] ? row[unitColumnIndex].toString() : '';
 
+      // スキップ条件：カテゴリ行、空行、ヘッダー行、日付パターン
       if (itemName.startsWith('【') || itemName === '' || itemName === '検査項目') continue;
+
+      // 日付パターンをスキップ（様々な形式に対応）
+      if (/\d{4}[-\/\.]\d{1,2}[-\/\.]\d{1,2}/.test(itemName)) continue;  // 2024-01-01, 2024.01.01形式（文字列のどこかに含まれていればスキップ）
+      if (/^Day\s*\d+/i.test(itemName)) continue;  // Day 1形式
+      if (/^\d{1,2}[-\/\.]\d{1,2}[-\/\.]\d{2,4}/.test(itemName)) continue;  // 01/01/2024形式
+      if (/^\d+$/.test(itemName) && parseInt(itemName) > 30000) continue;  // Excelのシリアル日付
+      if (/^(ベースライン|baseline|治療前|治療後|初診|入院|退院)/i.test(itemName)) continue;  // 時間ラベル
+      if (/\d+[日週ヶ月年]後?/.test(itemName)) continue;  // 1ヶ月後などの時間ラベル（文字列のどこかに含まれていればスキップ）
+      if (/^(基準値|単位|患者|診断|発症|採取|検体|参考値|正常値)/.test(itemName)) continue;  // ヘッダー関連
+      if (/\r?\n/.test(itemName)) continue;  // 改行を含む（日付+ラベルの複合セル）
+      // 日本語の日付形式
+      if (/\d{1,2}月\d{1,2}日/.test(itemName)) continue;  // 1月1日形式
+      if (/令和|平成|昭和/.test(itemName)) continue;  // 和暦
 
       for (const col of dateColumns) {
         const value = row[col.index];
@@ -1853,43 +1915,95 @@ function PatientsListView({ onSelectPatient }) {
 
     setIsBulkLabImporting(true);
     let labSuccessCount = 0;
+    let labSkipCount = 0;
     let totalLabItems = 0;
     let eventSuccessCount = 0;
 
-    // 検査データのインポート
+    // 検査データのインポート（重複チェック付き）
     for (const sheetData of bulkLabImportData) {
       if (!sheetData.matchedPatient) continue;
 
       const patientRef = sheetData.matchedPatient;
 
+      // 既存の検査データを取得して重複チェック用セットを作成
+      let existingLabDates = new Set();
+      try {
+        const existingSnapshot = await getDocs(
+          collection(db, 'users', user.uid, 'patients', patientRef.id, 'labResults')
+        );
+        existingSnapshot.forEach(doc => {
+          const data = doc.data();
+          // 日付+検体タイプの組み合わせをキーにする
+          existingLabDates.add(`${data.date}_${data.specimen || ''}`);
+        });
+      } catch (err) {
+        console.error('Error fetching existing lab results:', err);
+      }
+
+      let importedCount = 0;
       for (const dayData of sheetData.labData) {
         try {
+          // 重複チェック（同じ日付+同じ検体タイプは既に存在するかチェック）
+          const labKey = `${dayData.date}_${dayData.specimen || ''}`;
+          if (existingLabDates.has(labKey)) {
+            labSkipCount++;
+            continue; // 重複はスキップ
+          }
+
           await addDoc(
             collection(db, 'users', user.uid, 'patients', patientRef.id, 'labResults'),
             {
               date: dayData.date,
               specimen: dayData.specimen || '',
-              items: dayData.data.reduce((obj, item) => {
-                obj[item.item] = { value: item.value, unit: item.unit };
-                return obj;
-              }, {}),
+              data: dayData.data,  // 配列形式で保存（通常のインポートと同じ形式）
+              source: 'excel_bulk',
               createdAt: serverTimestamp()
             }
           );
           totalLabItems += dayData.data.length;
           labSuccessCount++;
+          importedCount++;
+          existingLabDates.add(labKey); // 新規追加したものも重複チェック対象に
         } catch (err) {
           console.error('Error importing lab data:', err);
         }
       }
+
+      // 患者の検査件数を更新（実際にインポートした分のみ）
+      if (importedCount > 0) {
+        try {
+          const currentLabCount = patientRef.labCount || 0;
+          await updateDoc(doc(db, 'users', user.uid, 'patients', patientRef.id), {
+            labCount: currentLabCount + importedCount
+          });
+        } catch (err) {
+          console.error('Error updating lab count:', err);
+        }
+      }
     }
 
-    // 臨床経過データのインポート
+    // 臨床経過データのインポート（重複チェック付き）
+    let eventSkipCount = 0;
     for (const eventData of bulkClinicalEventData) {
       if (!eventData.matchedPatient) continue;
 
       const patientRef = eventData.matchedPatient;
       const onsetDate = patientRef.onsetDate ? new Date(patientRef.onsetDate) : new Date();
+
+      // 既存の臨床経過を取得して重複チェック用セットを作成
+      let existingEvents = new Set();
+      try {
+        const existingSnapshot = await getDocs(
+          collection(db, 'users', user.uid, 'patients', patientRef.id, 'clinicalEvents')
+        );
+        existingSnapshot.forEach(doc => {
+          const data = doc.data();
+          // 日付+イベントタイプの組み合わせをキーにする
+          existingEvents.add(`${data.startDate}_${data.eventType}`);
+        });
+      } catch (err) {
+        console.error('Error fetching existing events:', err);
+      }
 
       for (const event of eventData.events) {
         try {
@@ -1911,6 +2025,13 @@ function PatientsListView({ onSelectPatient }) {
           }
 
           const dateStr = eventDate.toISOString().split('T')[0];
+
+          // 重複チェック（同じ日付+同じイベントタイプは既に存在するかチェック）
+          const eventKey = `${dateStr}_${event.eventType}`;
+          if (existingEvents.has(eventKey)) {
+            eventSkipCount++;
+            continue; // 重複はスキップ
+          }
 
           // 頻度値を適切な形式に変換
           let frequency = 'several_daily';
@@ -1934,6 +2055,7 @@ function PatientsListView({ onSelectPatient }) {
             }
           );
           eventSuccessCount++;
+          existingEvents.add(eventKey); // 新規追加したものも重複チェック対象に
         } catch (err) {
           console.error('Error importing clinical event:', err);
         }
@@ -1943,6 +2065,12 @@ function PatientsListView({ onSelectPatient }) {
     const messages = [];
     if (labSuccessCount > 0) messages.push(`検査データ ${labSuccessCount}件（${totalLabItems}項目）`);
     if (eventSuccessCount > 0) messages.push(`臨床経過 ${eventSuccessCount}件`);
+    if (labSkipCount > 0 || eventSkipCount > 0) {
+      const skipDetails = [];
+      if (labSkipCount > 0) skipDetails.push(`検査${labSkipCount}件`);
+      if (eventSkipCount > 0) skipDetails.push(`臨床経過${eventSkipCount}件`);
+      messages.push(`重複スキップ: ${skipDetails.join('、')}`);
+    }
     alert(`インポート完了: ${messages.join('、')}`);
 
     setShowBulkLabImportModal(false);
@@ -2802,7 +2930,21 @@ function PatientsListView({ onSelectPatient }) {
         const labData = labDoc.data();
         if (labData.data && Array.isArray(labData.data)) {
           labData.data.forEach(item => {
-            if (item.item) itemsSet.add(item.item);
+            if (item.item) {
+              const itemName = item.item.toString().trim();
+              // 日付パターンをスキップ（誤ってインポートされたデータを除外）
+              if (/\d{4}[-\/\.]\d{1,2}[-\/\.]\d{1,2}/.test(itemName)) return;
+              if (/^Day\s*\d+/i.test(itemName)) return;
+              if (/^\d{1,2}[-\/\.]\d{1,2}[-\/\.]\d{2,4}/.test(itemName)) return;
+              if (/^\d+$/.test(itemName) && parseInt(itemName) > 30000) return;
+              if (/^(ベースライン|baseline|治療前|治療後|初診|入院|退院)/i.test(itemName)) return;
+              if (/\d+[日週ヶ月年]後?/.test(itemName)) return;
+              if (/^(基準値|単位|患者|診断|発症|採取|検体|参考値|正常値)/.test(itemName)) return;
+              if (/\r?\n/.test(itemName)) return;
+              if (/\d{1,2}月\d{1,2}日/.test(itemName)) return;
+              if (/令和|平成|昭和/.test(itemName)) return;
+              itemsSet.add(item.item);
+            }
           });
         }
       });
@@ -2823,14 +2965,22 @@ function PatientsListView({ onSelectPatient }) {
     setIsLoadingAnalysis(true);
 
     const selectedPatientsData = patients.filter(p => selectedPatientIds.includes(p.id));
-    const chartDatasets = [];
     const rawDataRows = []; // CSV用の生データ
     const colors = [
       '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6',
       '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#6366f1'
     ];
 
-    let colorIndex = 0;
+    // 項目ごとにデータをグループ化
+    const chartDataByItem = {};
+    selectedItems.forEach(item => {
+      chartDataByItem[item] = {
+        datasets: [],
+        unit: ''
+      };
+    });
+
+    let patientColorIndex = 0;
 
     for (const patient of selectedPatientsData) {
       const labQuery = query(
@@ -2838,9 +2988,11 @@ function PatientsListView({ onSelectPatient }) {
         orderBy('date', 'asc')
       );
       const labSnapshot = await getDocs(labQuery);
+      const patientColor = colors[patientColorIndex % colors.length];
 
       for (const itemName of selectedItems) {
         const dataPoints = [];
+        let itemUnit = '';
 
         labSnapshot.docs.forEach(labDoc => {
           const labData = labDoc.data();
@@ -2862,6 +3014,7 @@ function PatientsListView({ onSelectPatient }) {
                 x: dayFromOnset,
                 y: parseFloat(item.value) || 0
               });
+              if (item.unit) itemUnit = item.unit;
               // CSV用生データを追加
               rawDataRows.push({
                 PatientID: patient.displayId,
@@ -2882,32 +3035,41 @@ function PatientsListView({ onSelectPatient }) {
           // Sort by x (day from onset)
           dataPoints.sort((a, b) => a.x - b.x);
 
-          const color = colors[colorIndex % colors.length];
-          chartDatasets.push({
-            label: `${patient.displayId} - ${itemName}${patient.group ? ` (${patient.group})` : ''}`,
+          chartDataByItem[itemName].datasets.push({
+            label: `${patient.displayId}${patient.group ? ` (${patient.group})` : ''}`,
             data: dataPoints,
-            borderColor: color,
-            backgroundColor: color + '40',
+            borderColor: patientColor,
+            backgroundColor: patientColor + '40',
             tension: 0.1,
             pointRadius: 5,
             pointHoverRadius: 7,
           });
-          colorIndex++;
+          if (itemUnit) chartDataByItem[itemName].unit = itemUnit;
         }
       }
+      patientColorIndex++;
     }
 
-    // X軸のラベル（全データポイントの日数をユニークに）
-    const allDays = new Set();
-    chartDatasets.forEach(ds => {
-      ds.data.forEach(point => allDays.add(point.x));
-    });
-    const sortedDays = Array.from(allDays).sort((a, b) => a - b);
+    // 項目ごとのチャートデータを配列に変換
+    const chartsArray = selectedItems
+      .filter(item => chartDataByItem[item].datasets.length > 0)
+      .map(item => {
+        const itemData = chartDataByItem[item];
+        const allDays = new Set();
+        itemData.datasets.forEach(ds => {
+          ds.data.forEach(point => allDays.add(point.x));
+        });
+        const sortedDays = Array.from(allDays).sort((a, b) => a - b);
 
-    setAnalysisData({
-      labels: sortedDays,
-      datasets: chartDatasets
-    });
+        return {
+          itemName: item,
+          unit: itemData.unit,
+          labels: sortedDays,
+          datasets: itemData.datasets
+        };
+      });
+
+    setAnalysisData(chartsArray);
     setAnalysisRawData(rawDataRows);
 
     setIsLoadingAnalysis(false);
@@ -3988,52 +4150,59 @@ function PatientsListView({ onSelectPatient }) {
                   {isLoadingAnalysis ? 'グラフ生成中...' : 'グラフを生成'}
                 </button>
 
-                {/* グラフ表示 */}
-                {analysisData && analysisData.datasets.length > 0 && (
-                  <div style={{
-                    background: '#f8fafc',
-                    padding: '20px',
-                    borderRadius: '12px',
-                    marginBottom: '20px'
-                  }}>
-                    <Line
-                      ref={chartRef}
-                      data={analysisData}
-                      options={{
-                        responsive: true,
-                        plugins: {
-                          legend: {
-                            position: 'top',
-                          },
-                          title: {
-                            display: true,
-                            text: '経時データ（発症日からの日数）'
-                          },
-                          tooltip: {
-                            callbacks: {
-                              label: function(context) {
-                                return `${context.dataset.label}: ${context.parsed.y}`;
+                {/* グラフ表示（検査項目ごとに別々のグラフ） */}
+                {analysisData && Array.isArray(analysisData) && analysisData.length > 0 && (
+                  <div>
+                    {analysisData.map((chartData, chartIndex) => (
+                      <div key={chartIndex} style={{
+                        background: '#f8fafc',
+                        padding: '20px',
+                        borderRadius: '12px',
+                        marginBottom: '20px'
+                      }}>
+                        <Line
+                          ref={chartIndex === 0 ? chartRef : null}
+                          data={{
+                            labels: chartData.labels,
+                            datasets: chartData.datasets
+                          }}
+                          options={{
+                            responsive: true,
+                            plugins: {
+                              legend: {
+                                position: 'top',
+                              },
+                              title: {
+                                display: true,
+                                text: `${chartData.itemName}${chartData.unit ? ` (${chartData.unit})` : ''}`
+                              },
+                              tooltip: {
+                                callbacks: {
+                                  label: function(context) {
+                                    return `${context.dataset.label}: ${context.parsed.y}${chartData.unit ? ' ' + chartData.unit : ''}`;
+                                  }
+                                }
+                              }
+                            },
+                            scales: {
+                              x: {
+                                type: 'linear',
+                                title: {
+                                  display: true,
+                                  text: '発症からの日数'
+                                }
+                              },
+                              y: {
+                                title: {
+                                  display: true,
+                                  text: chartData.unit || '値'
+                                }
                               }
                             }
-                          }
-                        },
-                        scales: {
-                          x: {
-                            type: 'linear',
-                            title: {
-                              display: true,
-                              text: '発症からの日数'
-                            }
-                          },
-                          y: {
-                            title: {
-                              display: true,
-                              text: '値'
-                            }
-                          }
-                        }
-                      }}
-                    />
+                          }}
+                        />
+                      </div>
+                    ))}
                     {/* エクスポートボタン */}
                     <div style={{
                       display: 'flex',
@@ -4067,7 +4236,7 @@ function PatientsListView({ onSelectPatient }) {
                   </div>
                 )}
 
-                {analysisData && analysisData.datasets.length === 0 && (
+                {analysisData && Array.isArray(analysisData) && analysisData.length === 0 && (
                   <div style={{
                     textAlign: 'center',
                     padding: '40px',
@@ -6114,6 +6283,19 @@ function PatientDetailView({ patient, onBack }) {
       // セクションヘッダーや空行をスキップ
       if (itemName.startsWith('【') || itemName === '' || itemName === '検査項目') continue;
 
+      // 日付パターンをスキップ（様々な形式に対応）
+      if (/\d{4}[-\/\.]\d{1,2}[-\/\.]\d{1,2}/.test(itemName)) continue;  // 2024-01-01, 2024.01.01形式（文字列のどこかに含まれていればスキップ）
+      if (/^Day\s*\d+/i.test(itemName)) continue;  // Day 1形式
+      if (/^\d{1,2}[-\/\.]\d{1,2}[-\/\.]\d{2,4}/.test(itemName)) continue;  // 01/01/2024形式
+      if (/^\d+$/.test(itemName) && parseInt(itemName) > 30000) continue;  // Excelのシリアル日付
+      if (/^(ベースライン|baseline|治療前|治療後|初診|入院|退院)/i.test(itemName)) continue;  // 時間ラベル
+      if (/\d+[日週ヶ月年]後?/.test(itemName)) continue;  // 1ヶ月後などの時間ラベル（文字列のどこかに含まれていればスキップ）
+      if (/^(基準値|単位|患者|診断|発症|採取|検体|参考値|正常値)/.test(itemName)) continue;  // ヘッダー関連
+      if (/\r?\n/.test(itemName)) continue;  // 改行を含む（日付+ラベルの複合セル）
+      // 日本語の日付形式
+      if (/\d{1,2}月\d{1,2}日/.test(itemName)) continue;  // 1月1日形式
+      if (/令和|平成|昭和/.test(itemName)) continue;  // 和暦
+
       for (const col of dateColumns) {
         const value = row[col.index];
         // 数値として解析可能かチェック（文字列の数値も含む）
@@ -6201,6 +6383,27 @@ function PatientDetailView({ patient, onBack }) {
       });
     } catch (err) {
       console.error('Error deleting lab result:', err);
+    }
+  };
+
+  // 全検査データを一括削除
+  const deleteAllLabResults = async () => {
+    if (!confirm(`この患者の全検査データ（${labResults.length}件）を削除しますか？この操作は取り消せません。`)) return;
+
+    try {
+      for (const lab of labResults) {
+        await deleteDoc(
+          doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', lab.id)
+        );
+      }
+
+      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+        labCount: 0
+      });
+      alert('全検査データを削除しました');
+    } catch (err) {
+      console.error('Error deleting all lab results:', err);
+      alert('削除に失敗しました');
     }
   };
 
@@ -6720,27 +6923,43 @@ function PatientDetailView({ patient, onBack }) {
                       臨床経過タイムライン（症状推移）
                     </h3>
 
-                    {/* X軸（Day表示） */}
+                    {/* X軸（Day表示）- 経過が長い場合は間隔を自動調整 */}
                     <div style={{marginLeft: '160px', marginBottom: '8px', position: 'relative', height: '20px'}}>
-                      {[...Array(Math.ceil(dayRange / 5) + 1)].map((_, i) => {
-                        const day = minDay + i * 5;
-                        if (day > maxDay) return null;
-                        const leftPercent = ((day - minDay) / dayRange) * 100;
-                        return (
-                          <span
-                            key={i}
-                            style={{
-                              position: 'absolute',
-                              left: `${leftPercent}%`,
-                              transform: 'translateX(-50%)',
-                              fontSize: '10px',
-                              color: '#6b7280'
-                            }}
-                          >
-                            Day {day}
-                          </span>
-                        );
-                      })}
+                      {(() => {
+                        // 表示間隔を自動調整（ラベルが被らないように）
+                        let step = 5;
+                        if (dayRange > 50) step = 10;
+                        if (dayRange > 100) step = 20;
+                        if (dayRange > 200) step = 30;
+                        if (dayRange > 500) step = 50;
+                        if (dayRange > 1000) step = 100;
+
+                        const labels = [];
+                        const firstDay = Math.ceil(minDay / step) * step;
+                        for (let day = firstDay; day <= maxDay; day += step) {
+                          labels.push(day);
+                        }
+                        if (labels[0] !== minDay && minDay >= 0) labels.unshift(minDay);
+
+                        return labels.map((day, i) => {
+                          const leftPercent = ((day - minDay) / dayRange) * 100;
+                          return (
+                            <span
+                              key={i}
+                              style={{
+                                position: 'absolute',
+                                left: `${leftPercent}%`,
+                                transform: 'translateX(-50%)',
+                                fontSize: '10px',
+                                color: '#6b7280',
+                                whiteSpace: 'nowrap'
+                              }}
+                            >
+                              Day {day}
+                            </span>
+                          );
+                        });
+                      })()}
                     </div>
 
                     {/* 症状ごとのタイムライン */}
@@ -6969,27 +7188,43 @@ function PatientDetailView({ patient, onBack }) {
                       治療タイムライン（投与量推移）
                     </h3>
 
-                    {/* X軸（Day表示） */}
+                    {/* X軸（Day表示）- 経過が長い場合は間隔を自動調整 */}
                     <div style={{marginLeft: '160px', marginBottom: '8px', position: 'relative', height: '20px'}}>
-                      {[...Array(Math.ceil(dayRange / 5) + 1)].map((_, i) => {
-                        const day = minDay + i * 5;
-                        if (day > maxDay) return null;
-                        const leftPercent = ((day - minDay) / dayRange) * 100;
-                        return (
-                          <span
-                            key={i}
-                            style={{
-                              position: 'absolute',
-                              left: `${leftPercent}%`,
-                              transform: 'translateX(-50%)',
-                              fontSize: '10px',
-                              color: '#6b7280'
-                            }}
-                          >
-                            Day {day}
-                          </span>
-                        );
-                      })}
+                      {(() => {
+                        // 表示間隔を自動調整（ラベルが被らないように）
+                        let step = 5;
+                        if (dayRange > 50) step = 10;
+                        if (dayRange > 100) step = 20;
+                        if (dayRange > 200) step = 30;
+                        if (dayRange > 500) step = 50;
+                        if (dayRange > 1000) step = 100;
+
+                        const labels = [];
+                        const firstDay = Math.ceil(minDay / step) * step;
+                        for (let day = firstDay; day <= maxDay; day += step) {
+                          labels.push(day);
+                        }
+                        if (labels[0] !== minDay && minDay >= 0) labels.unshift(minDay);
+
+                        return labels.map((day, i) => {
+                          const leftPercent = ((day - minDay) / dayRange) * 100;
+                          return (
+                            <span
+                              key={i}
+                              style={{
+                                position: 'absolute',
+                                left: `${leftPercent}%`,
+                                transform: 'translateX(-50%)',
+                                fontSize: '10px',
+                                color: '#6b7280',
+                                whiteSpace: 'nowrap'
+                              }}
+                            >
+                              Day {day}
+                            </span>
+                          );
+                        });
+                      })()}
                     </div>
 
                     {/* 薬剤ごとのタイムライン */}
@@ -9151,13 +9386,18 @@ function PatientDetailView({ patient, onBack }) {
         <section style={styles.section}>
           <div style={styles.sectionHeader}>
             <h2 style={styles.sectionTitle}>検査データ</h2>
-            <div style={{display: 'flex', gap: '10px'}}>
+            <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap'}}>
               <button onClick={() => setShowAddLabModal(true)} style={styles.addLabButton}>
                 <span>📷</span> 写真から追加
               </button>
               <button onClick={() => setShowExcelModal(true)} style={{...styles.addLabButton, background: '#e0f2fe', color: '#0369a1'}}>
                 <span>📊</span> Excelから追加
               </button>
+              {labResults.length > 0 && (
+                <button onClick={deleteAllLabResults} style={{...styles.addLabButton, background: '#fef2f2', color: '#dc2626'}}>
+                  <span>🗑️</span> 全削除
+                </button>
+              )}
             </div>
           </div>
 
@@ -9808,19 +10048,34 @@ function PatientDetailView({ patient, onBack }) {
 
                 return (
                   <>
-                    {/* X軸（Day表示） */}
+                    {/* X軸（Day表示）- 経過が長い場合は間隔を自動調整 */}
                     <div style={{marginLeft: '180px', marginBottom: '8px', position: 'relative', height: '24px', borderBottom: '1px solid #e5e7eb'}}>
-                      {[...Array(Math.ceil(dayRange / 5) + 1)].map((_, i) => {
-                        const day = minDay + i * 5;
-                        if (day > maxDay) return null;
-                        const leftPercent = ((day - minDay) / dayRange) * 100;
-                        return (
-                          <div key={i} style={{position: 'absolute', left: `${leftPercent}%`, transform: 'translateX(-50%)'}}>
-                            <span style={{fontSize: '11px', color: '#374151', fontWeight: '500'}}>Day {day}</span>
-                            <div style={{width: '1px', height: '8px', background: '#d1d5db', margin: '0 auto'}} />
-                          </div>
-                        );
-                      })}
+                      {(() => {
+                        // 表示間隔を自動調整（ラベルが被らないように）
+                        let step = 5;
+                        if (dayRange > 50) step = 10;
+                        if (dayRange > 100) step = 20;
+                        if (dayRange > 200) step = 30;
+                        if (dayRange > 500) step = 50;
+                        if (dayRange > 1000) step = 100;
+
+                        const labels = [];
+                        const firstDay = Math.ceil(minDay / step) * step;
+                        for (let day = firstDay; day <= maxDay; day += step) {
+                          labels.push(day);
+                        }
+                        if (labels[0] !== minDay && minDay >= 0) labels.unshift(minDay);
+
+                        return labels.map((day, i) => {
+                          const leftPercent = ((day - minDay) / dayRange) * 100;
+                          return (
+                            <div key={i} style={{position: 'absolute', left: `${leftPercent}%`, transform: 'translateX(-50%)'}}>
+                              <span style={{fontSize: '11px', color: '#374151', fontWeight: '500'}}>Day {day}</span>
+                              <div style={{width: '1px', height: '8px', background: '#d1d5db', margin: '0 auto'}} />
+                            </div>
+                          );
+                        });
+                      })()}
                     </div>
 
                     {/* 臨床症状セクション（同じ症状は横並び、頻度/重症度で高さが変化） */}
