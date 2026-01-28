@@ -1355,6 +1355,7 @@ function PatientsListView({ onSelectPatient }) {
   // 検査データ一括インポート用state
   const [showBulkLabImportModal, setShowBulkLabImportModal] = useState(false);
   const [bulkLabImportData, setBulkLabImportData] = useState([]);
+  const [bulkClinicalEventData, setBulkClinicalEventData] = useState([]);
   const [isBulkLabImporting, setIsBulkLabImporting] = useState(false);
 
   // Firestoreからリアルタイムでデータ取得
@@ -1629,12 +1630,22 @@ function PatientsListView({ onSelectPatient }) {
         const data = new Uint8Array(event.target.result);
         const workbook = XLSX.read(data, { type: 'array' });
 
-        const results = [];
+        const labResults = [];
+        const clinicalEventResults = [];
 
         // 各シートを処理
         for (const sheetName of workbook.SheetNames) {
           // 患者一覧シートや説明シートはスキップ
-          if (sheetName === '患者一覧' || sheetName === '説明' || sheetName.includes('縦持ち')) continue;
+          if (sheetName === '患者一覧' || sheetName === '説明' || sheetName.includes('縦持ち') || sheetName.includes('サマリー')) continue;
+
+          // 臨床経過データシート（発作頻度推移など）を検出
+          if (sheetName.includes('発作') || sheetName.includes('頻度') || sheetName.includes('推移') || sheetName.includes('経過')) {
+            const eventData = parseClinicalEventSheet(workbook, sheetName);
+            if (eventData.length > 0) {
+              clinicalEventResults.push(...eventData);
+            }
+            continue;
+          }
 
           const sheet = workbook.Sheets[sheetName];
           const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
@@ -1663,7 +1674,7 @@ function PatientsListView({ onSelectPatient }) {
           const labData = parseLabDataFromSheet(workbook, sheetName);
 
           if (labData.length > 0) {
-            results.push({
+            labResults.push({
               sheetName,
               patientId,
               matchedPatient,
@@ -1673,13 +1684,79 @@ function PatientsListView({ onSelectPatient }) {
           }
         }
 
-        setBulkLabImportData(results);
+        setBulkLabImportData(labResults);
+        setBulkClinicalEventData(clinicalEventResults);
       } catch (err) {
         console.error('Error parsing file:', err);
         alert('ファイルの読み込みに失敗しました');
       }
     };
     reader.readAsArrayBuffer(file);
+  };
+
+  // 臨床経過シートをパース（発作頻度推移など）
+  const parseClinicalEventSheet = (workbook, sheetName) => {
+    const sheet = workbook.Sheets[sheetName];
+    const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+
+    if (jsonData.length < 2) return [];
+
+    const headerRow = jsonData[0];
+    const results = [];
+
+    // ヘッダーから時間ポイントを抽出（ベースライン、1ヶ月後など）
+    const timePoints = [];
+    for (let i = 2; i < headerRow.length; i++) {
+      if (headerRow[i]) {
+        timePoints.push({ index: i, label: headerRow[i].toString() });
+      }
+    }
+
+    // 各患者の行を処理
+    for (let rowIdx = 1; rowIdx < jsonData.length; rowIdx++) {
+      const row = jsonData[rowIdx];
+      if (!row || !row[0]) continue;
+
+      const patientId = row[0].toString();
+
+      // 対応する患者を検索
+      const matchedPatient = patients.find(p =>
+        p.displayId === patientId ||
+        p.id === patientId ||
+        p.displayId?.includes(patientId) ||
+        patientId.includes(p.displayId || '')
+      );
+
+      // イベントタイプを決定（シート名から推測）
+      let eventType = 'てんかん発作';
+      if (sheetName.includes('意識')) eventType = '意識障害';
+      else if (sheetName.includes('発熱')) eventType = '発熱';
+
+      // 各時間ポイントのデータを抽出
+      const events = [];
+      for (const tp of timePoints) {
+        const value = row[tp.index];
+        if (value !== undefined && value !== null && value !== '') {
+          events.push({
+            timeLabel: tp.label,
+            value: value,
+            eventType: eventType
+          });
+        }
+      }
+
+      if (events.length > 0) {
+        results.push({
+          sheetName,
+          patientId,
+          matchedPatient,
+          events,
+          eventType
+        });
+      }
+    }
+
+    return results;
   };
 
   // シートから検査データをパースする共通関数
@@ -1772,12 +1849,14 @@ function PatientsListView({ onSelectPatient }) {
   };
 
   const executeBulkLabImport = async () => {
-    if (bulkLabImportData.length === 0) return;
+    if (bulkLabImportData.length === 0 && bulkClinicalEventData.length === 0) return;
 
     setIsBulkLabImporting(true);
-    let successCount = 0;
-    let totalItems = 0;
+    let labSuccessCount = 0;
+    let totalLabItems = 0;
+    let eventSuccessCount = 0;
 
+    // 検査データのインポート
     for (const sheetData of bulkLabImportData) {
       if (!sheetData.matchedPatient) continue;
 
@@ -1797,17 +1876,78 @@ function PatientsListView({ onSelectPatient }) {
               createdAt: serverTimestamp()
             }
           );
-          totalItems += dayData.data.length;
-          successCount++;
+          totalLabItems += dayData.data.length;
+          labSuccessCount++;
         } catch (err) {
           console.error('Error importing lab data:', err);
         }
       }
     }
 
-    alert(`${successCount}件の検査データ（${totalItems}項目）をインポートしました`);
+    // 臨床経過データのインポート
+    for (const eventData of bulkClinicalEventData) {
+      if (!eventData.matchedPatient) continue;
+
+      const patientRef = eventData.matchedPatient;
+      const onsetDate = patientRef.onsetDate ? new Date(patientRef.onsetDate) : new Date();
+
+      for (const event of eventData.events) {
+        try {
+          // 時間ラベルから日付を計算
+          let eventDate = new Date(onsetDate);
+          const label = event.timeLabel.toLowerCase();
+
+          if (label.includes('ベースライン') || label.includes('baseline')) {
+            // 発症日をそのまま使用
+          } else if (label.includes('ヶ月後') || label.includes('ヵ月後')) {
+            const months = parseInt(label.match(/(\d+)/)?.[1] || '0');
+            eventDate.setMonth(eventDate.getMonth() + months);
+          } else if (label.includes('週後')) {
+            const weeks = parseInt(label.match(/(\d+)/)?.[1] || '0');
+            eventDate.setDate(eventDate.getDate() + weeks * 7);
+          } else if (label.includes('日後')) {
+            const days = parseInt(label.match(/(\d+)/)?.[1] || '0');
+            eventDate.setDate(eventDate.getDate() + days);
+          }
+
+          const dateStr = eventDate.toISOString().split('T')[0];
+
+          // 頻度値を適切な形式に変換
+          let frequency = 'several_daily';
+          const numValue = parseFloat(event.value);
+          if (!isNaN(numValue)) {
+            if (numValue >= 20) frequency = 'hourly';
+            else if (numValue >= 7) frequency = 'several_daily';
+            else if (numValue >= 3) frequency = 'daily';
+            else if (numValue >= 1) frequency = 'several_weekly';
+            else frequency = 'weekly';
+          }
+
+          await addDoc(
+            collection(db, 'users', user.uid, 'patients', patientRef.id, 'clinicalEvents'),
+            {
+              eventType: event.eventType,
+              startDate: dateStr,
+              frequency: frequency,
+              note: `${event.timeLabel}: ${event.value}回/週`,
+              createdAt: serverTimestamp()
+            }
+          );
+          eventSuccessCount++;
+        } catch (err) {
+          console.error('Error importing clinical event:', err);
+        }
+      }
+    }
+
+    const messages = [];
+    if (labSuccessCount > 0) messages.push(`検査データ ${labSuccessCount}件（${totalLabItems}項目）`);
+    if (eventSuccessCount > 0) messages.push(`臨床経過 ${eventSuccessCount}件`);
+    alert(`インポート完了: ${messages.join('、')}`);
+
     setShowBulkLabImportModal(false);
     setBulkLabImportData([]);
+    setBulkClinicalEventData([]);
     setIsBulkLabImporting(false);
   };
 
@@ -3098,7 +3238,7 @@ function PatientsListView({ onSelectPatient }) {
               backgroundColor: '#8b5cf6'
             }}
           >
-            🔬 検査一括登録
+            📊 データ一括登録
           </button>
         </div>
 
@@ -3526,16 +3666,15 @@ function PatientsListView({ onSelectPatient }) {
         </div>
       )}
 
-      {/* 検査データ一括インポートモーダル */}
+      {/* 検査・臨床経過一括インポートモーダル */}
       {showBulkLabImportModal && (
         <div style={styles.modalOverlay}>
           <div style={{...styles.modal, maxWidth: '900px', maxHeight: '90vh', overflow: 'auto'}}>
-            <h2 style={styles.modalTitle}>検査データ一括インポート</h2>
+            <h2 style={styles.modalTitle}>検査・臨床経過 一括インポート</h2>
 
             <div style={{marginBottom: '20px'}}>
               <p style={{fontSize: '13px', color: '#6b7280', marginBottom: '12px'}}>
-                Excelファイルから複数患者の検査データを一括登録できます。<br/>
-                各シート名が患者IDとマッチングされます。
+                Excelファイルから複数患者のデータを一括登録できます。
               </p>
               <div style={{
                 background: '#f8fafc',
@@ -3545,8 +3684,8 @@ function PatientsListView({ onSelectPatient }) {
               }}>
                 <div><strong>対応形式:</strong></div>
                 <div>・各シート = 1患者（シート名またはセル内の患者IDで照合）</div>
-                <div>・「検査項目」「単位」列 + 日付列のフォーマット</div>
-                <div>・sample-clinical-data.xlsx のような形式に対応</div>
+                <div>・検査データ:「検査項目」「単位」列 + 日付列</div>
+                <div>・臨床経過:「発作頻度推移」等のシート（患者ID列 + 時点列）</div>
               </div>
             </div>
 
@@ -3562,10 +3701,10 @@ function PatientsListView({ onSelectPatient }) {
 
             {bulkLabImportData.length > 0 && (
               <div style={{marginTop: '20px'}}>
-                <p style={{fontWeight: '500', marginBottom: '12px'}}>
-                  検出されたシート（{bulkLabImportData.length}件）
+                <p style={{fontWeight: '500', marginBottom: '12px', color: '#1e40af'}}>
+                  🔬 検査データ（{bulkLabImportData.length}シート）
                 </p>
-                <div style={{maxHeight: '400px', overflow: 'auto', border: '1px solid #e2e8f0', borderRadius: '8px'}}>
+                <div style={{maxHeight: '250px', overflow: 'auto', border: '1px solid #e2e8f0', borderRadius: '8px'}}>
                   <table style={{width: '100%', borderCollapse: 'collapse', fontSize: '12px'}}>
                     <thead>
                       <tr style={{background: '#f1f5f9', position: 'sticky', top: 0}}>
@@ -3587,7 +3726,7 @@ function PatientsListView({ onSelectPatient }) {
                                 ✓ {row.matchedPatient.displayId || row.matchedPatient.id}
                               </span>
                             ) : (
-                              <span style={{color: '#dc2626'}}>✗ 患者が見つかりません</span>
+                              <span style={{color: '#dc2626'}}>✗ 未マッチ</span>
                             )}
                           </td>
                           <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
@@ -3601,10 +3740,53 @@ function PatientsListView({ onSelectPatient }) {
                     </tbody>
                   </table>
                 </div>
-                <p style={{fontSize: '12px', color: '#6b7280', marginTop: '8px'}}>
-                  ✓マークの患者のみインポートされます。患者が見つからない場合は、先に患者を登録してください。
-                </p>
               </div>
+            )}
+
+            {bulkClinicalEventData.length > 0 && (
+              <div style={{marginTop: '20px'}}>
+                <p style={{fontWeight: '500', marginBottom: '12px', color: '#7c3aed'}}>
+                  📋 臨床経過データ（{bulkClinicalEventData.length}患者）
+                </p>
+                <div style={{maxHeight: '200px', overflow: 'auto', border: '1px solid #e2e8f0', borderRadius: '8px'}}>
+                  <table style={{width: '100%', borderCollapse: 'collapse', fontSize: '12px'}}>
+                    <thead>
+                      <tr style={{background: '#f5f3ff', position: 'sticky', top: 0}}>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>患者ID</th>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>マッチ状況</th>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>イベント種類</th>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>データ数</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {bulkClinicalEventData.map((row, idx) => (
+                        <tr key={idx} style={{background: idx % 2 === 0 ? 'white' : '#faf5ff'}}>
+                          <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>{row.patientId}</td>
+                          <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>
+                            {row.matchedPatient ? (
+                              <span style={{color: '#059669', fontWeight: '500'}}>
+                                ✓ {row.matchedPatient.displayId || row.matchedPatient.id}
+                              </span>
+                            ) : (
+                              <span style={{color: '#dc2626'}}>✗ 未マッチ</span>
+                            )}
+                          </td>
+                          <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>{row.eventType}</td>
+                          <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
+                            {row.events.length}件
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
+            {(bulkLabImportData.length > 0 || bulkClinicalEventData.length > 0) && (
+              <p style={{fontSize: '12px', color: '#6b7280', marginTop: '12px'}}>
+                ✓マークの患者のみインポートされます。患者が見つからない場合は、先に患者を登録してください。
+              </p>
             )}
 
             <div style={styles.modalActions}>
@@ -3612,6 +3794,7 @@ function PatientsListView({ onSelectPatient }) {
                 onClick={() => {
                   setShowBulkLabImportModal(false);
                   setBulkLabImportData([]);
+                  setBulkClinicalEventData([]);
                 }}
                 style={styles.cancelButton}
               >
@@ -3619,14 +3802,14 @@ function PatientsListView({ onSelectPatient }) {
               </button>
               <button
                 onClick={executeBulkLabImport}
-                disabled={bulkLabImportData.filter(d => d.matchedPatient).length === 0 || isBulkLabImporting}
+                disabled={(bulkLabImportData.filter(d => d.matchedPatient).length === 0 && bulkClinicalEventData.filter(d => d.matchedPatient).length === 0) || isBulkLabImporting}
                 style={{
                   ...styles.primaryButton,
                   backgroundColor: '#8b5cf6',
-                  opacity: bulkLabImportData.filter(d => d.matchedPatient).length === 0 ? 0.5 : 1
+                  opacity: (bulkLabImportData.filter(d => d.matchedPatient).length === 0 && bulkClinicalEventData.filter(d => d.matchedPatient).length === 0) ? 0.5 : 1
                 }}
               >
-                {isBulkLabImporting ? 'インポート中...' : `${bulkLabImportData.filter(d => d.matchedPatient).length}件をインポート`}
+                {isBulkLabImporting ? 'インポート中...' : `インポート実行`}
               </button>
             </div>
           </div>
