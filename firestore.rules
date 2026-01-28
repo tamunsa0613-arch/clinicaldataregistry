@@ -7,29 +7,50 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    
+
     // ユーザーは自分のデータのみアクセス可能
     match /users/{userId} {
       // 認証済みユーザーが自分のドキュメントのみアクセス可能
       allow read, write: if request.auth != null && request.auth.uid == userId;
-      
+
       // 患者データ
       match /patients/{patientId} {
         // 認証済みユーザーが自分の患者データのみアクセス可能
         allow read, write: if request.auth != null && request.auth.uid == userId;
-        
+
         // 検査データ
         match /labResults/{labId} {
           allow read, write: if request.auth != null && request.auth.uid == userId;
         }
-        
-        // 治療データ（将来の拡張用）
+
+        // 治療データ
         match /treatments/{treatmentId} {
+          allow read, write: if request.auth != null && request.auth.uid == userId;
+        }
+
+        // 臨床経過データ
+        match /clinicalEvents/{eventId} {
           allow read, write: if request.auth != null && request.auth.uid == userId;
         }
       }
     }
-    
+
+    // 設定データ（管理者設定、許可リスト設定）
+    match /config/{configId} {
+      // 認証済みユーザーは読み取り可能
+      allow read: if request.auth != null;
+      // 書き込みは認証済みユーザーのみ（アプリ側で管理者チェック）
+      allow write: if request.auth != null;
+    }
+
+    // メールアドレス許可リスト
+    match /allowedEmails/{emailId} {
+      // 認証済みユーザーは読み取り可能
+      allow read: if request.auth != null;
+      // 書き込みは認証済みユーザーのみ（アプリ側で管理者チェック）
+      allow write: if request.auth != null;
+    }
+
     // その他のドキュメントへのアクセスは禁止
     match /{document=**} {
       allow read, write: if false;

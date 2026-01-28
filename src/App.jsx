@@ -8,7 +8,8 @@ import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
   signOut,
-  onAuthStateChanged
+  onAuthStateChanged,
+  sendPasswordResetEmail
 } from 'firebase/auth';
 import {
   collection,
@@ -20,7 +21,10 @@ import {
   orderBy,
   onSnapshot,
   serverTimestamp,
-  getDocs
+  getDocs,
+  getDoc,
+  setDoc,
+  where
 } from 'firebase/firestore';
 // Tesseract.jsは不要になりました（Cloud Vision APIに移行）
 import * as XLSX from 'xlsx';
@@ -55,16 +59,60 @@ const AuthContext = createContext();
 function AuthProvider({ children }) {
   const [user, setUser] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [isAdmin, setIsAdmin] = useState(false);
 
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setUser(user);
+    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      setUser(currentUser);
+      if (currentUser) {
+        try {
+          // 管理者かどうかチェック
+          const adminDoc = await getDoc(doc(db, 'config', 'admin'));
+          if (adminDoc.exists() && adminDoc.data().email === currentUser.email) {
+            setIsAdmin(true);
+          } else {
+            setIsAdmin(false);
+          }
+        } catch (err) {
+          console.error('Error checking admin status:', err);
+          setIsAdmin(false);
+        }
+      } else {
+        setIsAdmin(false);
+      }
       setLoading(false);
     });
     return unsubscribe;
   }, []);
 
-  const signup = (email, password) => {
+  // メールアドレスが許可リストに含まれているかチェック
+  const checkEmailAllowed = async (email) => {
+    try {
+      // まず許可リスト機能が有効かチェック
+      const configDoc = await getDoc(doc(db, 'config', 'settings'));
+      if (!configDoc.exists() || !configDoc.data().emailAllowlistEnabled) {
+        return true; // 機能が無効なら全て許可
+      }
+
+      // 許可リストをチェック
+      const allowedQuery = query(
+        collection(db, 'allowedEmails'),
+        where('email', '==', email.toLowerCase())
+      );
+      const snapshot = await getDocs(allowedQuery);
+      return !snapshot.empty;
+    } catch (err) {
+      console.error('Error checking email allowlist:', err);
+      return true; // エラー時は許可（フェイルオープン）
+    }
+  };
+
+  const signup = async (email, password) => {
+    // 許可リストをチェック
+    const isAllowed = await checkEmailAllowed(email);
+    if (!isAllowed) {
+      throw { code: 'auth/email-not-allowed', message: 'このメールアドレスは許可されていません' };
+    }
     return createUserWithEmailAndPassword(auth, email, password);
   };
 
@@ -77,7 +125,7 @@ function AuthProvider({ children }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, signup, login, logout, loading }}>
+    <AuthContext.Provider value={{ user, signup, login, logout, loading, isAdmin, checkEmailAllowed }}>
       {!loading && children}
     </AuthContext.Provider>
   );
@@ -1061,8 +1109,38 @@ function LoginView() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isRegistering, setIsRegistering] = useState(false);
+  const [showPasswordReset, setShowPasswordReset] = useState(false);
   const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
+
+  const handlePasswordReset = async (e) => {
+    e.preventDefault();
+    if (!email) {
+      setError('メールアドレスを入力してください');
+      return;
+    }
+
+    setLoading(true);
+    setError('');
+    setSuccess('');
+
+    try {
+      await sendPasswordResetEmail(auth, email);
+      setSuccess('パスワードリセットメールを送信しました。メールをご確認ください。');
+    } catch (err) {
+      console.error(err);
+      if (err.code === 'auth/user-not-found') {
+        setError('このメールアドレスは登録されていません');
+      } else if (err.code === 'auth/invalid-email') {
+        setError('メールアドレスの形式が正しくありません');
+      } else {
+        setError('メール送信に失敗しました');
+      }
+    }
+
+    setLoading(false);
+  };
 
   const handleAuth = async (e) => {
     e.preventDefault();
@@ -1094,6 +1172,8 @@ function LoginView() {
         setError('このメールアドレスは既に使用されています');
       } else if (err.code === 'auth/invalid-email') {
         setError('メールアドレスの形式が正しくありません');
+      } else if (err.code === 'auth/email-not-allowed') {
+        setError('このメールアドレスは登録が許可されていません。管理者にお問い合わせください。');
       } else {
         setError('認証エラーが発生しました');
       }
@@ -1116,43 +1196,93 @@ function LoginView() {
           <p style={styles.authSubtitle}>臨床データ管理システム</p>
         </div>
 
-        <form style={styles.authForm} onSubmit={handleAuth}>
-          <div style={styles.inputGroup}>
-            <label style={styles.inputLabel}>メールアドレス</label>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              style={styles.input}
-              placeholder="your@email.com"
-            />
-          </div>
-          <div style={styles.inputGroup}>
-            <label style={styles.inputLabel}>パスワード</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              style={styles.input}
-              placeholder="••••••••"
-            />
-          </div>
-          {error && <p style={styles.errorText}>{error}</p>}
-          <button 
-            type="submit" 
-            style={{...styles.primaryButton, opacity: loading ? 0.7 : 1}}
-            disabled={loading}
-          >
-            {loading ? '処理中...' : (isRegistering ? '新規登録' : 'ログイン')}
-          </button>
-          <button
-            type="button"
-            onClick={() => setIsRegistering(!isRegistering)}
-            style={styles.linkButton}
-          >
-            {isRegistering ? 'アカウントをお持ちの方はこちら' : '新規登録はこちら'}
-          </button>
-        </form>
+        {showPasswordReset ? (
+          <form style={styles.authForm} onSubmit={handlePasswordReset}>
+            <p style={{fontSize: '14px', color: '#6b7280', marginBottom: '16px', textAlign: 'center'}}>
+              登録済みのメールアドレスを入力してください。<br/>パスワード再設定用のメールを送信します。
+            </p>
+            <div style={styles.inputGroup}>
+              <label style={styles.inputLabel}>メールアドレス</label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                style={styles.input}
+                placeholder="your@email.com"
+              />
+            </div>
+            {error && <p style={styles.errorText}>{error}</p>}
+            {success && <p style={{color: '#059669', fontSize: '14px', marginBottom: '16px', textAlign: 'center'}}>{success}</p>}
+            <button
+              type="submit"
+              style={{...styles.primaryButton, opacity: loading ? 0.7 : 1}}
+              disabled={loading}
+            >
+              {loading ? '送信中...' : 'リセットメールを送信'}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setShowPasswordReset(false);
+                setError('');
+                setSuccess('');
+              }}
+              style={styles.linkButton}
+            >
+              ← ログイン画面に戻る
+            </button>
+          </form>
+        ) : (
+          <form style={styles.authForm} onSubmit={handleAuth}>
+            <div style={styles.inputGroup}>
+              <label style={styles.inputLabel}>メールアドレス</label>
+              <input
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                style={styles.input}
+                placeholder="your@email.com"
+              />
+            </div>
+            <div style={styles.inputGroup}>
+              <label style={styles.inputLabel}>パスワード</label>
+              <input
+                type="password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                style={styles.input}
+                placeholder="••••••••"
+              />
+            </div>
+            {error && <p style={styles.errorText}>{error}</p>}
+            <button
+              type="submit"
+              style={{...styles.primaryButton, opacity: loading ? 0.7 : 1}}
+              disabled={loading}
+            >
+              {loading ? '処理中...' : (isRegistering ? '新規登録' : 'ログイン')}
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsRegistering(!isRegistering)}
+              style={styles.linkButton}
+            >
+              {isRegistering ? 'アカウントをお持ちの方はこちら' : '新規登録はこちら'}
+            </button>
+            {!isRegistering && (
+              <button
+                type="button"
+                onClick={() => {
+                  setShowPasswordReset(true);
+                  setError('');
+                }}
+                style={{...styles.linkButton, marginTop: '8px', fontSize: '13px', color: '#6b7280'}}
+              >
+                パスワードを忘れた方はこちら
+              </button>
+            )}
+          </form>
+        )}
 
         <div style={styles.authFooter}>
           <p style={styles.footerText}>
@@ -1169,7 +1299,7 @@ function LoginView() {
 // 患者一覧画面
 // ============================================================
 function PatientsListView({ onSelectPatient }) {
-  const { user, logout } = useAuth();
+  const { user, logout, isAdmin } = useAuth();
   const [patients, setPatients] = useState([]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newPatient, setNewPatient] = useState({
@@ -1182,6 +1312,14 @@ function PatientsListView({ onSelectPatient }) {
   const [isExporting, setIsExporting] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
   const [exportFormat, setExportFormat] = useState('long'); // 'long', 'wide', 'integrated'
+
+  // 管理者パネル用state
+  const [showAdminPanel, setShowAdminPanel] = useState(false);
+  const [allowedEmails, setAllowedEmails] = useState([]);
+  const [newAllowedEmail, setNewAllowedEmail] = useState('');
+  const [emailAllowlistEnabled, setEmailAllowlistEnabled] = useState(false);
+  const [adminEmail, setAdminEmail] = useState('');
+  const [isSettingAdmin, setIsSettingAdmin] = useState(false);
 
   // 分析機能用state
   const [showAnalysisModal, setShowAnalysisModal] = useState(false);
@@ -1199,6 +1337,15 @@ function PatientsListView({ onSelectPatient }) {
   const [comparisonResults, setComparisonResults] = useState(null);
   const [dayRangeStart, setDayRangeStart] = useState('');
   const [dayRangeEnd, setDayRangeEnd] = useState('');
+
+  // 統計解析用state
+  const [showStatisticalAnalysis, setShowStatisticalAnalysis] = useState(false);
+  const [statChartType, setStatChartType] = useState('boxplot'); // 'boxplot', 'violin', 'bar', 'scatter'
+  const [statSelectedItem, setStatSelectedItem] = useState('');
+  const [statSelectedItems, setStatSelectedItems] = useState([]); // 複数選択用
+  const [statResults, setStatResults] = useState(null);
+  const [showDataPoints, setShowDataPoints] = useState('black'); // 'black', 'white', 'none'
+  const statisticalChartRef = useRef(null);
 
   // 患者一括インポート用state
   const [showBulkImportModal, setShowBulkImportModal] = useState(false);
@@ -1226,6 +1373,112 @@ function PatientsListView({ onSelectPatient }) {
     return unsubscribe;
   }, [user]);
 
+  // 管理者設定を読み込み
+  useEffect(() => {
+    const loadAdminSettings = async () => {
+      try {
+        // 管理者情報を取得
+        const adminDoc = await getDoc(doc(db, 'config', 'admin'));
+        if (adminDoc.exists()) {
+          setAdminEmail(adminDoc.data().email || '');
+        }
+
+        // 許可リスト設定を取得
+        const settingsDoc = await getDoc(doc(db, 'config', 'settings'));
+        if (settingsDoc.exists()) {
+          setEmailAllowlistEnabled(settingsDoc.data().emailAllowlistEnabled || false);
+        }
+
+        // 許可メールリストを取得
+        const allowedSnapshot = await getDocs(collection(db, 'allowedEmails'));
+        const emails = allowedSnapshot.docs.map(d => ({
+          id: d.id,
+          email: d.data().email
+        }));
+        setAllowedEmails(emails);
+      } catch (err) {
+        console.error('Error loading admin settings:', err);
+      }
+    };
+
+    if (user) {
+      loadAdminSettings();
+    }
+  }, [user]);
+
+  // 管理者として自分を設定（初回のみ）
+  const setAsAdmin = async () => {
+    setIsSettingAdmin(true);
+    try {
+      await setDoc(doc(db, 'config', 'admin'), {
+        email: user.email,
+        uid: user.uid,
+        setAt: serverTimestamp()
+      });
+      setAdminEmail(user.email);
+      window.location.reload(); // 管理者権限を反映
+    } catch (err) {
+      console.error('Error setting admin:', err);
+      alert('管理者の設定に失敗しました');
+    }
+    setIsSettingAdmin(false);
+  };
+
+  // 許可リスト機能のON/OFF切り替え
+  const toggleEmailAllowlist = async () => {
+    try {
+      const newValue = !emailAllowlistEnabled;
+      await setDoc(doc(db, 'config', 'settings'), {
+        emailAllowlistEnabled: newValue
+      }, { merge: true });
+      setEmailAllowlistEnabled(newValue);
+    } catch (err) {
+      console.error('Error toggling allowlist:', err);
+    }
+  };
+
+  // 許可メールを追加
+  const addAllowedEmail = async () => {
+    if (!newAllowedEmail || !newAllowedEmail.includes('@')) {
+      alert('有効なメールアドレスを入力してください');
+      return;
+    }
+
+    try {
+      const emailLower = newAllowedEmail.toLowerCase().trim();
+      // 重複チェック
+      if (allowedEmails.some(e => e.email === emailLower)) {
+        alert('このメールアドレスは既に登録されています');
+        return;
+      }
+
+      const docRef = await addDoc(collection(db, 'allowedEmails'), {
+        email: emailLower,
+        addedAt: serverTimestamp(),
+        addedBy: user.email
+      });
+
+      setAllowedEmails([...allowedEmails, { id: docRef.id, email: emailLower }]);
+      setNewAllowedEmail('');
+    } catch (err) {
+      console.error('Error adding allowed email:', err);
+      alert('メールアドレスの追加に失敗しました');
+    }
+  };
+
+  // 許可メールを削除
+  const removeAllowedEmail = async (id) => {
+    if (!confirm('このメールアドレスを許可リストから削除しますか？')) return;
+
+    try {
+      await deleteDoc(doc(db, 'allowedEmails', id));
+      setAllowedEmails(allowedEmails.filter(e => e.id !== id));
+    } catch (err) {
+      console.error('Error removing allowed email:', err);
+      alert('削除に失敗しました');
+    }
+  };
+
   const addPatient = async () => {
     if (!newPatient.diagnosis) return;
 
@@ -1249,6 +1502,35 @@ function PatientsListView({ onSelectPatient }) {
   // ============================================
   // 患者一括インポート機能
   // ============================================
+
+  // 一括インポート用サンプルExcelダウンロード
+  const downloadBulkImportSample = () => {
+    const sampleData = [
+      { PatientID: 'P-001', Diagnosis: '自己免疫性脳炎', Group: 'NMDAR', OnsetDate: '2024-01-15', Memo: '症例メモ' },
+      { PatientID: 'P-002', Diagnosis: '自己免疫性脳炎', Group: 'NMDAR', OnsetDate: '2024-02-01', Memo: '' },
+      { PatientID: 'P-003', Diagnosis: '自己免疫性脳炎', Group: 'LGI1', OnsetDate: '2024-01-20', Memo: '高齢発症' },
+      { PatientID: 'P-004', Diagnosis: 'ウイルス性脳炎', Group: 'Control', OnsetDate: '2024-02-10', Memo: '' },
+    ];
+
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.json_to_sheet(sampleData);
+    XLSX.utils.book_append_sheet(wb, ws, '患者リスト');
+
+    // 説明シートを追加
+    const instructions = [
+      ['列名', '説明', '必須'],
+      ['PatientID', '患者ID（例: P-001）', '○'],
+      ['Diagnosis', '診断名', ''],
+      ['Group', '群（比較分析用）', ''],
+      ['OnsetDate', '発症日（YYYY-MM-DD形式）', ''],
+      ['Memo', 'メモ・備考', ''],
+    ];
+    const wsInst = XLSX.utils.aoa_to_sheet(instructions);
+    XLSX.utils.book_append_sheet(wb, wsInst, '説明');
+
+    XLSX.writeFile(wb, 'patient_bulk_import_sample.xlsx');
+  };
+
   const handleBulkImportFile = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -1366,6 +1648,295 @@ function PatientsListView({ onSelectPatient }) {
     const onset = new Date(onsetDate);
     const target = new Date(targetDate);
     return Math.ceil((target - onset) / (1000 * 60 * 60 * 24));
+  };
+
+  // ========================================
+  // 統計解析ヘルパー関数
+  // ========================================
+
+  // 基本統計量
+  const calculateStats = (arr) => {
+    if (!arr || arr.length === 0) return null;
+    const sorted = [...arr].sort((a, b) => a - b);
+    const n = sorted.length;
+    const sum = sorted.reduce((a, b) => a + b, 0);
+    const mean = sum / n;
+    const variance = sorted.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) / (n - 1);
+    const sd = Math.sqrt(variance);
+    const se = sd / Math.sqrt(n);
+    const median = n % 2 === 0 ? (sorted[n/2 - 1] + sorted[n/2]) / 2 : sorted[Math.floor(n/2)];
+    const q1 = sorted[Math.floor(n * 0.25)];
+    const q3 = sorted[Math.floor(n * 0.75)];
+    const iqr = q3 - q1;
+    const min = sorted[0];
+    const max = sorted[n - 1];
+    const whiskerLow = Math.max(min, q1 - 1.5 * iqr);
+    const whiskerHigh = Math.min(max, q3 + 1.5 * iqr);
+    const outliers = sorted.filter(v => v < whiskerLow || v > whiskerHigh);
+
+    return { n, mean, sd, se, median, q1, q3, iqr, min, max, whiskerLow, whiskerHigh, outliers, values: sorted };
+  };
+
+  // Shapiro-Wilk近似（簡易版）- 正規性検定
+  const shapiroWilkTest = (arr) => {
+    if (arr.length < 3 || arr.length > 50) {
+      // サンプルサイズ制限
+      return { W: null, pValue: null, isNormal: arr.length >= 30 }; // 大標本は正規近似
+    }
+    const n = arr.length;
+    const sorted = [...arr].sort((a, b) => a - b);
+    const mean = sorted.reduce((a, b) => a + b, 0) / n;
+
+    // 簡易的な正規性判定（歪度・尖度ベース）
+    const m2 = sorted.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / n;
+    const m3 = sorted.reduce((acc, v) => acc + Math.pow(v - mean, 3), 0) / n;
+    const m4 = sorted.reduce((acc, v) => acc + Math.pow(v - mean, 4), 0) / n;
+    const skewness = m3 / Math.pow(m2, 1.5);
+    const kurtosis = m4 / Math.pow(m2, 2) - 3;
+
+    // Jarque-Bera的な判定
+    const jb = (n / 6) * (Math.pow(skewness, 2) + Math.pow(kurtosis, 2) / 4);
+    const pValue = Math.exp(-jb / 2); // 簡易近似
+
+    return { W: 1 - jb / 100, pValue, isNormal: pValue > 0.05, skewness, kurtosis };
+  };
+
+  // 独立2群のt検定
+  const tTest = (group1, group2) => {
+    const n1 = group1.length, n2 = group2.length;
+    if (n1 < 2 || n2 < 2) return { t: null, pValue: null, df: null };
+
+    const mean1 = group1.reduce((a, b) => a + b, 0) / n1;
+    const mean2 = group2.reduce((a, b) => a + b, 0) / n2;
+    const var1 = group1.reduce((acc, v) => acc + Math.pow(v - mean1, 2), 0) / (n1 - 1);
+    const var2 = group2.reduce((acc, v) => acc + Math.pow(v - mean2, 2), 0) / (n2 - 1);
+
+    // Welch's t-test
+    const se = Math.sqrt(var1 / n1 + var2 / n2);
+    const t = (mean1 - mean2) / se;
+    const df = Math.pow(var1 / n1 + var2 / n2, 2) /
+      (Math.pow(var1 / n1, 2) / (n1 - 1) + Math.pow(var2 / n2, 2) / (n2 - 1));
+
+    // p値近似（t分布の近似）
+    const x = df / (df + t * t);
+    const pValue = 2 * (1 - betaIncomplete(df / 2, 0.5, x));
+
+    return { t, pValue: Math.max(0.0001, Math.min(1, pValue)), df, mean1, mean2, se };
+  };
+
+  // Mann-Whitney U検定
+  const mannWhitneyU = (group1, group2) => {
+    const n1 = group1.length, n2 = group2.length;
+    if (n1 < 2 || n2 < 2) return { U: null, pValue: null };
+
+    // ランク付け
+    const combined = [
+      ...group1.map(v => ({ v, g: 1 })),
+      ...group2.map(v => ({ v, g: 2 }))
+    ].sort((a, b) => a.v - b.v);
+
+    let rank = 1;
+    for (let i = 0; i < combined.length; i++) {
+      let j = i;
+      while (j < combined.length - 1 && combined[j].v === combined[j + 1].v) j++;
+      const avgRank = (rank + rank + j - i) / 2;
+      for (let k = i; k <= j; k++) combined[k].rank = avgRank;
+      rank += j - i + 1;
+      i = j;
+    }
+
+    const R1 = combined.filter(c => c.g === 1).reduce((acc, c) => acc + c.rank, 0);
+    const U1 = n1 * n2 + (n1 * (n1 + 1)) / 2 - R1;
+    const U2 = n1 * n2 - U1;
+    const U = Math.min(U1, U2);
+
+    // 正規近似
+    const mU = (n1 * n2) / 2;
+    const sigmaU = Math.sqrt((n1 * n2 * (n1 + n2 + 1)) / 12);
+    const z = (U - mU) / sigmaU;
+    const pValue = 2 * (1 - normalCDF(Math.abs(z)));
+
+    return { U, z, pValue: Math.max(0.0001, pValue) };
+  };
+
+  // Kruskal-Wallis検定（3群以上の非パラメトリック検定）
+  const kruskalWallisTest = (groups) => {
+    if (groups.length < 2) return { H: null, pValue: null };
+
+    const allValues = groups.flatMap((g, i) => g.map(v => ({ v, g: i })));
+    allValues.sort((a, b) => a.v - b.v);
+
+    // ランク付け
+    let rank = 1;
+    for (let i = 0; i < allValues.length; i++) {
+      let j = i;
+      while (j < allValues.length - 1 && allValues[j].v === allValues[j + 1].v) j++;
+      const avgRank = (rank + rank + j - i) / 2;
+      for (let k = i; k <= j; k++) allValues[k].rank = avgRank;
+      rank += j - i + 1;
+      i = j;
+    }
+
+    const N = allValues.length;
+    const k = groups.length;
+    let H = 0;
+    for (let i = 0; i < k; i++) {
+      const ni = groups[i].length;
+      const Ri = allValues.filter(v => v.g === i).reduce((acc, v) => acc + v.rank, 0);
+      H += (Ri * Ri) / ni;
+    }
+    H = (12 / (N * (N + 1))) * H - 3 * (N + 1);
+
+    // カイ二乗分布で近似
+    const df = k - 1;
+    const pValue = 1 - chiSquareCDF(H, df);
+
+    return { H, df, pValue: Math.max(0.0001, pValue) };
+  };
+
+  // ANOVA（一元配置分散分析）
+  const oneWayANOVA = (groups) => {
+    if (groups.length < 2) return { F: null, pValue: null };
+
+    const allValues = groups.flat();
+    const N = allValues.length;
+    const k = groups.length;
+    const grandMean = allValues.reduce((a, b) => a + b, 0) / N;
+
+    // 群間変動
+    let SSB = 0;
+    groups.forEach(g => {
+      const ni = g.length;
+      const mi = g.reduce((a, b) => a + b, 0) / ni;
+      SSB += ni * Math.pow(mi - grandMean, 2);
+    });
+
+    // 群内変動
+    let SSW = 0;
+    groups.forEach(g => {
+      const mi = g.reduce((a, b) => a + b, 0) / g.length;
+      g.forEach(v => {
+        SSW += Math.pow(v - mi, 2);
+      });
+    });
+
+    const dfB = k - 1;
+    const dfW = N - k;
+    const MSB = SSB / dfB;
+    const MSW = SSW / dfW;
+    const F = MSB / MSW;
+
+    // F分布で近似
+    const pValue = 1 - fDistributionCDF(F, dfB, dfW);
+
+    return { F, dfB, dfW, pValue: Math.max(0.0001, pValue) };
+  };
+
+  // 正規分布CDF近似
+  const normalCDF = (x) => {
+    const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
+    const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
+    const sign = x < 0 ? -1 : 1;
+    x = Math.abs(x) / Math.sqrt(2);
+    const t = 1.0 / (1.0 + p * x);
+    const y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
+    return 0.5 * (1.0 + sign * y);
+  };
+
+  // ベータ不完全関数近似
+  const betaIncomplete = (a, b, x) => {
+    if (x === 0 || x === 1) return x;
+    const bt = Math.exp(
+      lgamma(a + b) - lgamma(a) - lgamma(b) + a * Math.log(x) + b * Math.log(1 - x)
+    );
+    if (x < (a + 1) / (a + b + 2)) {
+      return bt * betacf(a, b, x) / a;
+    }
+    return 1 - bt * betacf(b, a, 1 - x) / b;
+  };
+
+  // ベータ連分数
+  const betacf = (a, b, x) => {
+    const maxIt = 100, eps = 3e-7;
+    let aa, c = 1, d = 1 - (a + b) * x / (a + 1);
+    if (Math.abs(d) < 1e-30) d = 1e-30;
+    d = 1 / d;
+    let h = d;
+    for (let m = 1; m <= maxIt; m++) {
+      const m2 = 2 * m;
+      aa = m * (b - m) * x / ((a - 1 + m2) * (a + m2));
+      d = 1 + aa * d; if (Math.abs(d) < 1e-30) d = 1e-30;
+      c = 1 + aa / c; if (Math.abs(c) < 1e-30) c = 1e-30;
+      d = 1 / d; h *= d * c;
+      aa = -(a + m) * (a + b + m) * x / ((a + m2) * (a + 1 + m2));
+      d = 1 + aa * d; if (Math.abs(d) < 1e-30) d = 1e-30;
+      c = 1 + aa / c; if (Math.abs(c) < 1e-30) c = 1e-30;
+      d = 1 / d;
+      const del = d * c;
+      h *= del;
+      if (Math.abs(del - 1) < eps) break;
+    }
+    return h;
+  };
+
+  // ログガンマ関数
+  const lgamma = (x) => {
+    const c = [76.18009172947146, -86.50532032941677, 24.01409824083091,
+      -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5];
+    let y = x, tmp = x + 5.5;
+    tmp -= (x + 0.5) * Math.log(tmp);
+    let ser = 1.000000000190015;
+    for (let j = 0; j < 6; j++) ser += c[j] / ++y;
+    return -tmp + Math.log(2.5066282746310005 * ser / x);
+  };
+
+  // カイ二乗CDF
+  const chiSquareCDF = (x, df) => {
+    if (x <= 0) return 0;
+    return gammaIncomplete(df / 2, x / 2);
+  };
+
+  // 不完全ガンマ関数
+  const gammaIncomplete = (a, x) => {
+    if (x < a + 1) {
+      let sum = 1 / a, term = 1 / a;
+      for (let n = 1; n <= 100; n++) {
+        term *= x / (a + n);
+        sum += term;
+        if (Math.abs(term) < 1e-10) break;
+      }
+      return sum * Math.exp(-x + a * Math.log(x) - lgamma(a));
+    } else {
+      let b = x + 1 - a, c = 1 / 1e-30, d = 1 / b, h = d;
+      for (let i = 1; i <= 100; i++) {
+        const an = -i * (i - a);
+        b += 2;
+        d = an * d + b;
+        if (Math.abs(d) < 1e-30) d = 1e-30;
+        c = b + an / c;
+        if (Math.abs(c) < 1e-30) c = 1e-30;
+        d = 1 / d;
+        const del = d * c;
+        h *= del;
+        if (Math.abs(del - 1) < 1e-10) break;
+      }
+      return 1 - h * Math.exp(-x + a * Math.log(x) - lgamma(a));
+    }
+  };
+
+  // F分布CDF
+  const fDistributionCDF = (f, d1, d2) => {
+    if (f <= 0) return 0;
+    const x = (d1 * f) / (d1 * f + d2);
+    return betaIncomplete(d1 / 2, d2 / 2, x);
+  };
+
+  // 有意性マーク
+  const getSignificanceMarker = (pValue) => {
+    if (pValue < 0.001) return '***';
+    if (pValue < 0.01) return '**';
+    if (pValue < 0.05) return '*';
+    return 'n.s.';
   };
 
   // エクスポート実行（形式選択後）
@@ -2047,171 +2618,13 @@ function PatientsListView({ onSelectPatient }) {
     }
   };
 
-  // 統計関数
+  // 基本統計関数（群間比較用）
   const mean = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
 
   const std = (arr) => {
+    if (arr.length < 2) return 0;
     const m = mean(arr);
     return Math.sqrt(arr.reduce((acc, val) => acc + Math.pow(val - m, 2), 0) / (arr.length - 1));
-  };
-
-  // t検定（Welchのt検定）
-  const tTest = (group1, group2) => {
-    const n1 = group1.length;
-    const n2 = group2.length;
-    if (n1 < 2 || n2 < 2) return { t: null, p: null, significant: false };
-
-    const m1 = mean(group1);
-    const m2 = mean(group2);
-    const s1 = std(group1);
-    const s2 = std(group2);
-
-    const se = Math.sqrt((s1 * s1) / n1 + (s2 * s2) / n2);
-    if (se === 0) return { t: null, p: null, significant: false };
-
-    const t = (m1 - m2) / se;
-
-    // 自由度（Welch-Satterthwaite）
-    const v1 = (s1 * s1) / n1;
-    const v2 = (s2 * s2) / n2;
-    const df = Math.pow(v1 + v2, 2) / (Math.pow(v1, 2) / (n1 - 1) + Math.pow(v2, 2) / (n2 - 1));
-
-    // p値の近似計算（簡易版）
-    const p = tDistributionPValue(Math.abs(t), df);
-
-    return { t: t.toFixed(3), p: p.toFixed(4), significant: p < 0.05, df: df.toFixed(1) };
-  };
-
-  // t分布のp値近似計算
-  const tDistributionPValue = (t, df) => {
-    // 簡易的な近似（正規分布で代用、df > 30の場合は良好）
-    const x = df / (df + t * t);
-    const a = df / 2;
-    const b = 0.5;
-    // ベータ関数の不完全積分の近似
-    const p = 1 - incompleteBeta(x, a, b);
-    return 2 * Math.min(p, 1 - p); // 両側検定
-  };
-
-  // 不完全ベータ関数の近似
-  const incompleteBeta = (x, a, b) => {
-    if (x === 0) return 0;
-    if (x === 1) return 1;
-
-    // 簡易近似
-    const bt = Math.exp(
-      lgamma(a + b) - lgamma(a) - lgamma(b) +
-      a * Math.log(x) + b * Math.log(1 - x)
-    );
-
-    if (x < (a + 1) / (a + b + 2)) {
-      return bt * betaCF(x, a, b) / a;
-    } else {
-      return 1 - bt * betaCF(1 - x, b, a) / b;
-    }
-  };
-
-  // ログガンマ関数
-  const lgamma = (x) => {
-    const c = [76.18009172947146, -86.50532032941677, 24.01409824083091,
-              -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5];
-    let y = x;
-    let tmp = x + 5.5;
-    tmp -= (x + 0.5) * Math.log(tmp);
-    let ser = 1.000000000190015;
-    for (let j = 0; j < 6; j++) {
-      ser += c[j] / ++y;
-    }
-    return -tmp + Math.log(2.5066282746310005 * ser / x);
-  };
-
-  // 連分数展開
-  const betaCF = (x, a, b) => {
-    const maxIterations = 100;
-    const eps = 3e-7;
-
-    let qab = a + b;
-    let qap = a + 1;
-    let qam = a - 1;
-    let c = 1;
-    let d = 1 - qab * x / qap;
-    if (Math.abs(d) < 1e-30) d = 1e-30;
-    d = 1 / d;
-    let h = d;
-
-    for (let m = 1; m <= maxIterations; m++) {
-      let m2 = 2 * m;
-      let aa = m * (b - m) * x / ((qam + m2) * (a + m2));
-      d = 1 + aa * d;
-      if (Math.abs(d) < 1e-30) d = 1e-30;
-      c = 1 + aa / c;
-      if (Math.abs(c) < 1e-30) c = 1e-30;
-      d = 1 / d;
-      h *= d * c;
-      aa = -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2));
-      d = 1 + aa * d;
-      if (Math.abs(d) < 1e-30) d = 1e-30;
-      c = 1 + aa / c;
-      if (Math.abs(c) < 1e-30) c = 1e-30;
-      d = 1 / d;
-      let del = d * c;
-      h *= del;
-      if (Math.abs(del - 1) < eps) break;
-    }
-    return h;
-  };
-
-  // Mann-Whitney U検定
-  const mannWhitneyU = (group1, group2) => {
-    const n1 = group1.length;
-    const n2 = group2.length;
-    if (n1 < 1 || n2 < 1) return { U: null, p: null, significant: false };
-
-    // 全データを結合してランク付け
-    const combined = [
-      ...group1.map(v => ({ value: v, group: 1 })),
-      ...group2.map(v => ({ value: v, group: 2 }))
-    ].sort((a, b) => a.value - b.value);
-
-    // ランク付け（同順位は平均ランク）
-    let ranks = [];
-    let i = 0;
-    while (i < combined.length) {
-      let j = i;
-      while (j < combined.length && combined[j].value === combined[i].value) {
-        j++;
-      }
-      const avgRank = (i + 1 + j) / 2;
-      for (let k = i; k < j; k++) {
-        ranks.push({ ...combined[k], rank: avgRank });
-      }
-      i = j;
-    }
-
-    // 各群のランク和
-    const R1 = ranks.filter(r => r.group === 1).reduce((sum, r) => sum + r.rank, 0);
-    const U1 = n1 * n2 + (n1 * (n1 + 1)) / 2 - R1;
-    const U2 = n1 * n2 - U1;
-    const U = Math.min(U1, U2);
-
-    // 正規近似によるp値
-    const mU = (n1 * n2) / 2;
-    const sigmaU = Math.sqrt((n1 * n2 * (n1 + n2 + 1)) / 12);
-    const z = (U - mU) / sigmaU;
-    const p = 2 * (1 - normalCDF(Math.abs(z)));
-
-    return { U: U.toFixed(1), z: z.toFixed(3), p: p.toFixed(4), significant: p < 0.05 };
-  };
-
-  // 正規分布の累積分布関数
-  const normalCDF = (x) => {
-    const a1 = 0.254829592, a2 = -0.284496736, a3 = 1.421413741;
-    const a4 = -1.453152027, a5 = 1.061405429, p = 0.3275911;
-    const sign = x < 0 ? -1 : 1;
-    x = Math.abs(x) / Math.sqrt(2);
-    const t = 1 / (1 + p * x);
-    const y = 1 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * Math.exp(-x * x);
-    return 0.5 * (1 + sign * y);
   };
 
   // 群間比較を実行
@@ -2249,8 +2662,8 @@ function PatientsListView({ onSelectPatient }) {
     const results = [];
 
     for (const itemName of selectedItems) {
-      const group1Values = [];
-      const group2Values = [];
+      const group1Data = []; // { id, value, date, day }
+      const group2Data = []; // { id, value, date, day }
 
       // Group 1のデータ収集
       for (const patient of group1Patients) {
@@ -2271,7 +2684,12 @@ function PatientsListView({ onSelectPatient }) {
           if (labData.data && Array.isArray(labData.data)) {
             const item = labData.data.find(d => d.item === itemName);
             if (item && !isNaN(parseFloat(item.value))) {
-              group1Values.push(parseFloat(item.value));
+              group1Data.push({
+                id: patient.displayId,
+                value: parseFloat(item.value),
+                date: labDate,
+                day: dayFromOnset
+              });
             }
           }
         });
@@ -2296,11 +2714,20 @@ function PatientsListView({ onSelectPatient }) {
           if (labData.data && Array.isArray(labData.data)) {
             const item = labData.data.find(d => d.item === itemName);
             if (item && !isNaN(parseFloat(item.value))) {
-              group2Values.push(parseFloat(item.value));
+              group2Data.push({
+                id: patient.displayId,
+                value: parseFloat(item.value),
+                date: labDate,
+                day: dayFromOnset
+              });
             }
           }
         });
       }
+
+      // 数値のみの配列を抽出（統計計算用）
+      const group1Values = group1Data.map(d => d.value);
+      const group2Values = group2Data.map(d => d.value);
 
       if (group1Values.length > 0 && group2Values.length > 0) {
         const tResult = tTest(group1Values, group2Values);
@@ -2312,13 +2739,17 @@ function PatientsListView({ onSelectPatient }) {
             n: group1Values.length,
             mean: mean(group1Values).toFixed(2),
             std: group1Values.length > 1 ? std(group1Values).toFixed(2) : '-',
-            median: group1Values.sort((a, b) => a - b)[Math.floor(group1Values.length / 2)].toFixed(2)
+            median: [...group1Values].sort((a, b) => a - b)[Math.floor(group1Values.length / 2)].toFixed(2),
+            values: [...group1Values],
+            data: [...group1Data] // ID付きデータも保存
           },
           group2: {
             n: group2Values.length,
             mean: mean(group2Values).toFixed(2),
             std: group2Values.length > 1 ? std(group2Values).toFixed(2) : '-',
-            median: group2Values.sort((a, b) => a - b)[Math.floor(group2Values.length / 2)].toFixed(2)
+            median: [...group2Values].sort((a, b) => a - b)[Math.floor(group2Values.length / 2)].toFixed(2),
+            values: [...group2Values],
+            data: [...group2Data] // ID付きデータも保存
           },
           tTest: tResult,
           mannWhitney: mwResult
@@ -2403,6 +2834,18 @@ function PatientsListView({ onSelectPatient }) {
         </div>
         <div style={styles.headerRight}>
           <span style={styles.userInfo}>{user?.email}</span>
+          {(isAdmin || !adminEmail) && (
+            <button
+              onClick={() => setShowAdminPanel(true)}
+              style={{
+                ...styles.logoutButton,
+                backgroundColor: '#7c3aed',
+                marginRight: '8px'
+              }}
+            >
+              ⚙️ 管理
+            </button>
+          )}
           <button onClick={logout} style={styles.logoutButton}>
             ログアウト
           </button>
@@ -2781,6 +3224,26 @@ function PatientsListView({ onSelectPatient }) {
               </div>
             </div>
 
+            <div style={{marginBottom: '16px'}}>
+              <button
+                onClick={downloadBulkImportSample}
+                style={{
+                  padding: '10px 16px',
+                  background: '#f0fdf4',
+                  color: '#047857',
+                  border: '1px solid #86efac',
+                  borderRadius: '8px',
+                  cursor: 'pointer',
+                  fontSize: '13px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '6px'
+                }}
+              >
+                <span>📄</span> サンプルExcelをダウンロード
+              </button>
+            </div>
+
             <div style={styles.inputGroup}>
               <label style={styles.inputLabel}>ファイルを選択</label>
               <input
@@ -2869,6 +3332,36 @@ function PatientsListView({ onSelectPatient }) {
                   {/* 患者選択 */}
                   <div>
                     <label style={styles.inputLabel}>患者を選択</label>
+                    <div style={{display: 'flex', gap: '8px', marginBottom: '8px'}}>
+                      <button
+                        onClick={() => setSelectedPatientIds(patients.map(p => p.id))}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '11px',
+                          background: '#3b82f6',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        全て選択
+                      </button>
+                      <button
+                        onClick={() => setSelectedPatientIds([])}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '11px',
+                          background: '#6b7280',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        全て解除
+                      </button>
+                    </div>
                     <div style={{
                       maxHeight: '200px',
                       overflow: 'auto',
@@ -2910,6 +3403,37 @@ function PatientsListView({ onSelectPatient }) {
                   {/* 項目選択 */}
                   <div>
                     <label style={styles.inputLabel}>検査項目を選択</label>
+                    <div style={{display: 'flex', gap: '8px', marginBottom: '8px'}}>
+                      <button
+                        onClick={() => setSelectedItems([...availableItems])}
+                        disabled={availableItems.length === 0}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '11px',
+                          background: availableItems.length === 0 ? '#d1d5db' : '#10b981',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: availableItems.length === 0 ? 'not-allowed' : 'pointer'
+                        }}
+                      >
+                        全て選択
+                      </button>
+                      <button
+                        onClick={() => setSelectedItems([])}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '11px',
+                          background: '#6b7280',
+                          color: 'white',
+                          border: 'none',
+                          borderRadius: '4px',
+                          cursor: 'pointer'
+                        }}
+                      >
+                        全て解除
+                      </button>
+                    </div>
                     <div style={{
                       maxHeight: '200px',
                       overflow: 'auto',
@@ -3274,6 +3798,558 @@ function PatientsListView({ onSelectPatient }) {
                               >
                                 📊 統計結果CSVダウンロード
                               </button>
+
+                              {/* 統計グラフ（Box Plot / Violin Plot） */}
+                              <div style={{
+                                marginTop: '24px',
+                                padding: '16px',
+                                background: '#f8fafc',
+                                borderRadius: '8px',
+                                border: '1px solid #e2e8f0'
+                              }}>
+                                <h4 style={{margin: '0 0 12px 0', fontSize: '14px', color: '#374151'}}>
+                                  📈 論文用グラフ作成
+                                </h4>
+
+                                <div style={{display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center'}}>
+                                  <label style={{fontSize: '13px', color: '#374151'}}>グラフ種類:</label>
+                                  {['boxplot', 'violin', 'bar'].map(type => (
+                                    <label key={type} style={{
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      gap: '4px',
+                                      padding: '6px 12px',
+                                      background: statChartType === type ? '#7c3aed' : 'white',
+                                      color: statChartType === type ? 'white' : '#374151',
+                                      borderRadius: '6px',
+                                      cursor: 'pointer',
+                                      border: '1px solid #d1d5db',
+                                      fontSize: '12px'
+                                    }}>
+                                      <input
+                                        type="radio"
+                                        name="chartType"
+                                        value={type}
+                                        checked={statChartType === type}
+                                        onChange={() => setStatChartType(type)}
+                                        style={{display: 'none'}}
+                                      />
+                                      {type === 'boxplot' && 'Box Plot'}
+                                      {type === 'violin' && 'Violin Plot'}
+                                      {type === 'bar' && 'Bar (Mean±SD)'}
+                                    </label>
+                                  ))}
+                                </div>
+
+                                <div style={{display: 'flex', gap: '12px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center'}}>
+                                  <label style={{fontSize: '13px', color: '#374151'}}>個別データ点:</label>
+                                  {[
+                                    { value: 'black', label: '黒丸 ●' },
+                                    { value: 'white', label: '白丸 ○' },
+                                    { value: 'none', label: '非表示' }
+                                  ].map(opt => (
+                                    <label key={opt.value} style={{
+                                      display: 'flex',
+                                      alignItems: 'center',
+                                      gap: '4px',
+                                      padding: '6px 12px',
+                                      background: showDataPoints === opt.value ? '#059669' : 'white',
+                                      color: showDataPoints === opt.value ? 'white' : '#374151',
+                                      borderRadius: '6px',
+                                      cursor: 'pointer',
+                                      border: '1px solid #d1d5db',
+                                      fontSize: '12px'
+                                    }}>
+                                      <input
+                                        type="radio"
+                                        name="dataPoints"
+                                        value={opt.value}
+                                        checked={showDataPoints === opt.value}
+                                        onChange={() => setShowDataPoints(opt.value)}
+                                        style={{display: 'none'}}
+                                      />
+                                      {opt.label}
+                                    </label>
+                                  ))}
+                                </div>
+
+                                <div style={{marginBottom: '16px'}}>
+                                  <label style={{fontSize: '13px', color: '#374151', display: 'block', marginBottom: '6px'}}>
+                                    表示する項目（複数選択可）:
+                                  </label>
+                                  <div style={{
+                                    display: 'flex',
+                                    flexWrap: 'wrap',
+                                    gap: '8px',
+                                    padding: '12px',
+                                    background: '#f9fafb',
+                                    borderRadius: '8px',
+                                    border: '1px solid #e5e7eb',
+                                    maxHeight: '120px',
+                                    overflowY: 'auto'
+                                  }}>
+                                    {selectedItems.map(item => (
+                                      <label key={item} style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '4px',
+                                        padding: '4px 10px',
+                                        background: statSelectedItems.includes(item) ? '#dbeafe' : 'white',
+                                        border: statSelectedItems.includes(item) ? '2px solid #3b82f6' : '1px solid #d1d5db',
+                                        borderRadius: '6px',
+                                        cursor: 'pointer',
+                                        fontSize: '12px',
+                                        transition: 'all 0.15s'
+                                      }}>
+                                        <input
+                                          type="checkbox"
+                                          checked={statSelectedItems.includes(item)}
+                                          onChange={(e) => {
+                                            if (e.target.checked) {
+                                              setStatSelectedItems([...statSelectedItems, item]);
+                                            } else {
+                                              setStatSelectedItems(statSelectedItems.filter(i => i !== item));
+                                            }
+                                          }}
+                                          style={{display: 'none'}}
+                                        />
+                                        {statSelectedItems.includes(item) && <span style={{color: '#3b82f6'}}>✓</span>}
+                                        {item}
+                                      </label>
+                                    ))}
+                                  </div>
+                                  <div style={{marginTop: '6px', display: 'flex', gap: '8px'}}>
+                                    <button
+                                      onClick={() => setStatSelectedItems([...selectedItems])}
+                                      style={{fontSize: '11px', padding: '4px 8px', background: '#e5e7eb', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                                    >
+                                      全選択
+                                    </button>
+                                    <button
+                                      onClick={() => setStatSelectedItems([])}
+                                      style={{fontSize: '11px', padding: '4px 8px', background: '#e5e7eb', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                                    >
+                                      全解除
+                                    </button>
+                                    <span style={{fontSize: '11px', color: '#6b7280', marginLeft: '8px'}}>
+                                      {statSelectedItems.length}項目選択中
+                                    </span>
+                                  </div>
+                                </div>
+
+                                {statSelectedItems.length > 0 && comparisonResults && (() => {
+                                  // グラフ描画関数
+                                  const renderChart = (itemName, chartIndex) => {
+                                    const result = comparisonResults.find(r => r.item === itemName);
+                                    if (!result) return null;
+
+                                    const stats1 = calculateStats(result.group1.values);
+                                    const stats2 = calculateStats(result.group2.values);
+                                    if (!stats1 || !stats2) return <div key={chartIndex} style={{padding: '20px', color: '#6b7280'}}>データ不足: {itemName}</div>;
+
+                                    // 正規性検定
+                                    const norm1 = shapiroWilkTest(result.group1.values);
+                                    const norm2 = shapiroWilkTest(result.group2.values);
+                                    const bothNormal = norm1.isNormal && norm2.isNormal;
+
+                                    // 適切な検定を選択
+                                    const testResult = bothNormal
+                                      ? tTest(result.group1.values, result.group2.values)
+                                      : mannWhitneyU(result.group1.values, result.group2.values);
+                                    const pValue = testResult.pValue;
+                                    const sigMarker = getSignificanceMarker(pValue);
+
+                                    // SVGでグラフを描画（複数表示用にコンパクトに）
+                                    const svgWidth = statSelectedItems.length === 1 ? 500 : 350;
+                                    const svgHeight = statSelectedItems.length === 1 ? 350 : 280;
+                                  const margin = { top: 40, right: 30, bottom: 60, left: 60 };
+                                  const chartWidth = svgWidth - margin.left - margin.right;
+                                  const chartHeight = svgHeight - margin.top - margin.bottom;
+
+                                  const allValues = [...result.group1.values, ...result.group2.values];
+                                  const minVal = Math.min(...allValues);
+                                  const maxVal = Math.max(...allValues);
+                                  const range = maxVal - minVal || 1;
+                                  const yMin = minVal - range * 0.1;
+                                  const yMax = maxVal + range * 0.15;
+                                  const yScale = (v) => margin.top + chartHeight - ((v - yMin) / (yMax - yMin)) * chartHeight;
+
+                                  const boxWidth = 60;
+                                  const x1 = margin.left + chartWidth * 0.25;
+                                  const x2 = margin.left + chartWidth * 0.75;
+
+                                  // Y軸の目盛り
+                                  const yTicks = [];
+                                  const tickStep = (yMax - yMin) / 5;
+                                  for (let i = 0; i <= 5; i++) {
+                                    yTicks.push(yMin + tickStep * i);
+                                  }
+
+                                  let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" style="font-family: Arial, sans-serif;">`;
+                                  svgContent += `<rect width="100%" height="100%" fill="white"/>`;
+
+                                  // タイトル
+                                    svgContent += `<text x="${svgWidth/2}" y="20" text-anchor="middle" font-size="14" font-weight="bold">${itemName}</text>`;
+
+                                  // 有意差表示
+                                  if (pValue < 0.05) {
+                                    const bracketY = yScale(maxVal) - 15;
+                                    svgContent += `<line x1="${x1}" y1="${bracketY}" x2="${x1}" y2="${bracketY + 5}" stroke="#333" stroke-width="1"/>`;
+                                    svgContent += `<line x1="${x1}" y1="${bracketY}" x2="${x2}" y2="${bracketY}" stroke="#333" stroke-width="1"/>`;
+                                    svgContent += `<line x1="${x2}" y1="${bracketY}" x2="${x2}" y2="${bracketY + 5}" stroke="#333" stroke-width="1"/>`;
+                                    svgContent += `<text x="${(x1+x2)/2}" y="${bracketY - 5}" text-anchor="middle" font-size="14" font-weight="bold">${sigMarker}</text>`;
+                                  }
+
+                                  // Y軸
+                                  svgContent += `<line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${margin.top + chartHeight}" stroke="#333" stroke-width="1"/>`;
+                                  yTicks.forEach(tick => {
+                                    const y = yScale(tick);
+                                    svgContent += `<line x1="${margin.left - 5}" y1="${y}" x2="${margin.left}" y2="${y}" stroke="#333" stroke-width="1"/>`;
+                                    svgContent += `<text x="${margin.left - 8}" y="${y + 4}" text-anchor="end" font-size="10">${tick.toFixed(1)}</text>`;
+                                    svgContent += `<line x1="${margin.left}" y1="${y}" x2="${svgWidth - margin.right}" y2="${y}" stroke="#e5e7eb" stroke-width="1" stroke-dasharray="3,3"/>`;
+                                  });
+
+                                  // X軸
+                                  svgContent += `<line x1="${margin.left}" y1="${margin.top + chartHeight}" x2="${svgWidth - margin.right}" y2="${margin.top + chartHeight}" stroke="#333" stroke-width="1"/>`;
+
+                                  // グループ名
+                                  svgContent += `<text x="${x1}" y="${svgHeight - 25}" text-anchor="middle" font-size="12">${selectedGroup1}</text>`;
+                                  svgContent += `<text x="${x1}" y="${svgHeight - 10}" text-anchor="middle" font-size="10" fill="#666">(n=${stats1.n})</text>`;
+                                  svgContent += `<text x="${x2}" y="${svgHeight - 25}" text-anchor="middle" font-size="12">${selectedGroup2}</text>`;
+                                  svgContent += `<text x="${x2}" y="${svgHeight - 10}" text-anchor="middle" font-size="10" fill="#666">(n=${stats2.n})</text>`;
+
+                                  // Box Plot描画
+                                  const drawBox = (stats, x, color) => {
+                                    const yQ1 = yScale(stats.q1);
+                                    const yQ3 = yScale(stats.q3);
+                                    const yMed = yScale(stats.median);
+                                    const yWhiskerLow = yScale(stats.whiskerLow);
+                                    const yWhiskerHigh = yScale(stats.whiskerHigh);
+
+                                    if (statChartType === 'boxplot') {
+                                      // ボックス
+                                      svgContent += `<rect x="${x - boxWidth/2}" y="${yQ3}" width="${boxWidth}" height="${yQ1 - yQ3}" fill="${color}" fill-opacity="0.3" stroke="${color}" stroke-width="2"/>`;
+                                      // 中央線
+                                      svgContent += `<line x1="${x - boxWidth/2}" y1="${yMed}" x2="${x + boxWidth/2}" y2="${yMed}" stroke="${color}" stroke-width="3"/>`;
+                                      // ヒゲ
+                                      svgContent += `<line x1="${x}" y1="${yQ1}" x2="${x}" y2="${yWhiskerLow}" stroke="${color}" stroke-width="1.5"/>`;
+                                      svgContent += `<line x1="${x}" y1="${yQ3}" x2="${x}" y2="${yWhiskerHigh}" stroke="${color}" stroke-width="1.5"/>`;
+                                      svgContent += `<line x1="${x - boxWidth/4}" y1="${yWhiskerLow}" x2="${x + boxWidth/4}" y2="${yWhiskerLow}" stroke="${color}" stroke-width="1.5"/>`;
+                                      svgContent += `<line x1="${x - boxWidth/4}" y1="${yWhiskerHigh}" x2="${x + boxWidth/4}" y2="${yWhiskerHigh}" stroke="${color}" stroke-width="1.5"/>`;
+
+                                      // 個別データ点（オプションに応じて表示）
+                                      if (showDataPoints !== 'none') {
+                                        stats.values.forEach((v, i) => {
+                                          const jitter = (Math.random() - 0.5) * boxWidth * 0.6;
+                                          if (showDataPoints === 'black') {
+                                            svgContent += `<circle cx="${x + jitter}" cy="${yScale(v)}" r="3" fill="#333" fill-opacity="0.7"/>`;
+                                          } else {
+                                            svgContent += `<circle cx="${x + jitter}" cy="${yScale(v)}" r="3" fill="white" stroke="#333" stroke-width="1"/>`;
+                                          }
+                                        });
+                                      }
+
+                                      // 外れ値
+                                      stats.outliers.forEach(v => {
+                                        svgContent += `<circle cx="${x}" cy="${yScale(v)}" r="4" fill="none" stroke="${color}" stroke-width="1.5"/>`;
+                                      });
+                                    } else if (statChartType === 'violin') {
+                                      // Violin: R (ggplot2) 風のカーネル密度推定
+                                      // Silverman's rule of thumb for bandwidth
+                                      const bandwidth = 0.9 * Math.min(stats.sd, stats.iqr / 1.34) * Math.pow(stats.n, -0.2) || (stats.sd * 0.5);
+
+                                      // データ範囲を少し拡張（端を滑らかに）
+                                      const dataRange = stats.max - stats.min;
+                                      const extendedMin = stats.min - dataRange * 0.1;
+                                      const extendedMax = stats.max + dataRange * 0.1;
+
+                                      const density = [];
+                                      const steps = 60; // より滑らかな曲線
+                                      for (let i = 0; i <= steps; i++) {
+                                        const y = extendedMin + (extendedMax - extendedMin) * (i / steps);
+                                        let d = 0;
+                                        stats.values.forEach(v => {
+                                          // ガウシアンカーネル
+                                          d += Math.exp(-0.5 * Math.pow((y - v) / bandwidth, 2));
+                                        });
+                                        d /= stats.n * bandwidth * Math.sqrt(2 * Math.PI);
+                                        density.push({ y, d });
+                                      }
+                                      const maxDensity = Math.max(...density.map(p => p.d));
+                                      const violinWidth = boxWidth * 1.0;
+
+                                      // Violin path（滑らかな曲線）
+                                      let leftPoints = [];
+                                      let rightPoints = [];
+                                      density.forEach(p => {
+                                        const w = (p.d / maxDensity) * (violinWidth / 2);
+                                        const yPos = yScale(p.y);
+                                        leftPoints.push(`${x - w},${yPos}`);
+                                        rightPoints.unshift(`${x + w},${yPos}`);
+                                      });
+
+                                      // SVG path with smooth curve
+                                      const allPoints = [...leftPoints, ...rightPoints];
+                                      svgContent += `<polygon points="${allPoints.join(' ')}" fill="${color}" fill-opacity="0.4" stroke="${color}" stroke-width="1"/>`;
+
+                                      // 個別データ点（ggplot2 geom_jitter風、violinの内側に表示）
+                                      if (showDataPoints !== 'none') {
+                                        stats.values.forEach((v, i) => {
+                                          // violin幅に応じたjitter（データ点がviolin内に収まるように）
+                                          const yVal = v;
+                                          const nearestDensity = density.reduce((prev, curr) =>
+                                            Math.abs(curr.y - yVal) < Math.abs(prev.y - yVal) ? curr : prev
+                                          );
+                                          const maxJitter = (nearestDensity.d / maxDensity) * (violinWidth / 2) * 0.8;
+                                          const jitter = (Math.random() - 0.5) * 2 * maxJitter;
+                                          if (showDataPoints === 'black') {
+                                            svgContent += `<circle cx="${x + jitter}" cy="${yScale(v)}" r="2.5" fill="#333" fill-opacity="0.8"/>`;
+                                          } else {
+                                            svgContent += `<circle cx="${x + jitter}" cy="${yScale(v)}" r="2.5" fill="white" stroke="#333" stroke-width="0.8"/>`;
+                                          }
+                                        });
+                                      }
+
+                                      // 内部のボックスプロット（ggplot2スタイル）
+                                      const thinLineWidth = 1;
+                                      // ヒゲ（細い線）
+                                      svgContent += `<line x1="${x}" y1="${yWhiskerLow}" x2="${x}" y2="${yWhiskerHigh}" stroke="black" stroke-width="${thinLineWidth}"/>`;
+
+                                      // IQRボックス（黒い細い四角）
+                                      const innerBoxWidth = 8;
+                                      svgContent += `<rect x="${x - innerBoxWidth/2}" y="${yQ3}" width="${innerBoxWidth}" height="${yQ1 - yQ3}" fill="black" stroke="none"/>`;
+
+                                      // 中央値（白い点）
+                                      svgContent += `<circle cx="${x}" cy="${yMed}" r="3" fill="white" stroke="none"/>`;
+                                    } else if (statChartType === 'bar') {
+                                      // Bar chart with error bars
+                                      const yMean = yScale(stats.mean);
+                                      const yBase = yScale(yMin);
+                                      const barW = boxWidth * 0.7;
+
+                                      svgContent += `<rect x="${x - barW/2}" y="${yMean}" width="${barW}" height="${yBase - yMean}" fill="${color}" fill-opacity="0.7"/>`;
+
+                                      // エラーバー (Mean ± SD)
+                                      const yTop = yScale(stats.mean + stats.sd);
+                                      const yBottom = yScale(Math.max(stats.mean - stats.sd, yMin));
+                                      svgContent += `<line x1="${x}" y1="${yTop}" x2="${x}" y2="${yBottom}" stroke="#333" stroke-width="1.5"/>`;
+                                      svgContent += `<line x1="${x - 8}" y1="${yTop}" x2="${x + 8}" y2="${yTop}" stroke="#333" stroke-width="1.5"/>`;
+                                      svgContent += `<line x1="${x - 8}" y1="${yBottom}" x2="${x + 8}" y2="${yBottom}" stroke="#333" stroke-width="1.5"/>`;
+
+                                      // 個別データ点（オプションに応じて表示）
+                                      if (showDataPoints !== 'none') {
+                                        stats.values.forEach((v, i) => {
+                                          const jitter = (Math.random() - 0.5) * barW * 0.8;
+                                          if (showDataPoints === 'black') {
+                                            svgContent += `<circle cx="${x + jitter}" cy="${yScale(v)}" r="3" fill="#333" fill-opacity="0.7"/>`;
+                                          } else {
+                                            svgContent += `<circle cx="${x + jitter}" cy="${yScale(v)}" r="3" fill="white" stroke="#333" stroke-width="1"/>`;
+                                          }
+                                        });
+                                      }
+                                    }
+                                  };
+
+                                  drawBox(stats1, x1, '#3b82f6');
+                                  drawBox(stats2, x2, '#ef4444');
+
+                                  // 統計情報
+                                  const testName = bothNormal ? 't-test' : 'Mann-Whitney U';
+                                  svgContent += `<text x="${svgWidth - 10}" y="${svgHeight - 5}" text-anchor="end" font-size="9" fill="#666">${testName}, p=${pValue.toFixed(4)}</text>`;
+
+                                    svgContent += '</svg>';
+
+                                    return {
+                                      itemName,
+                                      svgContent,
+                                      svgWidth,
+                                      svgHeight,
+                                      stats1,
+                                      stats2,
+                                      norm1,
+                                      norm2,
+                                      bothNormal,
+                                      pValue,
+                                      result
+                                    };
+                                  };
+
+                                  // 各項目のグラフデータを生成
+                                  const chartDataList = statSelectedItems.map((item, idx) => renderChart(item, idx)).filter(Boolean);
+
+                                  if (chartDataList.length === 0) {
+                                    return <div style={{padding: '20px', color: '#6b7280'}}>選択した項目にデータがありません</div>;
+                                  }
+
+                                  return (
+                                    <div>
+                                      {/* グラフをグリッド表示 */}
+                                      <div style={{
+                                        display: 'grid',
+                                        gridTemplateColumns: chartDataList.length === 1 ? '1fr' : 'repeat(auto-fit, minmax(350px, 1fr))',
+                                        gap: '20px',
+                                        marginBottom: '20px'
+                                      }}>
+                                        {chartDataList.map((chartData, idx) => (
+                                          <div key={idx} style={{
+                                            background: '#fafafa',
+                                            borderRadius: '8px',
+                                            padding: '16px',
+                                            border: '1px solid #e5e7eb'
+                                          }}>
+                                            {/* 正規性検定結果 */}
+                                            <div style={{marginBottom: '8px', padding: '8px', background: '#f0fdf4', borderRadius: '4px', fontSize: '10px'}}>
+                                              <strong>{chartData.itemName}</strong>: {chartData.bothNormal ? 't検定' : 'Mann-Whitney U'}, p={chartData.pValue.toFixed(4)}
+                                              {chartData.pValue < 0.05 && <span style={{color: '#dc2626', marginLeft: '4px'}}>*</span>}
+                                            </div>
+                                            {/* グラフ */}
+                                            <div
+                                              style={{display: 'flex', justifyContent: 'center'}}
+                                              dangerouslySetInnerHTML={{__html: chartData.svgContent}}
+                                            />
+                                          </div>
+                                        ))}
+                                      </div>
+
+                                      {/* 一括エクスポートボタン */}
+                                      <div style={{display: 'flex', gap: '10px', justifyContent: 'center', flexWrap: 'wrap', padding: '16px', background: '#f8fafc', borderRadius: '8px'}}>
+                                        <button
+                                          onClick={() => {
+                                            // 全グラフを結合したSVGを作成
+                                            const cols = Math.min(chartDataList.length, 3);
+                                            const rows = Math.ceil(chartDataList.length / cols);
+                                            const singleWidth = chartDataList[0].svgWidth;
+                                            const singleHeight = chartDataList[0].svgHeight;
+                                            const totalWidth = cols * singleWidth + (cols - 1) * 20;
+                                            const totalHeight = rows * singleHeight + (rows - 1) * 20;
+
+                                            let combinedSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="${totalHeight}">`;
+                                            combinedSvg += `<rect width="100%" height="100%" fill="white"/>`;
+
+                                            chartDataList.forEach((chart, idx) => {
+                                              const col = idx % cols;
+                                              const row = Math.floor(idx / cols);
+                                              const x = col * (singleWidth + 20);
+                                              const y = row * (singleHeight + 20);
+                                              // SVGタグを除去して内容のみを取得
+                                              const innerSvg = chart.svgContent.replace(/<svg[^>]*>/, '').replace(/<\/svg>/, '');
+                                              combinedSvg += `<g transform="translate(${x}, ${y})">${innerSvg}</g>`;
+                                            });
+                                            combinedSvg += '</svg>';
+
+                                            const blob = new Blob([combinedSvg], { type: 'image/svg+xml;charset=utf-8' });
+                                            const url = URL.createObjectURL(blob);
+                                            const a = document.createElement('a');
+                                            a.href = url;
+                                            a.download = `統計グラフ_${statChartType}_${chartDataList.length}項目.svg`;
+                                            a.click();
+                                            URL.revokeObjectURL(url);
+                                          }}
+                                          style={{...styles.addButton, backgroundColor: '#7c3aed', padding: '10px 20px', fontSize: '13px'}}
+                                        >
+                                          🎨 全グラフSVG保存
+                                        </button>
+                                        <button
+                                          onClick={() => {
+                                            // 全グラフを結合したPNGを作成
+                                            const cols = Math.min(chartDataList.length, 3);
+                                            const rows = Math.ceil(chartDataList.length / cols);
+                                            const singleWidth = chartDataList[0].svgWidth;
+                                            const singleHeight = chartDataList[0].svgHeight;
+                                            const totalWidth = cols * singleWidth + (cols - 1) * 20;
+                                            const totalHeight = rows * singleHeight + (rows - 1) * 20;
+
+                                            let combinedSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="${totalWidth}" height="${totalHeight}">`;
+                                            combinedSvg += `<rect width="100%" height="100%" fill="white"/>`;
+
+                                            chartDataList.forEach((chart, idx) => {
+                                              const col = idx % cols;
+                                              const row = Math.floor(idx / cols);
+                                              const x = col * (singleWidth + 20);
+                                              const y = row * (singleHeight + 20);
+                                              const innerSvg = chart.svgContent.replace(/<svg[^>]*>/, '').replace(/<\/svg>/, '');
+                                              combinedSvg += `<g transform="translate(${x}, ${y})">${innerSvg}</g>`;
+                                            });
+                                            combinedSvg += '</svg>';
+
+                                            const canvas = document.createElement('canvas');
+                                            canvas.width = totalWidth * 2;
+                                            canvas.height = totalHeight * 2;
+                                            const ctx = canvas.getContext('2d');
+                                            ctx.scale(2, 2);
+                                            const img = new Image();
+                                            img.onload = () => {
+                                              ctx.fillStyle = 'white';
+                                              ctx.fillRect(0, 0, totalWidth, totalHeight);
+                                              ctx.drawImage(img, 0, 0);
+                                              const pngUrl = canvas.toDataURL('image/png');
+                                              const a = document.createElement('a');
+                                              a.href = pngUrl;
+                                              a.download = `統計グラフ_${statChartType}_${chartDataList.length}項目.png`;
+                                              a.click();
+                                            };
+                                            img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(combinedSvg);
+                                          }}
+                                          style={{...styles.addButton, backgroundColor: '#0ea5e9', padding: '10px 20px', fontSize: '13px'}}
+                                        >
+                                          📷 全グラフPNG保存
+                                        </button>
+                                        <button
+                                          onClick={() => {
+                                            // 全項目のデータをExcelに出力
+                                            const wb = XLSX.utils.book_new();
+
+                                            // 各項目のデータシート
+                                            chartDataList.forEach(chart => {
+                                              // Group1
+                                              const g1Data = [['ID', '日付', 'Day', chart.itemName]];
+                                              (chart.result.group1.data || []).forEach(d => {
+                                                g1Data.push([d.id, d.date, d.day, d.value]);
+                                              });
+                                              const wsG1 = XLSX.utils.aoa_to_sheet(g1Data);
+                                              XLSX.utils.book_append_sheet(wb, wsG1, `${chart.itemName}_${selectedGroup1}`.substring(0, 31));
+
+                                              // Group2
+                                              const g2Data = [['ID', '日付', 'Day', chart.itemName]];
+                                              (chart.result.group2.data || []).forEach(d => {
+                                                g2Data.push([d.id, d.date, d.day, d.value]);
+                                              });
+                                              const wsG2 = XLSX.utils.aoa_to_sheet(g2Data);
+                                              XLSX.utils.book_append_sheet(wb, wsG2, `${chart.itemName}_${selectedGroup2}`.substring(0, 31));
+                                            });
+
+                                            // 統計サマリーシート（全項目）
+                                            const summaryData = [
+                                              ['項目', 'n1', 'Mean1', 'SD1', 'n2', 'Mean2', 'SD2', '検定', 'p値', '有意差'],
+                                            ];
+                                            chartDataList.forEach(chart => {
+                                              summaryData.push([
+                                                chart.itemName,
+                                                chart.stats1.n,
+                                                chart.stats1.mean.toFixed(4),
+                                                chart.stats1.sd.toFixed(4),
+                                                chart.stats2.n,
+                                                chart.stats2.mean.toFixed(4),
+                                                chart.stats2.sd.toFixed(4),
+                                                chart.bothNormal ? 't検定' : 'Mann-Whitney',
+                                                chart.pValue.toFixed(6),
+                                                chart.pValue < 0.05 ? '*' : ''
+                                              ]);
+                                            });
+                                            const wsSummary = XLSX.utils.aoa_to_sheet(summaryData);
+                                            XLSX.utils.book_append_sheet(wb, wsSummary, '統計サマリー');
+
+                                            XLSX.writeFile(wb, `統計データ_${chartDataList.length}項目.xlsx`);
+                                          }}
+                                          style={{...styles.addButton, backgroundColor: '#10b981', padding: '10px 20px', fontSize: '13px'}}
+                                        >
+                                          📊 全データExcel保存
+                                        </button>
+                                      </div>
+                                    </div>
+                                  );
+                                })()}
+                              </div>
                             </div>
                           )}
 
@@ -3301,6 +4377,147 @@ function PatientsListView({ onSelectPatient }) {
                   setDayRangeStart('');
                   setDayRangeEnd('');
                 }}
+                style={styles.cancelButton}
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 管理者パネルモーダル */}
+      {showAdminPanel && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '600px'}}>
+            <h2 style={styles.modalTitle}>⚙️ 管理者設定</h2>
+
+            {/* 管理者設定セクション */}
+            <div style={{marginBottom: '24px', padding: '16px', background: '#f8fafc', borderRadius: '8px'}}>
+              <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '12px', color: '#374151'}}>
+                管理者アカウント
+              </h3>
+              {adminEmail ? (
+                <div style={{fontSize: '13px', color: '#6b7280'}}>
+                  現在の管理者: <strong style={{color: '#111827'}}>{adminEmail}</strong>
+                  {isAdmin && <span style={{marginLeft: '8px', color: '#059669'}}>(あなた)</span>}
+                </div>
+              ) : (
+                <div>
+                  <p style={{fontSize: '13px', color: '#6b7280', marginBottom: '12px'}}>
+                    管理者が設定されていません。自分を管理者として設定しますか？
+                  </p>
+                  <button
+                    onClick={setAsAdmin}
+                    disabled={isSettingAdmin}
+                    style={{
+                      ...styles.primaryButton,
+                      backgroundColor: '#7c3aed',
+                      padding: '8px 16px',
+                      fontSize: '13px'
+                    }}
+                  >
+                    {isSettingAdmin ? '設定中...' : '自分を管理者に設定'}
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* メール許可リスト設定 */}
+            {(isAdmin || !adminEmail) && (
+              <div style={{marginBottom: '24px', padding: '16px', background: '#f0fdf4', borderRadius: '8px'}}>
+                <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px'}}>
+                  <h3 style={{fontSize: '14px', fontWeight: '600', color: '#374151', margin: 0}}>
+                    メールアドレス許可リスト
+                  </h3>
+                  <label style={{display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer'}}>
+                    <input
+                      type="checkbox"
+                      checked={emailAllowlistEnabled}
+                      onChange={toggleEmailAllowlist}
+                      style={{width: '18px', height: '18px'}}
+                    />
+                    <span style={{fontSize: '13px', color: emailAllowlistEnabled ? '#059669' : '#6b7280'}}>
+                      {emailAllowlistEnabled ? '有効' : '無効'}
+                    </span>
+                  </label>
+                </div>
+
+                <p style={{fontSize: '12px', color: '#6b7280', marginBottom: '16px'}}>
+                  有効にすると、許可リストに登録されたメールアドレスのみ新規登録できます。
+                </p>
+
+                {/* メールアドレス追加フォーム */}
+                <div style={{display: 'flex', gap: '8px', marginBottom: '16px'}}>
+                  <input
+                    type="email"
+                    value={newAllowedEmail}
+                    onChange={(e) => setNewAllowedEmail(e.target.value)}
+                    placeholder="example@email.com"
+                    style={{...styles.input, flex: 1}}
+                  />
+                  <button
+                    onClick={addAllowedEmail}
+                    style={{
+                      ...styles.addButton,
+                      backgroundColor: '#10b981',
+                      padding: '8px 16px',
+                      whiteSpace: 'nowrap'
+                    }}
+                  >
+                    追加
+                  </button>
+                </div>
+
+                {/* 許可リスト一覧 */}
+                <div style={{
+                  maxHeight: '200px',
+                  overflow: 'auto',
+                  border: '1px solid #d1d5db',
+                  borderRadius: '6px',
+                  background: 'white'
+                }}>
+                  {allowedEmails.length === 0 ? (
+                    <div style={{padding: '16px', textAlign: 'center', color: '#6b7280', fontSize: '13px'}}>
+                      許可されたメールアドレスはありません
+                    </div>
+                  ) : (
+                    allowedEmails.map(item => (
+                      <div
+                        key={item.id}
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          alignItems: 'center',
+                          padding: '10px 12px',
+                          borderBottom: '1px solid #e5e7eb'
+                        }}
+                      >
+                        <span style={{fontSize: '13px'}}>{item.email}</span>
+                        <button
+                          onClick={() => removeAllowedEmail(item.id)}
+                          style={{
+                            background: '#fee2e2',
+                            color: '#dc2626',
+                            border: 'none',
+                            borderRadius: '4px',
+                            padding: '4px 8px',
+                            fontSize: '11px',
+                            cursor: 'pointer'
+                          }}
+                        >
+                          削除
+                        </button>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => setShowAdminPanel(false)}
                 style={styles.cancelButton}
               >
                 閉じる
@@ -3800,6 +5017,121 @@ function PatientDetailView({ patient, onBack }) {
     }
   };
 
+  // 臨床経過CSVエクスポート
+  const exportClinicalEventsCSV = () => {
+    if (clinicalEvents.length === 0) {
+      alert('エクスポートするデータがありません');
+      return;
+    }
+
+    const headers = ['EventType', 'InputType', 'StartDate', 'EndDate', 'JCS', 'Frequency', 'Severity', 'Presence', 'Note'];
+    const rows = clinicalEvents.map(e => [
+      e.eventType || '',
+      e.inputType || '',
+      e.startDate || '',
+      e.endDate || '',
+      e.jcs || '',
+      e.frequency || '',
+      e.severity || '',
+      e.presence || '',
+      (e.note || '').replace(/,/g, '，').replace(/\n/g, ' ')
+    ]);
+
+    const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+    const bom = '\uFEFF';
+    const blob = new Blob([bom + csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${patient.displayId}_clinical_events.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // 臨床経過CSVインポート
+  const importClinicalEventsCSV = async (file) => {
+    const text = await file.text();
+    const lines = text.split('\n').filter(line => line.trim());
+    if (lines.length < 2) {
+      alert('データが見つかりません');
+      return;
+    }
+
+    const headers = lines[0].split(',').map(h => h.trim().replace(/^"/, '').replace(/"$/, ''));
+    const eventTypeIdx = headers.findIndex(h => h.toLowerCase() === 'eventtype');
+    const inputTypeIdx = headers.findIndex(h => h.toLowerCase() === 'inputtype');
+    const startDateIdx = headers.findIndex(h => h.toLowerCase() === 'startdate');
+    const endDateIdx = headers.findIndex(h => h.toLowerCase() === 'enddate');
+    const jcsIdx = headers.findIndex(h => h.toLowerCase() === 'jcs');
+    const frequencyIdx = headers.findIndex(h => h.toLowerCase() === 'frequency');
+    const severityIdx = headers.findIndex(h => h.toLowerCase() === 'severity');
+    const presenceIdx = headers.findIndex(h => h.toLowerCase() === 'presence');
+    const noteIdx = headers.findIndex(h => h.toLowerCase() === 'note');
+
+    if (eventTypeIdx === -1 || startDateIdx === -1) {
+      alert('必須列（EventType, StartDate）が見つかりません');
+      return;
+    }
+
+    let imported = 0;
+    for (let i = 1; i < lines.length; i++) {
+      const values = lines[i].split(',').map(v => v.trim().replace(/^"/, '').replace(/"$/, ''));
+      const eventType = values[eventTypeIdx];
+      const startDate = values[startDateIdx];
+
+      if (!eventType || !startDate) continue;
+
+      try {
+        await addDoc(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          {
+            eventType: eventType,
+            inputType: inputTypeIdx !== -1 ? values[inputTypeIdx] || 'severity' : 'severity',
+            startDate: startDate,
+            endDate: endDateIdx !== -1 ? values[endDateIdx] || null : null,
+            jcs: jcsIdx !== -1 ? values[jcsIdx] || null : null,
+            frequency: frequencyIdx !== -1 ? values[frequencyIdx] || null : null,
+            severity: severityIdx !== -1 ? values[severityIdx] || null : null,
+            presence: presenceIdx !== -1 ? values[presenceIdx] || null : null,
+            note: noteIdx !== -1 ? values[noteIdx] || '' : '',
+            createdAt: serverTimestamp()
+          }
+        );
+        imported++;
+      } catch (err) {
+        console.error('Error importing event:', err);
+      }
+    }
+
+    alert(`${imported}件のイベントをインポートしました`);
+  };
+
+  // 臨床経過CSVサンプルダウンロード
+  const downloadClinicalEventsSample = () => {
+    const sampleData = [
+      ['EventType', 'InputType', 'StartDate', 'EndDate', 'JCS', 'Frequency', 'Severity', 'Presence', 'Note'],
+      ['てんかん発作', 'frequency', '2024-01-15', '2024-01-20', '', 'daily', '', '', '発熱時に増悪'],
+      ['てんかん発作', 'frequency', '2024-01-21', '2024-01-25', '', 'weekly', '', '', '改善傾向'],
+      ['意識障害', 'jcs', '2024-01-15', '2024-01-18', 'II-10', '', '', '', ''],
+      ['意識障害', 'jcs', '2024-01-19', '2024-01-22', 'I-3', '', '', '', '改善'],
+      ['不随意運動', 'presence', '2024-01-16', '2024-01-25', '', '', '', 'あり', '舞踏様運動'],
+      ['発熱', 'severity', '2024-01-15', '2024-01-17', '', '', '重度', '', '39度台'],
+      ['発熱', 'severity', '2024-01-18', '2024-01-20', '', '', '軽度', '', '37度台'],
+      ['頭痛', 'severity', '2024-01-15', '2024-01-22', '', '', '中等度', '', ''],
+      ['麻痺', 'severity', '2024-01-16', '', '', '', '軽度', '', '右上肢'],
+    ];
+
+    const csvContent = sampleData.map(row => row.join(',')).join('\n');
+    const bom = '\uFEFF';
+    const blob = new Blob([bom + csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'clinical_events_sample.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   // ========================================
   // 治療薬管理関数
   // ========================================
@@ -4052,6 +5384,71 @@ function PatientDetailView({ patient, onBack }) {
   // ============================================
   // Excelインポート機能
   // ============================================
+
+  // 検査データ用サンプルExcelダウンロード
+  const downloadLabDataSample = () => {
+    const wb = XLSX.utils.book_new();
+
+    // Serum（血清）シート
+    const serumData = [
+      ['検査項目', '単位', 'Day1', 'Day2', 'Day3', 'Day5', 'Day7', 'Day14'],
+      ['採取日', '', '2024-01-15', '2024-01-16', '2024-01-17', '2024-01-19', '2024-01-21', '2024-01-28'],
+      ['WBC', '/μL', '12000', '10500', '9800', '8500', '7200', '6500'],
+      ['RBC', '×10^4/μL', '450', '448', '445', '450', '455', '460'],
+      ['Hb', 'g/dL', '13.5', '13.2', '13.0', '13.3', '13.5', '13.8'],
+      ['Plt', '×10^4/μL', '18.5', '17.8', '16.5', '18.0', '20.5', '22.0'],
+      ['CRP', 'mg/dL', '8.5', '6.2', '4.1', '1.8', '0.5', '0.1'],
+      ['AST', 'U/L', '45', '42', '38', '32', '28', '25'],
+      ['ALT', 'U/L', '52', '48', '42', '35', '30', '28'],
+      ['BUN', 'mg/dL', '18', '16', '15', '14', '13', '12'],
+      ['Cr', 'mg/dL', '0.8', '0.75', '0.72', '0.70', '0.68', '0.65'],
+      ['Na', 'mEq/L', '138', '139', '140', '141', '140', '140'],
+      ['K', 'mEq/L', '4.2', '4.0', '4.1', '4.0', '4.1', '4.0'],
+      ['Cl', 'mEq/L', '102', '103', '103', '104', '103', '103'],
+      ['Glucose', 'mg/dL', '120', '110', '105', '100', '98', '95'],
+    ];
+    const wsSerum = XLSX.utils.aoa_to_sheet(serumData);
+    XLSX.utils.book_append_sheet(wb, wsSerum, 'Serum');
+
+    // CSF（髄液）シート
+    const csfData = [
+      ['検査項目', '単位', 'Day1', 'Day7', 'Day14'],
+      ['採取日', '', '2024-01-15', '2024-01-21', '2024-01-28'],
+      ['細胞数', '/μL', '150', '45', '12'],
+      ['蛋白', 'mg/dL', '85', '55', '42'],
+      ['糖', 'mg/dL', '55', '60', '65'],
+      ['IgG Index', '', '1.2', '0.9', '0.7'],
+      ['OCB', '', '陽性', '陽性', '陰性'],
+    ];
+    const wsCSF = XLSX.utils.aoa_to_sheet(csfData);
+    XLSX.utils.book_append_sheet(wb, wsCSF, 'CSF');
+
+    // 説明シート
+    const instructions = [
+      ['検査データExcelフォーマット説明'],
+      [''],
+      ['■ 基本構造'],
+      ['・1行目: ヘッダー行（検査項目, 単位, Day1, Day2, ...）'],
+      ['・2行目: 採取日行（採取日, 空欄, 日付, 日付, ...）'],
+      ['・3行目以降: 検査項目データ'],
+      [''],
+      ['■ 日付形式'],
+      ['・YYYY-MM-DD形式を推奨（例: 2024-01-15）'],
+      ['・Excelの日付形式も対応'],
+      [''],
+      ['■ シート名'],
+      ['・シート名に「CSF」を含むと髄液として認識'],
+      ['・シート名に「Serum」を含むと血清として認識'],
+      [''],
+      ['■ 複数日のデータ'],
+      ['・Day1, Day2, ... の列で複数日のデータを一括入力可能'],
+    ];
+    const wsInst = XLSX.utils.aoa_to_sheet(instructions);
+    XLSX.utils.book_append_sheet(wb, wsInst, '説明');
+
+    XLSX.writeFile(wb, 'lab_data_sample.xlsx');
+  };
+
   const handleExcelUpload = (e) => {
     const file = e.target.files[0];
     if (!file) return;
@@ -4576,7 +5973,7 @@ function PatientDetailView({ patient, onBack }) {
         <section style={styles.section}>
           <div style={styles.sectionHeader}>
             <h2 style={styles.sectionTitle}>臨床経過</h2>
-            <div style={{display: 'flex', gap: '8px'}}>
+            <div style={{display: 'flex', gap: '8px', flexWrap: 'wrap'}}>
               <button
                 onClick={openAddTreatmentModal}
                 style={{...styles.addLabButton, background: '#ecfdf5', color: '#047857'}}
@@ -4588,6 +5985,32 @@ function PatientDetailView({ patient, onBack }) {
                 style={{...styles.addLabButton, background: '#fef3c7', color: '#92400e'}}
               >
                 <span>📋</span> 症状追加
+              </button>
+              <button
+                onClick={exportClinicalEventsCSV}
+                style={{...styles.addLabButton, background: '#e0f2fe', color: '#0369a1'}}
+              >
+                <span>📥</span> CSV出力
+              </button>
+              <label style={{...styles.addLabButton, background: '#f3e8ff', color: '#7c3aed', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: '4px'}}>
+                <span>📤</span> CSVインポート
+                <input
+                  type="file"
+                  accept=".csv"
+                  onChange={(e) => {
+                    if (e.target.files[0]) {
+                      importClinicalEventsCSV(e.target.files[0]);
+                      e.target.value = '';
+                    }
+                  }}
+                  style={{display: 'none'}}
+                />
+              </label>
+              <button
+                onClick={downloadClinicalEventsSample}
+                style={{...styles.addLabButton, background: '#fafafa', color: '#6b7280', border: '1px dashed #d1d5db'}}
+              >
+                <span>📄</span> サンプルCSV
               </button>
             </div>
           </div>
@@ -5613,47 +7036,80 @@ function PatientDetailView({ patient, onBack }) {
                 </div>
                 {showTreatmentsOnChart && treatments.length > 0 && (
                   <div style={{
-                    display: 'flex',
-                    flexWrap: 'wrap',
-                    gap: '8px',
                     padding: '8px',
                     background: 'white',
                     borderRadius: '8px',
                     border: '1px solid #d1fae5'
                   }}>
-                    {(() => {
-                      const allMeds = [...new Set(treatments.map(t => t.medicationName))];
-                      return allMeds.map(med => (
-                        <label
-                          key={med}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '4px',
-                            padding: '4px 10px',
-                            background: selectedTreatmentsForChart.includes(med) ? '#d1fae5' : '#f1f5f9',
-                            borderRadius: '16px',
-                            cursor: 'pointer',
-                            fontSize: '12px',
-                            border: selectedTreatmentsForChart.includes(med) ? '1px solid #10b981' : '1px solid transparent'
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={selectedTreatmentsForChart.includes(med)}
-                            onChange={() => {
-                              setSelectedTreatmentsForChart(prev =>
-                                prev.includes(med)
-                                  ? prev.filter(m => m !== med)
-                                  : [...prev, med]
-                              );
+                    {/* 一括選択ボタン */}
+                    <div style={{display: 'flex', gap: '8px', marginBottom: '8px'}}>
+                      <button
+                        onClick={() => {
+                          const allMeds = [...new Set(treatments.map(t => t.medicationName))];
+                          setSelectedTreatmentsForChart(allMeds);
+                        }}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '11px',
+                          background: '#d1fae5',
+                          border: '1px solid #10b981',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          color: '#065f46'
+                        }}
+                      >
+                        全て選択
+                      </button>
+                      <button
+                        onClick={() => setSelectedTreatmentsForChart([])}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '11px',
+                          background: '#f1f5f9',
+                          border: '1px solid #cbd5e1',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          color: '#64748b'
+                        }}
+                      >
+                        全て解除
+                      </button>
+                    </div>
+                    <div style={{display: 'flex', flexWrap: 'wrap', gap: '8px'}}>
+                      {(() => {
+                        const allMeds = [...new Set(treatments.map(t => t.medicationName))];
+                        return allMeds.map(med => (
+                          <label
+                            key={med}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              padding: '4px 10px',
+                              background: selectedTreatmentsForChart.includes(med) ? '#d1fae5' : '#f1f5f9',
+                              borderRadius: '16px',
+                              cursor: 'pointer',
+                              fontSize: '12px',
+                              border: selectedTreatmentsForChart.includes(med) ? '1px solid #10b981' : '1px solid transparent'
                             }}
-                            style={{display: 'none'}}
-                          />
-                          {med}
-                        </label>
-                      ));
-                    })()}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedTreatmentsForChart.includes(med)}
+                              onChange={() => {
+                                setSelectedTreatmentsForChart(prev =>
+                                  prev.includes(med)
+                                    ? prev.filter(m => m !== med)
+                                    : [...prev, med]
+                                );
+                              }}
+                              style={{display: 'none'}}
+                            />
+                            {med}
+                          </label>
+                        ));
+                      })()}
+                    </div>
                   </div>
                 )}
               </div>
@@ -5672,47 +7128,80 @@ function PatientDetailView({ patient, onBack }) {
                 </div>
                 {showEventsOnChart && clinicalEvents.length > 0 && (
                   <div style={{
-                    display: 'flex',
-                    flexWrap: 'wrap',
-                    gap: '8px',
                     padding: '8px',
                     background: 'white',
                     borderRadius: '8px',
                     border: '1px solid #fde68a'
                   }}>
-                    {(() => {
-                      const allEventTypes = [...new Set(clinicalEvents.map(e => e.eventType))];
-                      return allEventTypes.map(eventType => (
-                        <label
-                          key={eventType}
-                          style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '4px',
-                            padding: '4px 10px',
-                            background: selectedEventsForChart.includes(eventType) ? '#fef3c7' : '#f1f5f9',
-                            borderRadius: '16px',
-                            cursor: 'pointer',
-                            fontSize: '12px',
-                            border: selectedEventsForChart.includes(eventType) ? '1px solid #f59e0b' : '1px solid transparent'
-                          }}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={selectedEventsForChart.includes(eventType)}
-                            onChange={() => {
-                              setSelectedEventsForChart(prev =>
-                                prev.includes(eventType)
-                                  ? prev.filter(et => et !== eventType)
-                                  : [...prev, eventType]
-                              );
+                    {/* 一括選択ボタン */}
+                    <div style={{display: 'flex', gap: '8px', marginBottom: '8px'}}>
+                      <button
+                        onClick={() => {
+                          const allEventTypes = [...new Set(clinicalEvents.map(e => e.eventType))];
+                          setSelectedEventsForChart(allEventTypes);
+                        }}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '11px',
+                          background: '#fef3c7',
+                          border: '1px solid #f59e0b',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          color: '#92400e'
+                        }}
+                      >
+                        全て選択
+                      </button>
+                      <button
+                        onClick={() => setSelectedEventsForChart([])}
+                        style={{
+                          padding: '4px 10px',
+                          fontSize: '11px',
+                          background: '#f1f5f9',
+                          border: '1px solid #cbd5e1',
+                          borderRadius: '4px',
+                          cursor: 'pointer',
+                          color: '#64748b'
+                        }}
+                      >
+                        全て解除
+                      </button>
+                    </div>
+                    <div style={{display: 'flex', flexWrap: 'wrap', gap: '8px'}}>
+                      {(() => {
+                        const allEventTypes = [...new Set(clinicalEvents.map(e => e.eventType))];
+                        return allEventTypes.map(eventType => (
+                          <label
+                            key={eventType}
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '4px',
+                              padding: '4px 10px',
+                              background: selectedEventsForChart.includes(eventType) ? '#fef3c7' : '#f1f5f9',
+                              borderRadius: '16px',
+                              cursor: 'pointer',
+                              fontSize: '12px',
+                              border: selectedEventsForChart.includes(eventType) ? '1px solid #f59e0b' : '1px solid transparent'
                             }}
-                            style={{display: 'none'}}
-                          />
-                          {eventType}
-                        </label>
-                      ));
-                    })()}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={selectedEventsForChart.includes(eventType)}
+                              onChange={() => {
+                                setSelectedEventsForChart(prev =>
+                                  prev.includes(eventType)
+                                    ? prev.filter(et => et !== eventType)
+                                    : [...prev, eventType]
+                                );
+                              }}
+                              style={{display: 'none'}}
+                            />
+                            {eventType}
+                          </label>
+                        ));
+                      })()}
+                    </div>
                   </div>
                 )}
               </div>
@@ -5996,7 +7485,9 @@ function PatientDetailView({ patient, onBack }) {
                         clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
                           eventGroups[e.eventType] = true;
                         });
-                        totalHeight += Object.keys(eventGroups).length * (barHeight + 8) + 20;
+                        // 頻度/重症度ベースの場合はmaxBarHeight(50)を使用
+                        const maxEventBarHeight = 50;
+                        totalHeight += Object.keys(eventGroups).length * (maxEventBarHeight + 15) + 20;
                       }
                       if (hasLabData) {
                         totalHeight += 250; // グラフエリア
@@ -6044,12 +7535,43 @@ function PatientDetailView({ patient, onBack }) {
                         });
                       }
 
-                      // 臨床経過タイムライン
+                      // 臨床経過タイムライン（頻度/重症度に応じたバー高さ）
                       if (showEventsOnChart && selectedEventsForChart.length > 0) {
+                        // レベル定義
+                        const svgFrequencyLevels = {
+                          'hourly': { level: 7, label: '毎時' },
+                          'several_daily': { level: 6, label: '数回/日' },
+                          'daily': { level: 5, label: '毎日' },
+                          'several_weekly': { level: 4, label: '数回/週' },
+                          'weekly': { level: 3, label: '週1' },
+                          'monthly': { level: 2, label: '月1' },
+                          'rare': { level: 1, label: '稀' }
+                        };
+                        const svgJcsLevels = {
+                          '0': { level: 0, label: '清明' },
+                          'I-1': { level: 1, label: 'I-1' },
+                          'I-2': { level: 2, label: 'I-2' },
+                          'I-3': { level: 3, label: 'I-3' },
+                          'II-10': { level: 4, label: 'II-10' },
+                          'II-20': { level: 5, label: 'II-20' },
+                          'II-30': { level: 6, label: 'II-30' },
+                          'III-100': { level: 7, label: 'III-100' },
+                          'III-200': { level: 8, label: 'III-200' },
+                          'III-300': { level: 9, label: 'III-300' }
+                        };
+                        const svgSeverityLevels = {
+                          '軽症': { level: 1, label: '軽症' },
+                          '軽度': { level: 1, label: '軽度' },
+                          '中等症': { level: 2, label: '中等症' },
+                          '中等度': { level: 2, label: '中等度' },
+                          '重症': { level: 3, label: '重症' },
+                          '重度': { level: 3, label: '重度' }
+                        };
+
                         const groups = {};
                         clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
                           if (!groups[e.eventType]) {
-                            groups[e.eventType] = { type: e.eventType, entries: [] };
+                            groups[e.eventType] = { type: e.eventType, entries: [], inputType: e.inputType };
                           }
                           groups[e.eventType].entries.push(e);
                         });
@@ -6058,16 +7580,50 @@ function PatientDetailView({ patient, onBack }) {
                           group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
                           const color = eventSvgColors[group.type] || '#6b7280';
 
-                          svgContent += `<text x="${leftMargin - 8}" y="${yPos + barHeight/2 + 4}" text-anchor="end" font-size="10">${group.type}</text>`;
+                          // 頻度/重症度ベースかどうか判定
+                          const isFrequencyBased = group.entries.some(e => e.frequency);
+                          const isJCSBased = group.entries.some(e => e.jcs);
+                          const isSeverityBased = group.entries.some(e => e.severity);
+                          const hasLevels = isFrequencyBased || isJCSBased || isSeverityBased;
+
+                          const maxEventBarHeight = hasLevels ? 50 : 30;
+                          let maxLevel = 7;
+                          if (isJCSBased) maxLevel = 9;
+                          if (isSeverityBased) maxLevel = 3;
+
+                          svgContent += `<text x="${leftMargin - 8}" y="${yPos + maxEventBarHeight - 5}" text-anchor="end" font-size="10">${group.type}</text>`;
+                          svgContent += `<line x1="${leftMargin}" y1="${yPos + maxEventBarHeight}" x2="${width - 40}" y2="${yPos + maxEventBarHeight}" stroke="#d1d5db" stroke-width="1"/>`;
 
                           group.entries.forEach(entry => {
                             const startDay = calcDaysFromOnset(entry.startDate);
                             const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
                             const x = leftMargin + ((startDay - minDay) / dayRange) * graphWidth;
                             const w = Math.max(((endDay - startDay) / dayRange) * graphWidth, 8);
-                            svgContent += `<rect x="${x}" y="${yPos}" width="${w}" height="${barHeight}" fill="${color}" fill-opacity="0.3" stroke="${color}" stroke-width="1" rx="2"/>`;
+
+                            // レベルとラベルを決定
+                            let level = maxLevel;
+                            let labelText = '';
+                            if (entry.frequency && svgFrequencyLevels[entry.frequency]) {
+                              level = svgFrequencyLevels[entry.frequency].level;
+                              labelText = svgFrequencyLevels[entry.frequency].label;
+                            } else if (entry.jcs && svgJcsLevels[entry.jcs]) {
+                              level = svgJcsLevels[entry.jcs].level;
+                              labelText = svgJcsLevels[entry.jcs].label;
+                            } else if (entry.severity && svgSeverityLevels[entry.severity]) {
+                              level = svgSeverityLevels[entry.severity].level;
+                              labelText = svgSeverityLevels[entry.severity].label;
+                            }
+
+                            // 高さを計算
+                            const h = hasLevels ? Math.max((level / maxLevel) * maxEventBarHeight, 12) : maxEventBarHeight;
+                            const y = yPos + maxEventBarHeight - h;
+
+                            svgContent += `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${color}" rx="2"/>`;
+                            if (w > 20 && h > 14 && labelText) {
+                              svgContent += `<text x="${x + w/2}" y="${y + h/2 + 3}" text-anchor="middle" font-size="8" fill="white">${labelText}</text>`;
+                            }
                           });
-                          yPos += barHeight + 8;
+                          yPos += maxEventBarHeight + 15;
                         });
                       }
 
@@ -6274,15 +7830,47 @@ function PatientDetailView({ patient, onBack }) {
                             </div>
                           )}
 
-                          {/* 臨床経過タイムライン */}
+                          {/* 臨床経過タイムライン（頻度の増減を高さで表現、同じ症状は同じ色） */}
                           {hasEvents && (
                             <div>
                               {(() => {
+                                // 頻度レベルの定義（高いほど頻度が高い）
+                                const frequencyLevels = {
+                                  'hourly': { level: 7, label: '毎時' },
+                                  'several_daily': { level: 6, label: '数回/日' },
+                                  'daily': { level: 5, label: '毎日' },
+                                  'several_weekly': { level: 4, label: '数回/週' },
+                                  'weekly': { level: 3, label: '週1' },
+                                  'monthly': { level: 2, label: '月1' },
+                                  'rare': { level: 1, label: '稀' }
+                                };
+
+                                // JCSレベルの定義
+                                const jcsLevels = {
+                                  '0': { level: 0, label: '清明' },
+                                  'I-1': { level: 1, label: 'I-1' },
+                                  'I-2': { level: 2, label: 'I-2' },
+                                  'I-3': { level: 3, label: 'I-3' },
+                                  'II-10': { level: 4, label: 'II-10' },
+                                  'II-20': { level: 5, label: 'II-20' },
+                                  'II-30': { level: 6, label: 'II-30' },
+                                  'III-100': { level: 7, label: 'III-100' },
+                                  'III-200': { level: 8, label: 'III-200' },
+                                  'III-300': { level: 9, label: 'III-300' }
+                                };
+
+                                // 重症度レベル
+                                const severityLevels = {
+                                  '軽度': { level: 1, label: '軽度' },
+                                  '中等度': { level: 2, label: '中等度' },
+                                  '重度': { level: 3, label: '重度' }
+                                };
+
                                 // 選択されたイベントでグループ化
                                 const groups = {};
                                 clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
                                   if (!groups[e.eventType]) {
-                                    groups[e.eventType] = { type: e.eventType, entries: [] };
+                                    groups[e.eventType] = { type: e.eventType, entries: [], inputType: e.inputType };
                                   }
                                   groups[e.eventType].entries.push(e);
                                 });
@@ -6290,10 +7878,21 @@ function PatientDetailView({ patient, onBack }) {
 
                                 return Object.values(groups).map((group, gIdx) => {
                                   const barStyle = eventBarColors[group.type] || { bg: '#F8F9FA', border: '#ADB5BD' };
-                                  const barHeight = 22;
+
+                                  // 頻度ベースのイベントかどうか判定
+                                  const isFrequencyBased = group.entries.some(e => e.frequency);
+                                  const isJCSBased = group.entries.some(e => e.jcs);
+                                  const isSeverityBased = group.entries.some(e => e.severity);
+                                  const hasLevels = isFrequencyBased || isJCSBased || isSeverityBased;
+
+                                  // レベルベースの表示の場合は高さを可変に
+                                  const maxBarHeight = hasLevels ? 50 : 22;
+                                  let maxLevel = 7; // デフォルト
+                                  if (isJCSBased) maxLevel = 9;
+                                  if (isSeverityBased) maxLevel = 3;
 
                                   return (
-                                    <div key={gIdx} style={{display: 'flex', alignItems: 'center', height: `${barHeight + 6}px`, marginBottom: '2px'}}>
+                                    <div key={gIdx} style={{display: 'flex', alignItems: hasLevels ? 'flex-end' : 'center', height: `${maxBarHeight + 12}px`, marginBottom: '4px'}}>
                                       <div style={{
                                         width: `${leftMargin}px`,
                                         flexShrink: 0,
@@ -6301,14 +7900,15 @@ function PatientDetailView({ patient, onBack }) {
                                         color: '#333',
                                         paddingRight: '8px',
                                         textAlign: 'right',
-                                        fontWeight: '500'
+                                        fontWeight: '500',
+                                        paddingBottom: hasLevels ? '4px' : '0'
                                       }}>
                                         {group.type}
                                       </div>
                                       <div style={{
                                         flex: 1,
                                         position: 'relative',
-                                        height: `${barHeight}px`
+                                        height: `${maxBarHeight}px`
                                       }}>
                                         {group.entries.map((entry, eIdx) => {
                                           const startDay = calcDaysFromOnset(entry.startDate);
@@ -6316,14 +7916,28 @@ function PatientDetailView({ patient, onBack }) {
                                           const leftPercent = ((startDay - minDay) / dayRange) * 100;
                                           const widthPercent = Math.max(((endDay - startDay) / dayRange) * 100, 2);
 
-                                          // 詳細テキスト
-                                          let detailText = '';
-                                          if (entry.jcs) detailText = entry.jcs;
-                                          else if (entry.frequency) {
-                                            const freqLabels = { hourly: '毎時', several_daily: '数回/日', daily: '毎日', several_weekly: '数回/週', weekly: '週1', monthly: '月1', rare: '稀' };
-                                            detailText = freqLabels[entry.frequency] || '';
+                                          // レベルとラベルを決定（色は症状ごとに固定）
+                                          let level = maxLevel; // デフォルトは最大
+                                          let labelText = '';
+
+                                          if (entry.frequency && frequencyLevels[entry.frequency]) {
+                                            const freq = frequencyLevels[entry.frequency];
+                                            level = freq.level;
+                                            labelText = freq.label;
+                                          } else if (entry.jcs && jcsLevels[entry.jcs]) {
+                                            const jcs = jcsLevels[entry.jcs];
+                                            level = jcs.level;
+                                            labelText = jcs.label;
+                                          } else if (entry.severity && severityLevels[entry.severity]) {
+                                            const sev = severityLevels[entry.severity];
+                                            level = sev.level;
+                                            labelText = sev.label;
                                           }
-                                          else if (entry.severity) detailText = entry.severity;
+
+                                          // 高さを計算（レベルベースの場合）
+                                          const barHeight = hasLevels
+                                            ? Math.max((level / maxLevel) * maxBarHeight, 12)
+                                            : maxBarHeight;
 
                                           return (
                                             <div
@@ -6332,22 +7946,24 @@ function PatientDetailView({ patient, onBack }) {
                                                 position: 'absolute',
                                                 left: `${leftPercent}%`,
                                                 width: `${widthPercent}%`,
-                                                height: '100%',
-                                                background: barStyle.bg,
-                                                border: `1px solid ${barStyle.border}`,
-                                                borderRadius: '2px',
+                                                height: `${barHeight}px`,
+                                                bottom: 0,
+                                                background: barStyle.border,
+                                                border: 'none',
+                                                borderRadius: '2px 2px 0 0',
                                                 display: 'flex',
                                                 alignItems: 'center',
                                                 justifyContent: 'center',
                                                 fontSize: '9px',
-                                                fontWeight: '500',
-                                                color: '#333',
+                                                fontWeight: '600',
+                                                color: '#fff',
                                                 overflow: 'hidden',
-                                                boxSizing: 'border-box'
+                                                boxSizing: 'border-box',
+                                                opacity: 0.85
                                               }}
-                                              title={`${group.type}: Day ${startDay}〜${endDay}${detailText ? ` (${detailText})` : ''}`}
+                                              title={`${group.type}: Day ${startDay}〜${endDay}${labelText ? ` (${labelText})` : ''}`}
                                             >
-                                              {widthPercent > 5 && detailText}
+                                              {widthPercent > 4 && barHeight > 14 && labelText}
                                             </div>
                                           );
                                         })}
@@ -6660,7 +8276,9 @@ function PatientDetailView({ patient, onBack }) {
                                 if (hasEvents) {
                                   const eGroups = {};
                                   clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => { eGroups[e.eventType] = true; });
-                                  totalHeight += Object.keys(eGroups).length * (barHeight + 8) + 20;
+                                  // 頻度/重症度ベースの場合はmaxEventBarHeight(50)を使用
+                                  const maxEventBarHeight = 50;
+                                  totalHeight += Object.keys(eGroups).length * (maxEventBarHeight + 15) + 20;
                                 }
                                 if (hasLabData) totalHeight += 250;
                                 totalHeight += 60;
@@ -6699,25 +8317,92 @@ function PatientDetailView({ patient, onBack }) {
                                   });
                                 }
 
-                                // 臨床経過タイムライン
+                                // 臨床経過タイムライン（頻度/重症度に応じたバー高さ）
                                 if (hasEvents) {
+                                  // レベル定義
+                                  const pngFrequencyLevels = {
+                                    'hourly': { level: 7, label: '毎時' },
+                                    'several_daily': { level: 6, label: '数回/日' },
+                                    'daily': { level: 5, label: '毎日' },
+                                    'several_weekly': { level: 4, label: '数回/週' },
+                                    'weekly': { level: 3, label: '週1' },
+                                    'monthly': { level: 2, label: '月1' },
+                                    'rare': { level: 1, label: '稀' }
+                                  };
+                                  const pngJcsLevels = {
+                                    '0': { level: 0, label: '清明' },
+                                    'I-1': { level: 1, label: 'I-1' },
+                                    'I-2': { level: 2, label: 'I-2' },
+                                    'I-3': { level: 3, label: 'I-3' },
+                                    'II-10': { level: 4, label: 'II-10' },
+                                    'II-20': { level: 5, label: 'II-20' },
+                                    'II-30': { level: 6, label: 'II-30' },
+                                    'III-100': { level: 7, label: 'III-100' },
+                                    'III-200': { level: 8, label: 'III-200' },
+                                    'III-300': { level: 9, label: 'III-300' }
+                                  };
+                                  const pngSeverityLevels = {
+                                    '軽症': { level: 1, label: '軽症' },
+                                    '軽度': { level: 1, label: '軽度' },
+                                    '中等症': { level: 2, label: '中等症' },
+                                    '中等度': { level: 2, label: '中等度' },
+                                    '重症': { level: 3, label: '重症' },
+                                    '重度': { level: 3, label: '重度' }
+                                  };
+
                                   const groups = {};
                                   clinicalEvents.filter(e => selectedEventsForChart.includes(e.eventType)).forEach(e => {
-                                    if (!groups[e.eventType]) groups[e.eventType] = { type: e.eventType, entries: [] };
+                                    if (!groups[e.eventType]) groups[e.eventType] = { type: e.eventType, entries: [], inputType: e.inputType };
                                     groups[e.eventType].entries.push(e);
                                   });
                                   Object.values(groups).forEach(group => {
                                     group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
                                     const color = eventPngColors[group.type] || '#6b7280';
-                                    svg += `<text x="${leftMargin - 8}" y="${yPos + barHeight/2 + 4}" text-anchor="end" font-size="10">${group.type}</text>`;
+
+                                    // 頻度/重症度ベースかどうか判定
+                                    const isFrequencyBased = group.entries.some(e => e.frequency);
+                                    const isJCSBased = group.entries.some(e => e.jcs);
+                                    const isSeverityBased = group.entries.some(e => e.severity);
+                                    const hasLevels = isFrequencyBased || isJCSBased || isSeverityBased;
+
+                                    const maxEventBarHeight = hasLevels ? 50 : 30;
+                                    let maxLevel = 7;
+                                    if (isJCSBased) maxLevel = 9;
+                                    if (isSeverityBased) maxLevel = 3;
+
+                                    svg += `<text x="${leftMargin - 8}" y="${yPos + maxEventBarHeight - 5}" text-anchor="end" font-size="10">${group.type}</text>`;
+                                    svg += `<line x1="${leftMargin}" y1="${yPos + maxEventBarHeight}" x2="${leftMargin + graphWidth}" y2="${yPos + maxEventBarHeight}" stroke="#d1d5db" stroke-width="1"/>`;
+
                                     group.entries.forEach(entry => {
                                       const startDay = calcDaysFromOnset(entry.startDate);
                                       const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
                                       const x = leftMargin + ((startDay - minDay) / dayRange) * graphWidth;
                                       const w = Math.max(((endDay - startDay) / dayRange) * graphWidth, 8);
-                                      svg += `<rect x="${x}" y="${yPos}" width="${w}" height="${barHeight}" fill="${color}" fill-opacity="0.3" stroke="${color}" stroke-width="1" rx="2"/>`;
+
+                                      // レベルとラベルを決定
+                                      let level = maxLevel;
+                                      let labelText = '';
+                                      if (entry.frequency && pngFrequencyLevels[entry.frequency]) {
+                                        level = pngFrequencyLevels[entry.frequency].level;
+                                        labelText = pngFrequencyLevels[entry.frequency].label;
+                                      } else if (entry.jcs && pngJcsLevels[entry.jcs]) {
+                                        level = pngJcsLevels[entry.jcs].level;
+                                        labelText = pngJcsLevels[entry.jcs].label;
+                                      } else if (entry.severity && pngSeverityLevels[entry.severity]) {
+                                        level = pngSeverityLevels[entry.severity].level;
+                                        labelText = pngSeverityLevels[entry.severity].label;
+                                      }
+
+                                      // 高さを計算
+                                      const h = hasLevels ? Math.max((level / maxLevel) * maxEventBarHeight, 12) : maxEventBarHeight;
+                                      const y = yPos + maxEventBarHeight - h;
+
+                                      svg += `<rect x="${x}" y="${y}" width="${w}" height="${h}" fill="${color}" rx="2"/>`;
+                                      if (w > 20 && h > 14 && labelText) {
+                                        svg += `<text x="${x + w/2}" y="${y + h/2 + 3}" text-anchor="middle" font-size="8" fill="white">${labelText}</text>`;
+                                      }
                                     });
-                                    yPos += barHeight + 8;
+                                    yPos += maxEventBarHeight + 15;
                                   });
                                 }
 
@@ -7556,106 +9241,158 @@ function PatientDetailView({ patient, onBack }) {
                       })}
                     </div>
 
-                    {/* 臨床症状セクション */}
+                    {/* 臨床症状セクション（同じ症状は横並び、頻度/重症度で高さが変化） */}
                     {clinicalEvents.length > 0 && (
                       <>
                         <div style={{fontSize: '13px', fontWeight: '600', color: '#374151', marginBottom: '8px', marginTop: '16px'}}>
                           臨床症状
                         </div>
                         <div style={{display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '20px'}}>
-                          {clinicalEvents.map((event, idx) => {
-                            const startDay = calcDaysFromOnset(event.startDate);
-                            const endDay = event.endDate ? calcDaysFromOnset(event.endDate) : startDay;
-                            const isSingleDay = startDay === endDay;
-                            const color = eventColors[event.eventType] || '#6b7280';
+                          {(() => {
+                            // 頻度レベル
+                            const frequencyLevels = {
+                              'hourly': { level: 7, label: '毎時' },
+                              'several_daily': { level: 6, label: '数回/日' },
+                              'daily': { level: 5, label: '毎日' },
+                              'several_weekly': { level: 4, label: '数回/週' },
+                              'weekly': { level: 3, label: '週1' },
+                              'monthly': { level: 2, label: '月1' },
+                              'rare': { level: 1, label: '稀' }
+                            };
+                            // JCSレベル
+                            const jcsLevels = {
+                              '0': { level: 0, label: '清明' },
+                              'I-1': { level: 1, label: 'I-1' },
+                              'I-2': { level: 2, label: 'I-2' },
+                              'I-3': { level: 3, label: 'I-3' },
+                              'II-10': { level: 4, label: 'II-10' },
+                              'II-20': { level: 5, label: 'II-20' },
+                              'II-30': { level: 6, label: 'II-30' },
+                              'III-100': { level: 7, label: 'III-100' },
+                              'III-200': { level: 8, label: 'III-200' },
+                              'III-300': { level: 9, label: 'III-300' }
+                            };
+                            // 重症度レベル
+                            const severityLevels = {
+                              '軽度': { level: 1, label: '軽度' },
+                              '中等度': { level: 2, label: '中等度' },
+                              '重度': { level: 3, label: '重度' }
+                            };
 
-                            const leftPercent = ((startDay - minDay) / dayRange) * 100;
-                            const widthPercent = isSingleDay ? 0 : ((endDay - startDay) / dayRange) * 100;
+                            // イベントタイプごとにグループ化
+                            const groups = {};
+                            clinicalEvents.forEach(e => {
+                              if (!groups[e.eventType]) {
+                                groups[e.eventType] = { type: e.eventType, entries: [] };
+                              }
+                              groups[e.eventType].entries.push(e);
+                            });
+                            Object.values(groups).forEach(g => g.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate)));
 
-                            // 症状の詳細表示
-                            let detailText = '';
-                            if (event.jcs) detailText = `JCS ${event.jcs}`;
-                            else if (event.frequency) {
-                              const freqLabels = {hourly: '毎時間', several_daily: '1日数回', daily: '毎日', several_weekly: '週数回', weekly: '週1回', monthly: '月1回', rare: '稀'};
-                              detailText = freqLabels[event.frequency] || event.frequency;
-                            }
-                            else if (event.presence) detailText = event.presence;
-                            else if (event.severity) detailText = event.severity;
+                            return Object.values(groups).map((group, gIdx) => {
+                              const color = eventColors[group.type] || '#6b7280';
 
-                            return (
-                              <div key={idx} style={{display: 'flex', alignItems: 'center', height: '26px'}}>
-                                <div style={{
-                                  width: '180px',
-                                  flexShrink: 0,
-                                  fontSize: '11px',
-                                  color: '#374151',
-                                  paddingRight: '12px',
-                                  textAlign: 'right',
-                                  display: 'flex',
-                                  alignItems: 'center',
-                                  justifyContent: 'flex-end',
-                                  gap: '6px'
-                                }}>
-                                  <span style={{
-                                    width: '8px',
-                                    height: '8px',
-                                    borderRadius: '50%',
-                                    background: color,
-                                    flexShrink: 0
-                                  }} />
-                                  <span style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
-                                    {event.eventType}
-                                  </span>
+                              // レベルベースかどうか判定
+                              const isFrequencyBased = group.entries.some(e => e.frequency);
+                              const isJCSBased = group.entries.some(e => e.jcs);
+                              const isSeverityBased = group.entries.some(e => e.severity);
+                              const hasLevels = isFrequencyBased || isJCSBased || isSeverityBased;
+
+                              const maxBarHeight = hasLevels ? 50 : 26;
+                              let maxLevel = 7;
+                              if (isJCSBased) maxLevel = 9;
+                              if (isSeverityBased) maxLevel = 3;
+
+                              return (
+                                <div key={gIdx} style={{display: 'flex', alignItems: hasLevels ? 'flex-end' : 'center', height: `${maxBarHeight + 8}px`}}>
+                                  <div style={{
+                                    width: '180px',
+                                    flexShrink: 0,
+                                    fontSize: '11px',
+                                    color: '#374151',
+                                    paddingRight: '12px',
+                                    textAlign: 'right',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'flex-end',
+                                    gap: '6px',
+                                    paddingBottom: hasLevels ? '4px' : '0'
+                                  }}>
+                                    <span style={{
+                                      width: '8px',
+                                      height: '8px',
+                                      borderRadius: '50%',
+                                      background: color,
+                                      flexShrink: 0
+                                    }} />
+                                    <span style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
+                                      {group.type}
+                                    </span>
+                                  </div>
+
+                                  <div style={{
+                                    flex: 1,
+                                    position: 'relative',
+                                    height: `${maxBarHeight}px`,
+                                    background: '#fafafa'
+                                  }}>
+                                    {group.entries.map((entry, eIdx) => {
+                                      const startDay = calcDaysFromOnset(entry.startDate);
+                                      const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
+                                      const leftPercent = ((startDay - minDay) / dayRange) * 100;
+                                      const widthPercent = Math.max(((endDay - startDay) / dayRange) * 100, 2);
+
+                                      // レベルとラベルを決定
+                                      let level = maxLevel;
+                                      let labelText = '';
+                                      if (entry.frequency && frequencyLevels[entry.frequency]) {
+                                        level = frequencyLevels[entry.frequency].level;
+                                        labelText = frequencyLevels[entry.frequency].label;
+                                      } else if (entry.jcs && jcsLevels[entry.jcs]) {
+                                        level = jcsLevels[entry.jcs].level;
+                                        labelText = jcsLevels[entry.jcs].label;
+                                      } else if (entry.severity && severityLevels[entry.severity]) {
+                                        level = severityLevels[entry.severity].level;
+                                        labelText = severityLevels[entry.severity].label;
+                                      } else if (entry.presence) {
+                                        labelText = entry.presence;
+                                      }
+
+                                      const barHeight = hasLevels
+                                        ? Math.max((level / maxLevel) * maxBarHeight, 14)
+                                        : maxBarHeight - 8;
+
+                                      return (
+                                        <div
+                                          key={eIdx}
+                                          style={{
+                                            position: 'absolute',
+                                            left: `${leftPercent}%`,
+                                            width: `${widthPercent}%`,
+                                            height: `${barHeight}px`,
+                                            bottom: 0,
+                                            background: color,
+                                            borderRadius: '2px 2px 0 0',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center',
+                                            opacity: 0.85
+                                          }}
+                                          title={`${group.type}: Day ${startDay}〜${endDay}${labelText ? ` (${labelText})` : ''}`}
+                                        >
+                                          {widthPercent > 4 && barHeight > 14 && labelText && (
+                                            <span style={{fontSize: '9px', color: 'white', fontWeight: '600'}}>
+                                              {labelText}
+                                            </span>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
                                 </div>
-
-                                <div style={{
-                                  flex: 1,
-                                  position: 'relative',
-                                  height: '100%',
-                                  background: '#fafafa'
-                                }}>
-                                  {isSingleDay ? (
-                                    <div
-                                      style={{
-                                        position: 'absolute',
-                                        left: `${leftPercent}%`,
-                                        top: '50%',
-                                        transform: 'translate(-50%, -50%)',
-                                        width: '10px',
-                                        height: '10px',
-                                        background: color,
-                                        borderRadius: '50%'
-                                      }}
-                                      title={`${event.eventType}: Day ${startDay}${detailText ? ` (${detailText})` : ''}`}
-                                    />
-                                  ) : (
-                                    <div
-                                      style={{
-                                        position: 'absolute',
-                                        left: `${leftPercent}%`,
-                                        width: `${Math.max(widthPercent, 0.5)}%`,
-                                        height: '18px',
-                                        top: '50%',
-                                        transform: 'translateY(-50%)',
-                                        background: `linear-gradient(90deg, ${color} 0%, ${color}88 100%)`,
-                                        borderRadius: '9px',
-                                        display: 'flex',
-                                        alignItems: 'center',
-                                        justifyContent: 'center'
-                                      }}
-                                      title={`${event.eventType}: Day ${startDay}〜${endDay}${detailText ? ` (${detailText})` : ''}`}
-                                    >
-                                      {detailText && widthPercent > 5 && (
-                                        <span style={{fontSize: '9px', color: 'white', fontWeight: '500'}}>
-                                          {detailText}
-                                        </span>
-                                      )}
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })}
+                              );
+                            });
+                          })()}
                         </div>
                       </>
                     )}
@@ -7964,17 +9701,40 @@ function PatientDetailView({ patient, onBack }) {
             <h2 style={styles.modalTitle}>Excelから検査データをインポート</h2>
 
             {!excelData ? (
-              <div style={styles.uploadArea}>
-                <label style={styles.uploadLabel}>
-                  <input
-                    type="file"
-                    accept=".xlsx,.xls"
-                    onChange={handleExcelUpload}
-                    style={{ display: 'none' }}
-                  />
-                  <div style={styles.uploadContent}>
-                    <span style={styles.uploadIcon}>📊</span>
-                    <span style={{fontWeight: '500', color: '#475569'}}>
+              <>
+                <div style={{marginBottom: '16px', textAlign: 'center'}}>
+                  <button
+                    onClick={downloadLabDataSample}
+                    style={{
+                      padding: '10px 16px',
+                      background: '#f0fdf4',
+                      color: '#047857',
+                      border: '1px solid #86efac',
+                      borderRadius: '8px',
+                      cursor: 'pointer',
+                      fontSize: '13px',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '6px'
+                    }}
+                  >
+                    <span>📄</span> サンプルExcelをダウンロード
+                  </button>
+                  <p style={{fontSize: '12px', color: '#6b7280', marginTop: '8px'}}>
+                    フォーマットを確認してからデータを作成できます
+                  </p>
+                </div>
+                <div style={styles.uploadArea}>
+                  <label style={styles.uploadLabel}>
+                    <input
+                      type="file"
+                      accept=".xlsx,.xls"
+                      onChange={handleExcelUpload}
+                      style={{ display: 'none' }}
+                    />
+                    <div style={styles.uploadContent}>
+                      <span style={styles.uploadIcon}>📊</span>
+                      <span style={{fontWeight: '500', color: '#475569'}}>
                       クリックしてExcelファイルを選択
                     </span>
                     <span style={styles.uploadHint}>
@@ -7983,6 +9743,7 @@ function PatientDetailView({ patient, onBack }) {
                   </div>
                 </label>
               </div>
+              </>
             ) : (
               <>
                 {/* シート選択 */}
