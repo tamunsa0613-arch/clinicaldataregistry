@@ -1352,6 +1352,11 @@ function PatientsListView({ onSelectPatient }) {
   const [bulkImportData, setBulkImportData] = useState([]);
   const [isBulkImporting, setIsBulkImporting] = useState(false);
 
+  // 検査データ一括インポート用state
+  const [showBulkLabImportModal, setShowBulkLabImportModal] = useState(false);
+  const [bulkLabImportData, setBulkLabImportData] = useState([]);
+  const [isBulkLabImporting, setIsBulkLabImporting] = useState(false);
+
   // Firestoreからリアルタイムでデータ取得
   useEffect(() => {
     if (!user) return;
@@ -1608,6 +1613,202 @@ function PatientsListView({ onSelectPatient }) {
     setShowBulkImportModal(false);
     setBulkImportData([]);
     setIsBulkImporting(false);
+  };
+
+  // ============================================
+  // 検査データ一括インポート機能
+  // ============================================
+
+  const handleBulkLabImportFile = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const data = new Uint8Array(event.target.result);
+        const workbook = XLSX.read(data, { type: 'array' });
+
+        const results = [];
+
+        // 各シートを処理
+        for (const sheetName of workbook.SheetNames) {
+          // 患者一覧シートや説明シートはスキップ
+          if (sheetName === '患者一覧' || sheetName === '説明' || sheetName.includes('縦持ち')) continue;
+
+          const sheet = workbook.Sheets[sheetName];
+          const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+
+          // シート名または患者IDセルから患者IDを取得
+          let patientId = sheetName;
+
+          // 1行目に「患者ID」がある場合、その値を使用
+          for (let i = 0; i < Math.min(5, jsonData.length); i++) {
+            const row = jsonData[i];
+            if (row && row[0] === '患者ID' && row[1]) {
+              patientId = row[1].toString();
+              break;
+            }
+          }
+
+          // 対応する患者を検索
+          const matchedPatient = patients.find(p =>
+            p.displayId === patientId ||
+            p.id === patientId ||
+            p.displayId?.includes(patientId) ||
+            patientId.includes(p.displayId || '')
+          );
+
+          // 検査データをパース
+          const labData = parseLabDataFromSheet(workbook, sheetName);
+
+          if (labData.length > 0) {
+            results.push({
+              sheetName,
+              patientId,
+              matchedPatient,
+              labData,
+              totalItems: labData.reduce((sum, d) => sum + d.data.length, 0)
+            });
+          }
+        }
+
+        setBulkLabImportData(results);
+      } catch (err) {
+        console.error('Error parsing file:', err);
+        alert('ファイルの読み込みに失敗しました');
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+
+  // シートから検査データをパースする共通関数
+  const parseLabDataFromSheet = (workbook, sheetName) => {
+    const sheet = workbook.Sheets[sheetName];
+    const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+
+    const specimenType = sheetName.includes('CSF') ? 'CSF' :
+                         sheetName.includes('Serum') ? 'Serum' : '';
+
+    let headerRowIndex = -1;
+    for (let i = 0; i < Math.min(15, jsonData.length); i++) {
+      const row = jsonData[i];
+      if (row && row[0] === '検査項目') {
+        headerRowIndex = i;
+        break;
+      }
+    }
+
+    if (headerRowIndex === -1) return [];
+
+    const headerRow = jsonData[headerRowIndex];
+
+    // 単位列を検出
+    let unitColumnIndex = 1;
+    for (let i = 1; i < Math.min(5, headerRow.length); i++) {
+      if (headerRow[i] && headerRow[i].toString().includes('単位')) {
+        unitColumnIndex = i;
+        break;
+      }
+    }
+
+    const dataStartIndex = unitColumnIndex + 1;
+
+    // 日付列を検出
+    const dateColumns = [];
+    for (let i = dataStartIndex; i < headerRow.length; i++) {
+      const headerValue = headerRow[i];
+      if (!headerValue) continue;
+
+      const headerStr = headerValue.toString();
+      let formattedDate = '';
+      let dayLabel = '';
+
+      const dateMatch = headerStr.match(/(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/);
+      if (dateMatch) {
+        formattedDate = dateMatch[1].replace(/\//g, '-');
+        const labelMatch = headerStr.split(/[\n\r]+/);
+        dayLabel = labelMatch.length > 1 ? labelMatch[1].trim() : formattedDate;
+      } else if (headerStr.startsWith('Day')) {
+        dayLabel = headerStr;
+        formattedDate = headerStr; // Day形式の場合は別途日付を取得する必要あり
+      }
+
+      if (formattedDate) {
+        dateColumns.push({ index: i, day: dayLabel, date: formattedDate });
+      }
+    }
+
+    // 検査データを抽出
+    const labDataByDate = {};
+
+    for (let i = headerRowIndex + 1; i < jsonData.length; i++) {
+      const row = jsonData[i];
+      if (!row || !row[0]) continue;
+
+      const itemName = row[0].toString().trim();
+      const unit = row[unitColumnIndex] ? row[unitColumnIndex].toString() : '';
+
+      if (itemName.startsWith('【') || itemName === '' || itemName === '検査項目') continue;
+
+      for (const col of dateColumns) {
+        const value = row[col.index];
+        const numValue = parseFloat(String(value).replace(/,/g, ''));
+        if (value !== undefined && value !== null && value !== '' && !isNaN(numValue)) {
+          if (!labDataByDate[col.date]) {
+            labDataByDate[col.date] = {
+              date: col.date,
+              day: col.day,
+              specimen: specimenType,
+              data: []
+            };
+          }
+          labDataByDate[col.date].data.push({ item: itemName, value: numValue, unit: unit });
+        }
+      }
+    }
+
+    return Object.values(labDataByDate).sort((a, b) => a.date.localeCompare(b.date));
+  };
+
+  const executeBulkLabImport = async () => {
+    if (bulkLabImportData.length === 0) return;
+
+    setIsBulkLabImporting(true);
+    let successCount = 0;
+    let totalItems = 0;
+
+    for (const sheetData of bulkLabImportData) {
+      if (!sheetData.matchedPatient) continue;
+
+      const patientRef = sheetData.matchedPatient;
+
+      for (const dayData of sheetData.labData) {
+        try {
+          await addDoc(
+            collection(db, 'users', user.uid, 'patients', patientRef.id, 'labResults'),
+            {
+              date: dayData.date,
+              specimen: dayData.specimen || '',
+              items: dayData.data.reduce((obj, item) => {
+                obj[item.item] = { value: item.value, unit: item.unit };
+                return obj;
+              }, {}),
+              createdAt: serverTimestamp()
+            }
+          );
+          totalItems += dayData.data.length;
+          successCount++;
+        } catch (err) {
+          console.error('Error importing lab data:', err);
+        }
+      }
+    }
+
+    alert(`${successCount}件の検査データ（${totalItems}項目）をインポートしました`);
+    setShowBulkLabImportModal(false);
+    setBulkLabImportData([]);
+    setIsBulkLabImporting(false);
   };
 
   // ============================================
@@ -2888,7 +3089,16 @@ function PatientsListView({ onSelectPatient }) {
               backgroundColor: '#f59e0b'
             }}
           >
-            📥 一括インポート
+            📥 患者一括登録
+          </button>
+          <button
+            onClick={() => setShowBulkLabImportModal(true)}
+            style={{
+              ...styles.addButton,
+              backgroundColor: '#8b5cf6'
+            }}
+          >
+            🔬 検査一括登録
           </button>
         </div>
 
@@ -3310,6 +3520,113 @@ function PatientsListView({ onSelectPatient }) {
                 }}
               >
                 {isBulkImporting ? 'インポート中...' : `${bulkImportData.length}件をインポート`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 検査データ一括インポートモーダル */}
+      {showBulkLabImportModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '900px', maxHeight: '90vh', overflow: 'auto'}}>
+            <h2 style={styles.modalTitle}>検査データ一括インポート</h2>
+
+            <div style={{marginBottom: '20px'}}>
+              <p style={{fontSize: '13px', color: '#6b7280', marginBottom: '12px'}}>
+                Excelファイルから複数患者の検査データを一括登録できます。<br/>
+                各シート名が患者IDとマッチングされます。
+              </p>
+              <div style={{
+                background: '#f8fafc',
+                padding: '12px',
+                borderRadius: '8px',
+                fontSize: '12px'
+              }}>
+                <div><strong>対応形式:</strong></div>
+                <div>・各シート = 1患者（シート名またはセル内の患者IDで照合）</div>
+                <div>・「検査項目」「単位」列 + 日付列のフォーマット</div>
+                <div>・sample-clinical-data.xlsx のような形式に対応</div>
+              </div>
+            </div>
+
+            <div style={styles.inputGroup}>
+              <label style={styles.inputLabel}>Excelファイルを選択</label>
+              <input
+                type="file"
+                accept=".xlsx,.xls"
+                onChange={handleBulkLabImportFile}
+                style={{...styles.input, padding: '10px'}}
+              />
+            </div>
+
+            {bulkLabImportData.length > 0 && (
+              <div style={{marginTop: '20px'}}>
+                <p style={{fontWeight: '500', marginBottom: '12px'}}>
+                  検出されたシート（{bulkLabImportData.length}件）
+                </p>
+                <div style={{maxHeight: '400px', overflow: 'auto', border: '1px solid #e2e8f0', borderRadius: '8px'}}>
+                  <table style={{width: '100%', borderCollapse: 'collapse', fontSize: '12px'}}>
+                    <thead>
+                      <tr style={{background: '#f1f5f9', position: 'sticky', top: 0}}>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>シート名</th>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>患者ID</th>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>マッチ状況</th>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>日数</th>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>項目数</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {bulkLabImportData.map((row, idx) => (
+                        <tr key={idx} style={{background: idx % 2 === 0 ? 'white' : '#f8fafc'}}>
+                          <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>{row.sheetName}</td>
+                          <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>{row.patientId}</td>
+                          <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>
+                            {row.matchedPatient ? (
+                              <span style={{color: '#059669', fontWeight: '500'}}>
+                                ✓ {row.matchedPatient.displayId || row.matchedPatient.id}
+                              </span>
+                            ) : (
+                              <span style={{color: '#dc2626'}}>✗ 患者が見つかりません</span>
+                            )}
+                          </td>
+                          <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
+                            {row.labData.length}日分
+                          </td>
+                          <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
+                            {row.totalItems}項目
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+                <p style={{fontSize: '12px', color: '#6b7280', marginTop: '8px'}}>
+                  ✓マークの患者のみインポートされます。患者が見つからない場合は、先に患者を登録してください。
+                </p>
+              </div>
+            )}
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => {
+                  setShowBulkLabImportModal(false);
+                  setBulkLabImportData([]);
+                }}
+                style={styles.cancelButton}
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={executeBulkLabImport}
+                disabled={bulkLabImportData.filter(d => d.matchedPatient).length === 0 || isBulkLabImporting}
+                style={{
+                  ...styles.primaryButton,
+                  backgroundColor: '#8b5cf6',
+                  opacity: bulkLabImportData.filter(d => d.matchedPatient).length === 0 ? 0.5 : 1
+                }}
+              >
+                {isBulkLabImporting ? 'インポート中...' : `${bulkLabImportData.filter(d => d.matchedPatient).length}件をインポート`}
               </button>
             </div>
           </div>
@@ -5520,11 +5837,11 @@ function PatientDetailView({ patient, onBack }) {
     const specimenType = sheetName.includes('CSF') ? 'CSF' :
                          sheetName.includes('Serum') ? 'Serum' : '';
 
-    // ヘッダー行を探す（検査項目、単位、Day1...）
+    // ヘッダー行を探す（検査項目を含む行）
     let headerRowIndex = -1;
     let dateRowIndex = -1;
 
-    for (let i = 0; i < Math.min(10, jsonData.length); i++) {
+    for (let i = 0; i < Math.min(15, jsonData.length); i++) {
       const row = jsonData[i];
       if (row && row[0] === '検査項目') {
         headerRowIndex = i;
@@ -5541,17 +5858,35 @@ function PatientDetailView({ patient, onBack }) {
     }
 
     const headerRow = jsonData[headerRowIndex];
-    const dateRow = jsonData[dateRowIndex];
+    const dateRow = dateRowIndex !== -1 ? jsonData[dateRowIndex] : null;
 
-    // 日付列のインデックスを取得（Day1, Day3, Day7...）
+    // 単位列のインデックスを検出（「単位」が含まれる列を探す）
+    let unitColumnIndex = 1;
+    for (let i = 1; i < Math.min(5, headerRow.length); i++) {
+      if (headerRow[i] && headerRow[i].toString().includes('単位')) {
+        unitColumnIndex = i;
+        break;
+      }
+    }
+
+    // データ列の開始インデックス（単位列の次から）
+    const dataStartIndex = unitColumnIndex + 1;
+
+    // 日付列のインデックスを取得
     const dateColumns = [];
-    for (let i = 2; i < headerRow.length; i++) {
-      if (headerRow[i] && headerRow[i].toString().startsWith('Day')) {
-        const dateValue = dateRow ? dateRow[i] : null;
-        let formattedDate = '';
+    for (let i = dataStartIndex; i < headerRow.length; i++) {
+      const headerValue = headerRow[i];
+      if (!headerValue) continue;
 
-        if (dateValue) {
-          // Excelの日付をパース
+      const headerStr = headerValue.toString();
+      let formattedDate = '';
+      let dayLabel = '';
+
+      // パターン1: Day1, Day2 形式（従来形式）
+      if (headerStr.startsWith('Day')) {
+        dayLabel = headerStr;
+        if (dateRow && dateRow[i]) {
+          const dateValue = dateRow[i];
           if (typeof dateValue === 'number') {
             const date = XLSX.SSF.parse_date_code(dateValue);
             formattedDate = `${date.y}-${String(date.m).padStart(2,'0')}-${String(date.d).padStart(2,'0')}`;
@@ -5559,14 +5894,29 @@ function PatientDetailView({ patient, onBack }) {
             formattedDate = dateValue.toString().replace(/\//g, '-');
           }
         }
+      }
+      // パターン2: ヘッダーに日付が直接含まれている形式（例: "2025-06-15\n初診時"）
+      else {
+        // 日付パターンを抽出（YYYY-MM-DD または YYYY/MM/DD）
+        const dateMatch = headerStr.match(/(\d{4}[-\/]\d{1,2}[-\/]\d{1,2})/);
+        if (dateMatch) {
+          formattedDate = dateMatch[1].replace(/\//g, '-');
+          // 改行以降のテキストをラベルとして使用
+          const labelMatch = headerStr.split(/[\n\r]+/);
+          dayLabel = labelMatch.length > 1 ? labelMatch[1].trim() : formattedDate;
+        }
+      }
 
+      if (formattedDate) {
         dateColumns.push({
           index: i,
-          day: headerRow[i],
+          day: dayLabel,
           date: formattedDate
         });
       }
     }
+
+    console.log('Detected date columns:', dateColumns);
 
     // 検査データを抽出
     const labDataByDate = {};
@@ -5576,14 +5926,16 @@ function PatientDetailView({ patient, onBack }) {
       if (!row || !row[0]) continue;
 
       const itemName = row[0].toString().trim();
-      const unit = row[1] ? row[1].toString() : '';
+      const unit = row[unitColumnIndex] ? row[unitColumnIndex].toString() : '';
 
-      // セクションヘッダーをスキップ
-      if (itemName.startsWith('【') || itemName === '') continue;
+      // セクションヘッダーや空行をスキップ
+      if (itemName.startsWith('【') || itemName === '' || itemName === '検査項目') continue;
 
       for (const col of dateColumns) {
         const value = row[col.index];
-        if (value !== undefined && value !== null && value !== '' && !isNaN(parseFloat(value))) {
+        // 数値として解析可能かチェック（文字列の数値も含む）
+        const numValue = parseFloat(String(value).replace(/,/g, ''));
+        if (value !== undefined && value !== null && value !== '' && !isNaN(numValue)) {
           if (!labDataByDate[col.date]) {
             labDataByDate[col.date] = {
               date: col.date,
@@ -5595,7 +5947,7 @@ function PatientDetailView({ patient, onBack }) {
 
           labDataByDate[col.date].data.push({
             item: itemName,
-            value: parseFloat(value),
+            value: numValue,
             unit: unit
           });
         }
