@@ -4611,6 +4611,16 @@ function PatientDetailView({ patient, onBack }) {
     '髄膜刺激症状': { inputType: 'presence', label: '有無' },
     '人工呼吸器管理': { inputType: 'presence', label: '有無' },
     'ICU入室': { inputType: 'presence', label: '有無' },
+    // 内分泌関連
+    '低ナトリウム血症': { inputType: 'severity', label: '重症度' },
+    '高ナトリウム血症': { inputType: 'severity', label: '重症度' },
+    'SIADH': { inputType: 'presence', label: '有無' },
+    '尿崩症': { inputType: 'presence', label: '有無' },
+    '高血糖': { inputType: 'severity', label: '重症度' },
+    '低血糖': { inputType: 'severity', label: '重症度' },
+    '甲状腺機能低下': { inputType: 'presence', label: '有無' },
+    '甲状腺機能亢進': { inputType: 'presence', label: '有無' },
+    '副腎不全': { inputType: 'presence', label: '有無' },
     'その他': { inputType: 'custom', label: '' }
   };
 
@@ -4773,6 +4783,43 @@ function PatientDetailView({ patient, onBack }) {
         'その他'
       ],
       defaultUnit: 'mL/日'
+    },
+    'ホルモン補充療法': {
+      medications: [
+        'レボチロキシン（チラーヂン）',
+        'リオチロニン（チロナミン）',
+        'ヒドロコルチゾン（コートリル）',
+        'デスモプレシン（ミニリンメルト）',
+        'フルドロコルチゾン（フロリネフ）',
+        'その他'
+      ],
+      defaultUnit: 'μg/日'
+    },
+    '糖尿病治療薬': {
+      medications: [
+        'インスリン（速効型）',
+        'インスリン（持効型）',
+        'インスリン（混合型）',
+        'メトホルミン',
+        'DPP-4阻害薬',
+        'SGLT2阻害薬',
+        'GLP-1受容体作動薬',
+        'その他'
+      ],
+      defaultUnit: '単位/日'
+    },
+    '電解質補正': {
+      medications: [
+        '塩化ナトリウム（生理食塩水）',
+        '高張食塩水（3%NaCl）',
+        '塩化カリウム',
+        'リン酸製剤',
+        'カルシウム製剤',
+        '水分制限',
+        'トルバプタン（サムスカ）',
+        'その他'
+      ],
+      defaultUnit: 'mEq/日'
     },
     'その他': {
       medications: [],
