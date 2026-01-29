@@ -5746,6 +5746,11 @@ function PatientDetailView({ patient, onBack }) {
     '回',
     '単位/日',
     'μg/日',
+    'μg/kg/min',
+    'γ（μg/kg/min）',
+    'mg/時',
+    'mL/時',
+    '単位/時',
     'その他'
   ];
 
