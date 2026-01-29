@@ -3337,6 +3337,20 @@ function PatientsListView({ onSelectPatient }) {
         </div>
         <div style={styles.headerRight}>
           <span style={styles.userInfo}>{user?.email}</span>
+          <a
+            href="/manual.html"
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              ...styles.logoutButton,
+              backgroundColor: '#0ea5e9',
+              marginRight: '8px',
+              textDecoration: 'none',
+              display: 'inline-block'
+            }}
+          >
+            📖 操作ガイド
+          </a>
           {(isAdmin || !adminEmail) && (
             <button
               onClick={() => setShowAdminPanel(true)}
