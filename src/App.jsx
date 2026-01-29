@@ -3886,7 +3886,7 @@ function PatientsListView({ onSelectPatient }) {
                       <tr style={{background: '#f1f5f9', position: 'sticky', top: 0}}>
                         <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>シート名</th>
                         <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>患者ID</th>
-                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>マッチ状況</th>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>対象患者</th>
                         <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>日数</th>
                         <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>項目数</th>
                       </tr>
@@ -3897,13 +3897,30 @@ function PatientsListView({ onSelectPatient }) {
                           <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>{row.sheetName}</td>
                           <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>{row.patientId}</td>
                           <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>
-                            {row.matchedPatient ? (
-                              <span style={{color: '#059669', fontWeight: '500'}}>
-                                ✓ {row.matchedPatient.displayId || row.matchedPatient.id}
-                              </span>
-                            ) : (
-                              <span style={{color: '#dc2626'}}>✗ 未マッチ</span>
-                            )}
+                            <select
+                              value={row.matchedPatient?.id || ''}
+                              onChange={(e) => {
+                                const selectedPatient = patients.find(p => p.id === e.target.value);
+                                setBulkLabImportData(prev => prev.map((item, i) =>
+                                  i === idx ? {...item, matchedPatient: selectedPatient} : item
+                                ));
+                              }}
+                              style={{
+                                padding: '6px 10px',
+                                borderRadius: '6px',
+                                border: row.matchedPatient ? '1px solid #10b981' : '1px solid #f87171',
+                                background: row.matchedPatient ? '#f0fdf4' : '#fef2f2',
+                                fontSize: '12px',
+                                minWidth: '150px'
+                              }}
+                            >
+                              <option value="">-- 患者を選択 --</option>
+                              {patients.map(p => (
+                                <option key={p.id} value={p.id}>
+                                  {p.displayId} - {p.diagnosis}
+                                </option>
+                              ))}
+                            </select>
                           </td>
                           <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
                             {row.labData.length}日分
@@ -3929,7 +3946,7 @@ function PatientsListView({ onSelectPatient }) {
                     <thead>
                       <tr style={{background: '#f5f3ff', position: 'sticky', top: 0}}>
                         <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>患者ID</th>
-                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>マッチ状況</th>
+                        <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>対象患者</th>
                         <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>イベント種類</th>
                         <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>データ数</th>
                       </tr>
@@ -3939,13 +3956,30 @@ function PatientsListView({ onSelectPatient }) {
                         <tr key={idx} style={{background: idx % 2 === 0 ? 'white' : '#faf5ff'}}>
                           <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>{row.patientId}</td>
                           <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>
-                            {row.matchedPatient ? (
-                              <span style={{color: '#059669', fontWeight: '500'}}>
-                                ✓ {row.matchedPatient.displayId || row.matchedPatient.id}
-                              </span>
-                            ) : (
-                              <span style={{color: '#dc2626'}}>✗ 未マッチ</span>
-                            )}
+                            <select
+                              value={row.matchedPatient?.id || ''}
+                              onChange={(e) => {
+                                const selectedPatient = patients.find(p => p.id === e.target.value);
+                                setBulkClinicalEventData(prev => prev.map((item, i) =>
+                                  i === idx ? {...item, matchedPatient: selectedPatient} : item
+                                ));
+                              }}
+                              style={{
+                                padding: '6px 10px',
+                                borderRadius: '6px',
+                                border: row.matchedPatient ? '1px solid #10b981' : '1px solid #f87171',
+                                background: row.matchedPatient ? '#f0fdf4' : '#fef2f2',
+                                fontSize: '12px',
+                                minWidth: '150px'
+                              }}
+                            >
+                              <option value="">-- 患者を選択 --</option>
+                              {patients.map(p => (
+                                <option key={p.id} value={p.id}>
+                                  {p.displayId} - {p.diagnosis}
+                                </option>
+                              ))}
+                            </select>
                           </td>
                           <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0'}}>{row.eventType}</td>
                           <td style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
