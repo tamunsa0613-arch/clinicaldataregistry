@@ -5713,7 +5713,6 @@ function PatientDetailView({ patient, onBack }) {
         'エプレレノン（セララ）',
         'ドキサゾシン（カルデナリン）',
         'ヒドララジン',
-        'ミノキシジル',
         'その他'
       ],
       defaultUnit: 'mg/日',
