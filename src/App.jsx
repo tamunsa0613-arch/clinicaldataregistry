@@ -1638,10 +1638,16 @@ function PatientsListView({ onSelectPatient }) {
           // スキップするシート
           if (sheetName === '患者一覧' || sheetName === '説明' || sheetName === '患者情報' ||
               sheetName.includes('縦持ち') || sheetName.includes('サマリー') ||
-              sheetName === '治療データ' || sheetName === '治療') continue;
+              sheetName === '治療データ' || sheetName === '治療') {
+            continue;
+          }
 
+          // 検査データシートを明示的に検出（優先処理）
+          if (sheetName === '検査データ' || sheetName.includes('検査') || sheetName.includes('Lab')) {
+            // 検査データとして処理（後続の処理に任せる）
+          }
           // 臨床経過データシート（発作頻度推移、臨床イベントなど）を検出
-          if (sheetName.includes('発作') || sheetName.includes('頻度') || sheetName.includes('推移') ||
+          else if (sheetName.includes('発作') || sheetName.includes('頻度') || sheetName.includes('推移') ||
               sheetName.includes('経過') || sheetName.includes('イベント') || sheetName.includes('臨床')) {
             const eventData = parseClinicalEventSheet(workbook, sheetName);
             if (eventData.length > 0) {
