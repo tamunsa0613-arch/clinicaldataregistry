@@ -5341,6 +5341,7 @@ function PatientDetailView({ patient, onBack }) {
   const [showAddTreatmentModal, setShowAddTreatmentModal] = useState(false);
   const [lastUsedTreatmentDate, setLastUsedTreatmentDate] = useState('');
   const [newTreatment, setNewTreatment] = useState({
+    parentCategory: '',
     category: '',
     medicationName: '',
     customMedication: '',
@@ -5377,7 +5378,18 @@ function PatientDetailView({ patient, onBack }) {
   const overlayChartRef = useRef(null);
 
   // 治療薬カテゴリと薬剤リスト
+  // 治療薬の親カテゴリ（領域別）
+  const treatmentParentCategories = {
+    '神経系': ['抗てんかん薬', 'ステロイド', '免疫グロブリン', '血漿交換', '免疫抑制剤', '抗浮腫薬', 'ミトコンドリア治療', '栄養・微量元素補充'],
+    '感染症': ['抗菌薬（ペニシリン系）', '抗菌薬（セフェム系）', '抗菌薬（カルバペネム系）', '抗菌薬（その他）', '抗ウイルス薬', '抗真菌薬'],
+    'ICU/急性期': ['昇圧薬・強心薬', '鎮静薬・鎮痛薬', '筋弛緩薬', '血液製剤', '抗凝固薬'],
+    '腎臓': ['透析関連', '利尿薬', '腎性貧血治療薬'],
+    '内分泌': ['ホルモン補充療法', '糖尿病治療薬', '電解質補正'],
+    'その他': ['その他']
+  };
+
   const treatmentCategories = {
+    // === 神経系 ===
     '抗てんかん薬': {
       medications: [
         'バルプロ酸（デパケン）',
@@ -5397,7 +5409,8 @@ function PatientDetailView({ patient, onBack }) {
         'ロラゼパム（ワイパックス）',
         'その他'
       ],
-      defaultUnit: 'mg/日'
+      defaultUnit: 'mg/日',
+      parent: '神経系'
     },
     'ステロイド': {
       medications: [
@@ -5408,14 +5421,16 @@ function PatientDetailView({ patient, onBack }) {
         'ヒドロコルチゾン（ソルコーテフ）',
         'その他'
       ],
-      defaultUnit: 'mg/日'
+      defaultUnit: 'mg/日',
+      parent: '神経系'
     },
     '免疫グロブリン': {
       medications: [
         'IVIG（大量免疫グロブリン療法）',
         'その他'
       ],
-      defaultUnit: 'mg/kg/日'
+      defaultUnit: 'mg/kg/日',
+      parent: '神経系'
     },
     '血漿交換': {
       medications: [
@@ -5425,7 +5440,8 @@ function PatientDetailView({ patient, onBack }) {
         'その他'
       ],
       defaultUnit: '回',
-      noDosage: true  // 用量なし（回数のみ）
+      noDosage: true,
+      parent: '神経系'
     },
     '免疫抑制剤': {
       medications: [
@@ -5437,26 +5453,8 @@ function PatientDetailView({ patient, onBack }) {
         'リツキシマブ（リツキサン）',
         'その他'
       ],
-      defaultUnit: 'mg/日'
-    },
-    '抗ウイルス薬': {
-      medications: [
-        'アシクロビル（ゾビラックス）',
-        'ガンシクロビル',
-        'バラシクロビル（バルトレックス）',
-        'その他'
-      ],
-      defaultUnit: 'mg/日'
-    },
-    '抗菌薬': {
-      medications: [
-        'セフトリアキソン（ロセフィン）',
-        'メロペネム（メロペン）',
-        'バンコマイシン',
-        'アンピシリン',
-        'その他'
-      ],
-      defaultUnit: 'g/日'
+      defaultUnit: 'mg/日',
+      parent: '神経系'
     },
     '抗浮腫薬': {
       medications: [
@@ -5465,8 +5463,226 @@ function PatientDetailView({ patient, onBack }) {
         '高張食塩水',
         'その他'
       ],
-      defaultUnit: 'mL/日'
+      defaultUnit: 'mL/日',
+      parent: '神経系'
     },
+    'ミトコンドリア治療': {
+      medications: [
+        'ビタミンB1（チアミン）',
+        'ビタミンB2（リボフラビン）',
+        'ビタミンB12（コバラミン）',
+        'ビタミンC（アスコルビン酸）',
+        'ビタミンE（トコフェロール）',
+        'コエンザイムQ10（ユビキノン）',
+        'L-カルニチン（エルカルチン）',
+        'L-アルギニン',
+        'ビオチン',
+        'αリポ酸',
+        'ビタミンカクテル療法',
+        'その他'
+      ],
+      defaultUnit: 'mg/日',
+      parent: '神経系'
+    },
+    '栄養・微量元素補充': {
+      medications: [
+        '亜鉛製剤（ノベルジン/プロマック）',
+        '銅製剤',
+        'セレン製剤',
+        '鉄剤（フェロミア等）',
+        'カルニチン（エルカルチン）',
+        '葉酸',
+        'ビタミンD',
+        '経腸栄養剤',
+        '高カロリー輸液',
+        'その他'
+      ],
+      defaultUnit: 'mg/日',
+      parent: '神経系'
+    },
+    // === 感染症 ===
+    '抗菌薬（ペニシリン系）': {
+      medications: [
+        'アンピシリン（ビクシリン）',
+        'アモキシシリン（サワシリン）',
+        'ピペラシリン（ペントシリン）',
+        'ピペラシリン/タゾバクタム（ゾシン）',
+        'アンピシリン/スルバクタム（ユナシン）',
+        'アモキシシリン/クラブラン酸（オーグメンチン）',
+        'その他'
+      ],
+      defaultUnit: 'g/日',
+      parent: '感染症'
+    },
+    '抗菌薬（セフェム系）': {
+      medications: [
+        'セファゾリン（CEZ）',
+        'セフォタキシム（CTX）',
+        'セフトリアキソン（CTRX）',
+        'セフェピム（CFPM）',
+        'セフタジジム（CAZ）',
+        'セフメタゾール（CMZ）',
+        'その他'
+      ],
+      defaultUnit: 'g/日',
+      parent: '感染症'
+    },
+    '抗菌薬（カルバペネム系）': {
+      medications: [
+        'メロペネム（MEPM）',
+        'イミペネム/シラスタチン（IPM/CS）',
+        'ドリペネム（DRPM）',
+        'その他'
+      ],
+      defaultUnit: 'g/日',
+      parent: '感染症'
+    },
+    '抗菌薬（その他）': {
+      medications: [
+        'バンコマイシン（VCM）',
+        'テイコプラニン（TEIC）',
+        'リネゾリド（LZD）',
+        'ダプトマイシン（DAP）',
+        'レボフロキサシン（LVFX）',
+        'シプロフロキサシン（CPFX）',
+        'アジスロマイシン（AZM）',
+        'クリンダマイシン（CLDM）',
+        'メトロニダゾール（MNZ）',
+        'ST合剤（バクタ）',
+        'その他'
+      ],
+      defaultUnit: 'g/日',
+      parent: '感染症'
+    },
+    '抗ウイルス薬': {
+      medications: [
+        'アシクロビル（ゾビラックス）',
+        'バラシクロビル（バルトレックス）',
+        'ガンシクロビル',
+        'バルガンシクロビル（バリキサ）',
+        'オセルタミビル（タミフル）',
+        'ラニナミビル（イナビル）',
+        'レムデシビル（ベクルリー）',
+        'その他'
+      ],
+      defaultUnit: 'mg/日',
+      parent: '感染症'
+    },
+    '抗真菌薬': {
+      medications: [
+        'フルコナゾール（ジフルカン）',
+        'ボリコナゾール（ブイフェンド）',
+        'ミカファンギン（ファンガード）',
+        'アムホテリシンB（ファンギゾン）',
+        'リポソーマルアムホテリシンB（アムビゾーム）',
+        'カスポファンギン（カンサイダス）',
+        'その他'
+      ],
+      defaultUnit: 'mg/日',
+      parent: '感染症'
+    },
+    // === ICU/急性期 ===
+    '昇圧薬・強心薬': {
+      medications: [
+        'ノルアドレナリン（ノルアドリナリン）',
+        'アドレナリン',
+        'ドパミン（イノバン）',
+        'ドブタミン（ドブトレックス）',
+        'バソプレシン（ピトレシン）',
+        'ミルリノン（ミルリーラ）',
+        'その他'
+      ],
+      defaultUnit: 'μg/kg/min',
+      parent: 'ICU/急性期'
+    },
+    '鎮静薬・鎮痛薬': {
+      medications: [
+        'プロポフォール（ディプリバン）',
+        'ミダゾラム（ドルミカム）',
+        'デクスメデトミジン（プレセデックス）',
+        'フェンタニル',
+        'レミフェンタニル（アルチバ）',
+        'モルヒネ',
+        'ケタミン',
+        'その他'
+      ],
+      defaultUnit: 'mg/時',
+      parent: 'ICU/急性期'
+    },
+    '筋弛緩薬': {
+      medications: [
+        'ロクロニウム（エスラックス）',
+        'ベクロニウム（マスキュラックス）',
+        'スガマデクス（ブリディオン）',
+        'その他'
+      ],
+      defaultUnit: 'mg/時',
+      parent: 'ICU/急性期'
+    },
+    '血液製剤': {
+      medications: [
+        '赤血球濃厚液（RBC）',
+        '新鮮凍結血漿（FFP）',
+        '血小板濃厚液（PC）',
+        'アルブミン製剤',
+        'その他'
+      ],
+      defaultUnit: '単位',
+      parent: 'ICU/急性期'
+    },
+    '抗凝固薬': {
+      medications: [
+        'ヘパリン',
+        'ワルファリン（ワーファリン）',
+        'エドキサバン（リクシアナ）',
+        'アピキサバン（エリキュース）',
+        'リバーロキサバン（イグザレルト）',
+        'ダビガトラン（プラザキサ）',
+        'アルガトロバン（スロンノン）',
+        'その他'
+      ],
+      defaultUnit: '単位/時',
+      parent: 'ICU/急性期'
+    },
+    // === 腎臓 ===
+    '透析関連': {
+      medications: [
+        '血液透析（HD）',
+        '持続血液透析濾過（CHDF）',
+        '腹膜透析（PD）',
+        '血漿交換（腎）',
+        'その他'
+      ],
+      defaultUnit: '回/週',
+      noDosage: true,
+      parent: '腎臓'
+    },
+    '利尿薬': {
+      medications: [
+        'フロセミド（ラシックス）',
+        'アゾセミド（ダイアート）',
+        'トルバプタン（サムスカ）',
+        'スピロノラクトン（アルダクトン）',
+        'トリクロルメチアジド（フルイトラン）',
+        'カルペリチド（ハンプ）',
+        'その他'
+      ],
+      defaultUnit: 'mg/日',
+      parent: '腎臓'
+    },
+    '腎性貧血治療薬': {
+      medications: [
+        'ダルベポエチンα（ネスプ）',
+        'エポエチンβペゴル（ミルセラ）',
+        'ロキサデュスタット（エベレンゾ）',
+        'ダプロデュスタット（ダーブロック）',
+        '鉄剤（静注）',
+        'その他'
+      ],
+      defaultUnit: 'μg/回',
+      parent: '腎臓'
+    },
+    // === 内分泌 ===
     'ホルモン補充療法': {
       medications: [
         'レボチロキシン（チラーヂン）',
@@ -5476,7 +5692,8 @@ function PatientDetailView({ patient, onBack }) {
         'フルドロコルチゾン（フロリネフ）',
         'その他'
       ],
-      defaultUnit: 'μg/日'
+      defaultUnit: 'μg/日',
+      parent: '内分泌'
     },
     '糖尿病治療薬': {
       medications: [
@@ -5487,9 +5704,12 @@ function PatientDetailView({ patient, onBack }) {
         'DPP-4阻害薬',
         'SGLT2阻害薬',
         'GLP-1受容体作動薬',
+        'SU薬',
+        'チアゾリジン薬',
         'その他'
       ],
-      defaultUnit: '単位/日'
+      defaultUnit: '単位/日',
+      parent: '内分泌'
     },
     '電解質補正': {
       medications: [
@@ -5502,11 +5722,14 @@ function PatientDetailView({ patient, onBack }) {
         'トルバプタン（サムスカ）',
         'その他'
       ],
-      defaultUnit: 'mEq/日'
+      defaultUnit: 'mEq/日',
+      parent: '内分泌'
     },
+    // === その他 ===
     'その他': {
       medications: [],
-      defaultUnit: ''
+      defaultUnit: '',
+      parent: 'その他'
     }
   };
 
@@ -9802,29 +10025,56 @@ function PatientDetailView({ patient, onBack }) {
           <div style={{...styles.modal, maxWidth: '550px'}}>
             <h2 style={styles.modalTitle}>治療薬を追加</h2>
 
+            {/* 親カテゴリ（領域）選択 */}
             <div style={styles.inputGroup}>
-              <label style={styles.inputLabel}>カテゴリ *</label>
+              <label style={styles.inputLabel}>領域 *</label>
               <select
-                value={newTreatment.category}
+                value={newTreatment.parentCategory}
                 onChange={(e) => {
-                  const category = e.target.value;
-                  const defaultUnit = treatmentCategories[category]?.defaultUnit || '';
                   setNewTreatment({
                     ...newTreatment,
-                    category: category,
+                    parentCategory: e.target.value,
+                    category: '',
                     medicationName: '',
                     customMedication: '',
-                    dosageUnit: defaultUnit
+                    dosageUnit: ''
                   });
                 }}
                 style={{...styles.input, width: '100%'}}
               >
                 <option value="">選択してください</option>
-                {Object.keys(treatmentCategories).map(cat => (
-                  <option key={cat} value={cat}>{cat}</option>
+                {Object.keys(treatmentParentCategories).map(parent => (
+                  <option key={parent} value={parent}>{parent}</option>
                 ))}
               </select>
             </div>
+
+            {/* サブカテゴリ選択 */}
+            {newTreatment.parentCategory && (
+              <div style={{...styles.inputGroup, marginTop: '12px'}}>
+                <label style={styles.inputLabel}>カテゴリ *</label>
+                <select
+                  value={newTreatment.category}
+                  onChange={(e) => {
+                    const category = e.target.value;
+                    const defaultUnit = treatmentCategories[category]?.defaultUnit || '';
+                    setNewTreatment({
+                      ...newTreatment,
+                      category: category,
+                      medicationName: '',
+                      customMedication: '',
+                      dosageUnit: defaultUnit
+                    });
+                  }}
+                  style={{...styles.input, width: '100%'}}
+                >
+                  <option value="">選択してください</option>
+                  {treatmentParentCategories[newTreatment.parentCategory]?.map(cat => (
+                    <option key={cat} value={cat}>{cat}</option>
+                  ))}
+                </select>
+              </div>
+            )}
 
             {newTreatment.category && (
               <div style={{...styles.inputGroup, marginTop: '12px'}}>
