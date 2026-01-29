@@ -1635,11 +1635,14 @@ function PatientsListView({ onSelectPatient }) {
 
         // 各シートを処理
         for (const sheetName of workbook.SheetNames) {
-          // 患者一覧シートや説明シートはスキップ
-          if (sheetName === '患者一覧' || sheetName === '説明' || sheetName.includes('縦持ち') || sheetName.includes('サマリー')) continue;
+          // スキップするシート
+          if (sheetName === '患者一覧' || sheetName === '説明' || sheetName === '患者情報' ||
+              sheetName.includes('縦持ち') || sheetName.includes('サマリー') ||
+              sheetName === '治療データ' || sheetName === '治療') continue;
 
-          // 臨床経過データシート（発作頻度推移など）を検出
-          if (sheetName.includes('発作') || sheetName.includes('頻度') || sheetName.includes('推移') || sheetName.includes('経過')) {
+          // 臨床経過データシート（発作頻度推移、臨床イベントなど）を検出
+          if (sheetName.includes('発作') || sheetName.includes('頻度') || sheetName.includes('推移') ||
+              sheetName.includes('経過') || sheetName.includes('イベント') || sheetName.includes('臨床')) {
             const eventData = parseClinicalEventSheet(workbook, sheetName);
             if (eventData.length > 0) {
               clinicalEventResults.push(...eventData);
@@ -1703,6 +1706,31 @@ function PatientsListView({ onSelectPatient }) {
 
     const headerRow = jsonData[0];
     const results = [];
+
+    // シンプルフォーマット（日付, イベントタイプ, 詳細）の検出
+    if (headerRow[0] === '日付' && (headerRow[1] === 'イベントタイプ' || headerRow[1] === 'イベント種類')) {
+      // シンプルフォーマット: 各行が1つのイベント
+      const events = [];
+      for (let i = 1; i < jsonData.length; i++) {
+        const row = jsonData[i];
+        if (!row || !row[0]) continue;
+        events.push({
+          date: normalizeDate(row[0]),
+          eventType: row[1]?.toString() || 'その他',
+          detail: row[2]?.toString() || ''
+        });
+      }
+      if (events.length > 0) {
+        // このシートのイベントを1つのグループとして返す
+        results.push({
+          patientId: sheetName,
+          matchedPatient: null,
+          eventType: 'multiple',
+          events: events
+        });
+      }
+      return results;
+    }
 
     // ヘッダーから「症状」列のインデックスを検出
     let symptomColumnIndex = -1;
@@ -2007,50 +2035,65 @@ function PatientsListView({ onSelectPatient }) {
 
       for (const event of eventData.events) {
         try {
-          // 時間ラベルから日付を計算
-          let eventDate = new Date(onsetDate);
-          const label = event.timeLabel.toLowerCase();
+          let eventDate;
+          let eventType = event.eventType || 'その他';
+          let detail = event.detail || '';
 
-          if (label.includes('ベースライン') || label.includes('baseline')) {
-            // 発症日をそのまま使用
-          } else if (label.includes('ヶ月後') || label.includes('ヵ月後')) {
-            const months = parseInt(label.match(/(\d+)/)?.[1] || '0');
-            eventDate.setMonth(eventDate.getMonth() + months);
-          } else if (label.includes('週後')) {
-            const weeks = parseInt(label.match(/(\d+)/)?.[1] || '0');
-            eventDate.setDate(eventDate.getDate() + weeks * 7);
-          } else if (label.includes('日後')) {
-            const days = parseInt(label.match(/(\d+)/)?.[1] || '0');
-            eventDate.setDate(eventDate.getDate() + days);
+          // 新フォーマット（日付が直接指定されている場合）
+          if (event.date) {
+            eventDate = new Date(event.date);
+          } else if (event.timeLabel) {
+            // 旧フォーマット（時間ラベルから日付を計算）
+            eventDate = new Date(onsetDate);
+            const label = event.timeLabel.toLowerCase();
+
+            if (label.includes('ベースライン') || label.includes('baseline')) {
+              // 発症日をそのまま使用
+            } else if (label.includes('ヶ月後') || label.includes('ヵ月後')) {
+              const months = parseInt(label.match(/(\d+)/)?.[1] || '0');
+              eventDate.setMonth(eventDate.getMonth() + months);
+            } else if (label.includes('週後')) {
+              const weeks = parseInt(label.match(/(\d+)/)?.[1] || '0');
+              eventDate.setDate(eventDate.getDate() + weeks * 7);
+            } else if (label.includes('日後')) {
+              const days = parseInt(label.match(/(\d+)/)?.[1] || '0');
+              eventDate.setDate(eventDate.getDate() + days);
+            }
+            eventType = event.eventType || eventType;
+            detail = event.severity ? `重症度: ${event.severity}` : '';
+          } else {
+            continue; // 日付情報がない場合はスキップ
           }
 
           const dateStr = eventDate.toISOString().split('T')[0];
 
           // 重複チェック（同じ日付+同じイベントタイプは既に存在するかチェック）
-          const eventKey = `${dateStr}_${event.eventType}`;
+          const eventKey = `${dateStr}_${eventType}`;
           if (existingEvents.has(eventKey)) {
             eventSkipCount++;
             continue; // 重複はスキップ
           }
 
-          // 頻度値を適切な形式に変換
-          let frequency = 'several_daily';
-          const numValue = parseFloat(event.value);
-          if (!isNaN(numValue)) {
-            if (numValue >= 20) frequency = 'hourly';
-            else if (numValue >= 7) frequency = 'several_daily';
-            else if (numValue >= 3) frequency = 'daily';
-            else if (numValue >= 1) frequency = 'several_weekly';
-            else frequency = 'weekly';
+          // 頻度値を適切な形式に変換（旧フォーマットの場合のみ）
+          let frequency = 'once';
+          if (event.value) {
+            const numValue = parseFloat(event.value);
+            if (!isNaN(numValue)) {
+              if (numValue >= 20) frequency = 'hourly';
+              else if (numValue >= 7) frequency = 'several_daily';
+              else if (numValue >= 3) frequency = 'daily';
+              else if (numValue >= 1) frequency = 'several_weekly';
+              else frequency = 'weekly';
+            }
           }
 
           await addDoc(
             collection(db, 'users', user.uid, 'patients', patientRef.id, 'clinicalEvents'),
             {
-              eventType: event.eventType,
+              eventType: eventType,
               startDate: dateStr,
               frequency: frequency,
-              note: `${event.timeLabel}: ${event.value}回/週`,
+              note: detail || (event.timeLabel ? `${event.timeLabel}: ${event.value}回/週` : ''),
               createdAt: serverTimestamp()
             }
           );
