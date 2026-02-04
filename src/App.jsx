@@ -136,6 +136,223 @@ function useAuth() {
 }
 
 // ============================================================
+// 組織コンテキスト（マルチテナント対応）
+// ============================================================
+const OrganizationContext = createContext();
+
+function OrganizationProvider({ children }) {
+  const { user } = useAuth();
+  const [organizations, setOrganizations] = useState([]);
+  const [currentOrg, setCurrentOrg] = useState(null);
+  const [orgLoading, setOrgLoading] = useState(true);
+  const [isSystemAdmin, setIsSystemAdmin] = useState(false);
+
+  useEffect(() => {
+    if (!user) {
+      setOrganizations([]);
+      setCurrentOrg(null);
+      setOrgLoading(false);
+      return;
+    }
+
+    // システム管理者かどうかをチェック
+    const checkSystemAdmin = async () => {
+      try {
+        const sysAdminDoc = await getDoc(doc(db, 'config', 'systemAdmin'));
+        if (sysAdminDoc.exists()) {
+          const emails = sysAdminDoc.data().emails || [];
+          setIsSystemAdmin(emails.includes(user.email));
+        }
+      } catch (err) {
+        console.error('Error checking system admin:', err);
+      }
+    };
+    checkSystemAdmin();
+
+    // ユーザーの組織メンバーシップを監視
+    const q = query(
+      collection(db, 'organizationMembers'),
+      where('uid', '==', user.uid)
+    );
+
+    const unsubscribe = onSnapshot(q, async (snapshot) => {
+      try {
+        const memberships = snapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+
+        if (memberships.length === 0) {
+          // 組織に所属していない場合は旧システム（個人データ）を使用
+          setOrganizations([]);
+          setCurrentOrg(null);
+          setOrgLoading(false);
+          return;
+        }
+
+        // 各メンバーシップの組織詳細を取得
+        const orgsWithDetails = await Promise.all(
+          memberships.map(async (membership) => {
+            try {
+              const orgDoc = await getDoc(doc(db, 'organizations', membership.orgId));
+              if (orgDoc.exists()) {
+                return {
+                  id: membership.orgId,
+                  role: membership.role,
+                  ...orgDoc.data()
+                };
+              }
+              return null;
+            } catch (err) {
+              console.error('Error fetching org:', err);
+              return null;
+            }
+          })
+        );
+
+        const validOrgs = orgsWithDetails.filter(o => o !== null);
+        setOrganizations(validOrgs);
+
+        // デフォルト組織を設定
+        if (validOrgs.length > 0 && !currentOrg) {
+          try {
+            const userDoc = await getDoc(doc(db, 'users', user.uid));
+            const defaultOrgId = userDoc.exists() ? userDoc.data()?.defaultOrgId : null;
+            const defaultOrg = validOrgs.find(o => o.id === defaultOrgId);
+            setCurrentOrg(defaultOrg || validOrgs[0]);
+          } catch (err) {
+            setCurrentOrg(validOrgs[0]);
+          }
+        }
+
+        setOrgLoading(false);
+      } catch (err) {
+        console.error('Error loading organizations:', err);
+        setOrgLoading(false);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // 組織を切り替え
+  const switchOrganization = async (orgId) => {
+    const org = organizations.find(o => o.id === orgId);
+    if (org) {
+      setCurrentOrg(org);
+      // ユーザーのデフォルト組織を保存
+      try {
+        await setDoc(doc(db, 'users', user.uid), {
+          defaultOrgId: orgId,
+          email: user.email
+        }, { merge: true });
+      } catch (err) {
+        console.error('Error saving default org:', err);
+      }
+    }
+  };
+
+  // 新規組織を作成（システム管理者のみ）
+  const createOrganization = async (name, tier = 'paid', ownerEmail = null) => {
+    if (!isSystemAdmin) {
+      throw new Error('システム管理者のみが組織を作成できます');
+    }
+
+    const orgRef = await addDoc(collection(db, 'organizations'), {
+      name,
+      tier,
+      createdAt: serverTimestamp(),
+      createdBy: user.uid
+    });
+
+    // オーナーを設定（指定があれば）
+    if (ownerEmail) {
+      await addDoc(collection(db, 'organizationMembers'), {
+        orgId: orgRef.id,
+        email: ownerEmail.toLowerCase(),
+        uid: null, // ユーザーがログインした時に設定
+        role: 'owner',
+        joinedAt: serverTimestamp(),
+        invitedBy: user.uid
+      });
+    }
+
+    return orgRef.id;
+  };
+
+  // 組織にメンバーを追加
+  const addMemberToOrg = async (orgId, email, role = 'member') => {
+    const org = organizations.find(o => o.id === orgId);
+    if (!org || (org.role !== 'owner' && org.role !== 'admin' && !isSystemAdmin)) {
+      throw new Error('メンバーを追加する権限がありません');
+    }
+
+    // 重複チェック
+    const existingQuery = query(
+      collection(db, 'organizationMembers'),
+      where('orgId', '==', orgId),
+      where('email', '==', email.toLowerCase())
+    );
+    const existing = await getDocs(existingQuery);
+    if (!existing.empty) {
+      throw new Error('このメールアドレスは既に登録されています');
+    }
+
+    await addDoc(collection(db, 'organizationMembers'), {
+      orgId,
+      email: email.toLowerCase(),
+      uid: null,
+      role,
+      joinedAt: serverTimestamp(),
+      invitedBy: user.uid
+    });
+  };
+
+  // メンバーシップをUIDに紐付け（ログイン時に呼ばれる）
+  const linkMembershipToUid = async () => {
+    if (!user) return;
+
+    const q = query(
+      collection(db, 'organizationMembers'),
+      where('email', '==', user.email.toLowerCase()),
+      where('uid', '==', null)
+    );
+    const snapshot = await getDocs(q);
+
+    for (const docSnap of snapshot.docs) {
+      await updateDoc(doc(db, 'organizationMembers', docSnap.id), {
+        uid: user.uid
+      });
+    }
+  };
+
+  // ログイン時にメンバーシップをリンク
+  useEffect(() => {
+    if (user) {
+      linkMembershipToUid();
+    }
+  }, [user]);
+
+  return (
+    <OrganizationContext.Provider value={{
+      organizations,
+      currentOrg,
+      orgLoading,
+      isSystemAdmin,
+      switchOrganization,
+      createOrganization,
+      addMemberToOrg
+    }}>
+      {children}
+    </OrganizationContext.Provider>
+  );
+}
+
+function useOrganization() {
+  return useContext(OrganizationContext);
+}
+
+// ============================================================
 // OCR処理 - 個人情報フィルタリング付き
 // ============================================================
 
@@ -405,6 +622,47 @@ async function performOCR(imageFile, onProgress) {
       success: false,
       error: error.message,
       data: []
+    };
+  }
+}
+
+// ============================================================
+// サマリー画像解析（Cloud Vision + Claude API）
+// ============================================================
+async function processSummaryImage(imageFile, onProgress) {
+  try {
+    if (onProgress) onProgress(10);
+
+    // 画像をBase64に変換
+    const base64 = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64String = reader.result.split(',')[1];
+        resolve(base64String);
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(imageFile);
+    });
+
+    if (onProgress) onProgress(30);
+
+    // Cloud Functionsを呼び出し
+    const processSummary = httpsCallable(functions, 'processSummaryImage');
+
+    if (onProgress) onProgress(50);
+
+    const result = await processSummary({ imageBase64: base64 });
+
+    if (onProgress) onProgress(100);
+
+    console.log('Summary Processing Result:', result.data);
+
+    return result.data;
+  } catch (error) {
+    console.error('Summary Processing Error:', error);
+    return {
+      success: false,
+      error: error.message || 'サマリー解析に失敗しました'
     };
   }
 }
@@ -1300,6 +1558,7 @@ function LoginView() {
 // ============================================================
 function PatientsListView({ onSelectPatient }) {
   const { user, logout, isAdmin } = useAuth();
+  const { organizations, currentOrg, orgLoading, isSystemAdmin, switchOrganization, createOrganization, addMemberToOrg } = useOrganization();
   const [patients, setPatients] = useState([]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newPatient, setNewPatient] = useState({
@@ -1313,10 +1572,23 @@ function PatientsListView({ onSelectPatient }) {
   const [showExportModal, setShowExportModal] = useState(false);
   const [exportFormat, setExportFormat] = useState('long'); // 'long', 'wide', 'integrated'
 
+  // システム管理パネル用state
+  const [showSystemAdminPanel, setShowSystemAdminPanel] = useState(false);
+  const [newOrgName, setNewOrgName] = useState('');
+  const [newOrgTier, setNewOrgTier] = useState('paid');
+  const [newOrgOwnerEmail, setNewOrgOwnerEmail] = useState('');
+  const [allOrganizations, setAllOrganizations] = useState([]);
+  const [isCreatingOrg, setIsCreatingOrg] = useState(false);
+  const [bulkMemberInput, setBulkMemberInput] = useState('');
+  const [selectedOrgForMembers, setSelectedOrgForMembers] = useState('');
+  const [orgMembers, setOrgMembers] = useState([]);
+
   // 管理者パネル用state
   const [showAdminPanel, setShowAdminPanel] = useState(false);
   const [allowedEmails, setAllowedEmails] = useState([]);
   const [newAllowedEmail, setNewAllowedEmail] = useState('');
+  const [bulkEmailInput, setBulkEmailInput] = useState(''); // 一括登録用
+  const [isBulkAdding, setIsBulkAdding] = useState(false); // 一括登録中フラグ
   const [emailAllowlistEnabled, setEmailAllowlistEnabled] = useState(false);
   const [adminEmail, setAdminEmail] = useState('');
   const [isSettingAdmin, setIsSettingAdmin] = useState(false);
@@ -1482,6 +1754,65 @@ function PatientsListView({ onSelectPatient }) {
     } catch (err) {
       console.error('Error removing allowed email:', err);
       alert('削除に失敗しました');
+    }
+  };
+
+  // メールアドレス一括登録
+  const addBulkEmails = async () => {
+    if (!bulkEmailInput.trim()) {
+      alert('メールアドレスを入力してください');
+      return;
+    }
+
+    setIsBulkAdding(true);
+    try {
+      // 改行、カンマ、セミコロン、スペースで分割
+      const emails = bulkEmailInput
+        .split(/[\n,;\s]+/)
+        .map(e => e.toLowerCase().trim())
+        .filter(e => e && e.includes('@')); // 空文字と@なしを除外
+
+      if (emails.length === 0) {
+        alert('有効なメールアドレスが見つかりませんでした');
+        setIsBulkAdding(false);
+        return;
+      }
+
+      // 重複を除外（入力内での重複 & 既存リストとの重複）
+      const existingEmails = new Set(allowedEmails.map(e => e.email));
+      const uniqueNewEmails = [...new Set(emails)].filter(e => !existingEmails.has(e));
+
+      if (uniqueNewEmails.length === 0) {
+        alert('全てのメールアドレスは既に登録されています');
+        setIsBulkAdding(false);
+        return;
+      }
+
+      // Firestoreに一括追加
+      const newEntries = [];
+      for (const email of uniqueNewEmails) {
+        const docRef = await addDoc(collection(db, 'allowedEmails'), {
+          email: email,
+          addedAt: serverTimestamp(),
+          addedBy: user.email
+        });
+        newEntries.push({ id: docRef.id, email: email });
+      }
+
+      setAllowedEmails([...allowedEmails, ...newEntries]);
+      setBulkEmailInput('');
+
+      const skipped = emails.length - uniqueNewEmails.length;
+      let message = `${uniqueNewEmails.length}件のメールアドレスを登録しました`;
+      if (skipped > 0) {
+        message += `（${skipped}件は重複のためスキップ）`;
+      }
+      alert(message);
+    } catch (err) {
+      console.error('Error bulk adding emails:', err);
+      alert('一括登録に失敗しました: ' + err.message);
+    } finally {
+      setIsBulkAdding(false);
     }
   };
 
@@ -3383,6 +3714,44 @@ function PatientsListView({ onSelectPatient }) {
         <div style={styles.headerLeft}>
           <h1 style={styles.headerTitle}>患者一覧</h1>
           <span style={styles.headerBadge}>{patients.length} 件</span>
+          {/* 組織セレクター（複数組織所属時のみ表示） */}
+          {organizations.length > 1 && (
+            <select
+              value={currentOrg?.id || ''}
+              onChange={(e) => switchOrganization(e.target.value)}
+              style={{
+                marginLeft: '16px',
+                padding: '6px 12px',
+                borderRadius: '6px',
+                border: '1px solid #d1d5db',
+                fontSize: '13px',
+                backgroundColor: '#f0f9ff',
+                color: '#1e40af',
+                fontWeight: '500',
+                cursor: 'pointer'
+              }}
+            >
+              {organizations.map(org => (
+                <option key={org.id} value={org.id}>
+                  {org.name} {org.tier === 'free' ? '(無料)' : ''}
+                </option>
+              ))}
+            </select>
+          )}
+          {/* 単一組織の場合は名前のみ表示 */}
+          {organizations.length === 1 && currentOrg && (
+            <span style={{
+              marginLeft: '16px',
+              padding: '4px 10px',
+              borderRadius: '4px',
+              backgroundColor: '#dbeafe',
+              color: '#1e40af',
+              fontSize: '12px',
+              fontWeight: '500'
+            }}>
+              {currentOrg.name}
+            </span>
+          )}
         </div>
         <div style={styles.headerRight}>
           <span style={styles.userInfo}>{user?.email}</span>
@@ -3400,6 +3769,19 @@ function PatientsListView({ onSelectPatient }) {
           >
             📖 操作ガイド
           </a>
+          {/* システム管理ボタン（システム管理者のみ） */}
+          {isSystemAdmin && (
+            <button
+              onClick={() => setShowSystemAdminPanel(true)}
+              style={{
+                ...styles.logoutButton,
+                backgroundColor: '#dc2626',
+                marginRight: '8px'
+              }}
+            >
+              🔧 システム管理
+            </button>
+          )}
           {(isAdmin || !adminEmail) && (
             <button
               onClick={() => setShowAdminPanel(true)}
@@ -5235,6 +5617,53 @@ function PatientsListView({ onSelectPatient }) {
                   </button>
                 </div>
 
+                {/* 一括登録フォーム */}
+                <div style={{marginBottom: '16px', padding: '12px', background: '#f0f9ff', borderRadius: '6px', border: '1px solid #bae6fd'}}>
+                  <div style={{fontSize: '12px', fontWeight: '600', color: '#0369a1', marginBottom: '8px'}}>
+                    一括登録（コピー＆ペースト）
+                  </div>
+                  <textarea
+                    value={bulkEmailInput}
+                    onChange={(e) => setBulkEmailInput(e.target.value)}
+                    placeholder="1行に1メールアドレス、またはカンマ区切りで入力&#10;例:&#10;tanaka@hospital.ac.jp&#10;suzuki@hospital.ac.jp&#10;yamada@hospital.ac.jp"
+                    style={{
+                      width: '100%',
+                      minHeight: '100px',
+                      padding: '10px',
+                      border: '1px solid #d1d5db',
+                      borderRadius: '6px',
+                      fontSize: '13px',
+                      fontFamily: 'monospace',
+                      resize: 'vertical',
+                      boxSizing: 'border-box'
+                    }}
+                  />
+                  <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px'}}>
+                    <span style={{fontSize: '11px', color: '#6b7280'}}>
+                      改行・カンマ・セミコロンで区切り可能
+                    </span>
+                    <button
+                      onClick={addBulkEmails}
+                      disabled={isBulkAdding || !bulkEmailInput.trim()}
+                      style={{
+                        backgroundColor: isBulkAdding ? '#9ca3af' : '#0ea5e9',
+                        color: 'white',
+                        border: 'none',
+                        borderRadius: '6px',
+                        padding: '8px 16px',
+                        fontSize: '13px',
+                        fontWeight: '500',
+                        cursor: isBulkAdding ? 'wait' : 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: '6px'
+                      }}
+                    >
+                      {isBulkAdding ? '登録中...' : '一括登録'}
+                    </button>
+                  </div>
+                </div>
+
                 {/* 許可リスト一覧 */}
                 <div style={{
                   maxHeight: '200px',
@@ -5292,6 +5721,236 @@ function PatientsListView({ onSelectPatient }) {
           </div>
         </div>
       )}
+
+      {/* システム管理パネルモーダル */}
+      {showSystemAdminPanel && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '700px'}}>
+            <h2 style={styles.modalTitle}>🔧 システム管理</h2>
+            <p style={{fontSize: '12px', color: '#6b7280', marginBottom: '20px'}}>
+              組織の作成・管理を行います。システム管理者のみアクセス可能です。
+            </p>
+
+            {/* 新規組織作成 */}
+            <div style={{marginBottom: '24px', padding: '16px', background: '#fef3c7', borderRadius: '8px', border: '1px solid #f59e0b'}}>
+              <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '12px', color: '#92400e'}}>
+                新規組織作成
+              </h3>
+              <div style={{display: 'grid', gap: '12px'}}>
+                <div>
+                  <label style={{display: 'block', fontSize: '12px', color: '#6b7280', marginBottom: '4px'}}>
+                    組織名 <span style={{color: '#dc2626'}}>*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={newOrgName}
+                    onChange={(e) => setNewOrgName(e.target.value)}
+                    placeholder="例: 〇〇大学病院 小児科"
+                    style={{...styles.input, width: '100%'}}
+                  />
+                </div>
+                <div style={{display: 'flex', gap: '12px'}}>
+                  <div style={{flex: 1}}>
+                    <label style={{display: 'block', fontSize: '12px', color: '#6b7280', marginBottom: '4px'}}>
+                      プラン
+                    </label>
+                    <select
+                      value={newOrgTier}
+                      onChange={(e) => setNewOrgTier(e.target.value)}
+                      style={{...styles.input, width: '100%'}}
+                    >
+                      <option value="free">無料（医局用）</option>
+                      <option value="paid">有料</option>
+                    </select>
+                  </div>
+                  <div style={{flex: 2}}>
+                    <label style={{display: 'block', fontSize: '12px', color: '#6b7280', marginBottom: '4px'}}>
+                      オーナーのメールアドレス
+                    </label>
+                    <input
+                      type="email"
+                      value={newOrgOwnerEmail}
+                      onChange={(e) => setNewOrgOwnerEmail(e.target.value)}
+                      placeholder="owner@example.com"
+                      style={{...styles.input, width: '100%'}}
+                    />
+                  </div>
+                </div>
+                <button
+                  onClick={async () => {
+                    if (!newOrgName.trim()) {
+                      alert('組織名を入力してください');
+                      return;
+                    }
+                    setIsCreatingOrg(true);
+                    try {
+                      const orgId = await createOrganization(newOrgName.trim(), newOrgTier, newOrgOwnerEmail.trim() || null);
+                      alert(`組織「${newOrgName}」を作成しました (ID: ${orgId})`);
+                      setNewOrgName('');
+                      setNewOrgOwnerEmail('');
+                      setNewOrgTier('paid');
+                    } catch (err) {
+                      alert('エラー: ' + err.message);
+                    } finally {
+                      setIsCreatingOrg(false);
+                    }
+                  }}
+                  disabled={isCreatingOrg || !newOrgName.trim()}
+                  style={{
+                    ...styles.primaryButton,
+                    backgroundColor: isCreatingOrg ? '#9ca3af' : '#f59e0b',
+                    cursor: isCreatingOrg ? 'wait' : 'pointer'
+                  }}
+                >
+                  {isCreatingOrg ? '作成中...' : '組織を作成'}
+                </button>
+              </div>
+            </div>
+
+            {/* メンバー一括追加 */}
+            <div style={{marginBottom: '24px', padding: '16px', background: '#f0fdf4', borderRadius: '8px', border: '1px solid #22c55e'}}>
+              <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '12px', color: '#166534'}}>
+                メンバー一括追加
+              </h3>
+              <div style={{marginBottom: '12px'}}>
+                <label style={{display: 'block', fontSize: '12px', color: '#6b7280', marginBottom: '4px'}}>
+                  対象組織
+                </label>
+                <select
+                  value={selectedOrgForMembers}
+                  onChange={(e) => setSelectedOrgForMembers(e.target.value)}
+                  style={{...styles.input, width: '100%'}}
+                >
+                  <option value="">-- 組織を選択 --</option>
+                  {organizations.map(org => (
+                    <option key={org.id} value={org.id}>{org.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div style={{marginBottom: '12px'}}>
+                <label style={{display: 'block', fontSize: '12px', color: '#6b7280', marginBottom: '4px'}}>
+                  メールアドレス（1行に1つ、またはカンマ区切り）
+                </label>
+                <textarea
+                  value={bulkMemberInput}
+                  onChange={(e) => setBulkMemberInput(e.target.value)}
+                  placeholder={"user1@example.com\nuser2@example.com\nuser3@example.com"}
+                  style={{
+                    width: '100%',
+                    minHeight: '80px',
+                    padding: '10px',
+                    border: '1px solid #d1d5db',
+                    borderRadius: '6px',
+                    fontSize: '13px',
+                    fontFamily: 'monospace',
+                    resize: 'vertical',
+                    boxSizing: 'border-box'
+                  }}
+                />
+              </div>
+              <button
+                onClick={async () => {
+                  if (!selectedOrgForMembers) {
+                    alert('組織を選択してください');
+                    return;
+                  }
+                  if (!bulkMemberInput.trim()) {
+                    alert('メールアドレスを入力してください');
+                    return;
+                  }
+                  const emails = bulkMemberInput
+                    .split(/[\n,;\s]+/)
+                    .map(e => e.toLowerCase().trim())
+                    .filter(e => e && e.includes('@'));
+
+                  if (emails.length === 0) {
+                    alert('有効なメールアドレスが見つかりませんでした');
+                    return;
+                  }
+
+                  let added = 0;
+                  let skipped = 0;
+                  for (const email of emails) {
+                    try {
+                      await addMemberToOrg(selectedOrgForMembers, email, 'member');
+                      added++;
+                    } catch (err) {
+                      skipped++;
+                    }
+                  }
+                  alert(`${added}件追加しました${skipped > 0 ? ` (${skipped}件はスキップ)` : ''}`);
+                  setBulkMemberInput('');
+                }}
+                disabled={!selectedOrgForMembers || !bulkMemberInput.trim()}
+                style={{
+                  ...styles.primaryButton,
+                  backgroundColor: '#22c55e',
+                  cursor: (!selectedOrgForMembers || !bulkMemberInput.trim()) ? 'not-allowed' : 'pointer',
+                  opacity: (!selectedOrgForMembers || !bulkMemberInput.trim()) ? 0.5 : 1
+                }}
+              >
+                メンバーを追加
+              </button>
+            </div>
+
+            {/* 所属組織一覧 */}
+            <div style={{marginBottom: '24px', padding: '16px', background: '#f8fafc', borderRadius: '8px'}}>
+              <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '12px', color: '#374151'}}>
+                あなたが所属する組織
+              </h3>
+              {organizations.length === 0 ? (
+                <p style={{fontSize: '13px', color: '#6b7280'}}>所属する組織はありません</p>
+              ) : (
+                <div style={{display: 'grid', gap: '8px'}}>
+                  {organizations.map(org => (
+                    <div key={org.id} style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      padding: '10px 12px',
+                      background: 'white',
+                      borderRadius: '6px',
+                      border: '1px solid #e5e7eb'
+                    }}>
+                      <div>
+                        <span style={{fontWeight: '500', fontSize: '13px'}}>{org.name}</span>
+                        <span style={{
+                          marginLeft: '8px',
+                          padding: '2px 6px',
+                          borderRadius: '4px',
+                          fontSize: '11px',
+                          backgroundColor: org.tier === 'free' ? '#dbeafe' : '#fef3c7',
+                          color: org.tier === 'free' ? '#1e40af' : '#92400e'
+                        }}>
+                          {org.tier === 'free' ? '無料' : '有料'}
+                        </span>
+                      </div>
+                      <span style={{
+                        padding: '2px 8px',
+                        borderRadius: '4px',
+                        fontSize: '11px',
+                        backgroundColor: org.role === 'owner' ? '#fee2e2' : org.role === 'admin' ? '#fef3c7' : '#f3f4f6',
+                        color: org.role === 'owner' ? '#dc2626' : org.role === 'admin' ? '#92400e' : '#6b7280'
+                      }}>
+                        {org.role === 'owner' ? 'オーナー' : org.role === 'admin' ? '管理者' : 'メンバー'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => setShowSystemAdminPanel(false)}
+                style={styles.cancelButton}
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -5329,11 +5988,25 @@ function PatientDetailView({ patient, onBack }) {
   const [excelSheets, setExcelSheets] = useState([]);
   const [selectedSheet, setSelectedSheet] = useState('');
   const [parsedExcelData, setParsedExcelData] = useState([]);
+  const [parsedExcelTreatments, setParsedExcelTreatments] = useState([]);
+  const [parsedExcelEvents, setParsedExcelEvents] = useState([]);
+  const [isMultiSheetExcel, setIsMultiSheetExcel] = useState(false);
   const [isImporting, setIsImporting] = useState(false);
+  const [selectedLabIndices, setSelectedLabIndices] = useState([]);
+  const [selectedTreatmentIndices, setSelectedTreatmentIndices] = useState([]);
+  const [selectedEventIndices, setSelectedEventIndices] = useState([]);
+  const [isDraggingExcel, setIsDraggingExcel] = useState(false);
 
   // 既存検査データ編集用state
   const [editingLabId, setEditingLabId] = useState(null);
   const [editLabItem, setEditLabItem] = useState({ item: '', value: '', unit: '' });
+
+  // サマリー解析用state
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [summaryImage, setSummaryImage] = useState(null);
+  const [summaryProcessing, setSummaryProcessing] = useState(false);
+  const [summaryResult, setSummaryResult] = useState(null);
+  const [summaryError, setSummaryError] = useState('');
 
   // 臨床経過用state
   const [clinicalEvents, setClinicalEvents] = useState([]);
@@ -5377,6 +6050,19 @@ function PatientDetailView({ patient, onBack }) {
     '髄膜刺激症状': { inputType: 'presence', label: '有無' },
     '人工呼吸器管理': { inputType: 'presence', label: '有無' },
     'ICU入室': { inputType: 'presence', label: '有無' },
+    // 消化器・一般症状
+    '嘔吐': { inputType: 'severity', label: '重症度' },
+    '腹痛': { inputType: 'severity', label: '重症度' },
+    '下痢': { inputType: 'severity', label: '重症度' },
+    '食欲不振': { inputType: 'severity', label: '重症度' },
+    // 脱水・代謝関連
+    '口渇': { inputType: 'severity', label: '重症度' },
+    '多尿': { inputType: 'severity', label: '重症度' },
+    '脱水': { inputType: 'severity', label: '重症度' },
+    '体重減少': { inputType: 'severity', label: '重症度' },
+    // 呼吸器関連
+    '頻呼吸': { inputType: 'severity', label: '重症度' },
+    '呼吸困難': { inputType: 'severity', label: '重症度' },
     // 内分泌関連
     '低ナトリウム血症': { inputType: 'severity', label: '重症度' },
     '高ナトリウム血症': { inputType: 'severity', label: '重症度' },
@@ -5445,10 +6131,6 @@ function PatientDetailView({ patient, onBack }) {
     note: ''
   });
 
-  // プレゼン用統合タイムライン
-  const [showClinicalTimeline, setShowClinicalTimeline] = useState(false);
-  const timelineRef = useRef(null);
-
   // 経時データオーバーレイ用state
   const [showTimeSeriesOverlay, setShowTimeSeriesOverlay] = useState(false);
   const [selectedLabItemsForChart, setSelectedLabItemsForChart] = useState([]);
@@ -5458,6 +6140,8 @@ function PatientDetailView({ patient, onBack }) {
   const [selectedEventsForChart, setSelectedEventsForChart] = useState([]);
   const [timelinePosition, setTimelinePosition] = useState('below'); // 'above' or 'below'
   const [timelineDisplayMode, setTimelineDisplayMode] = useState('separate'); // 'separate' or 'overlay'
+  const [useDualAxis, setUseDualAxis] = useState(false); // 二軸表示
+  const [secondaryAxisItems, setSecondaryAxisItems] = useState([]); // 右軸に表示する項目
   const overlayChartRef = useRef(null);
 
   // 治療薬カテゴリと薬剤リスト
@@ -6536,10 +7220,158 @@ function PatientDetailView({ patient, onBack }) {
       const workbook = XLSX.read(data, { type: 'array' });
       setExcelData(workbook);
       setExcelSheets(workbook.SheetNames);
-      setSelectedSheet(workbook.SheetNames[0]);
-      parseExcelSheet(workbook, workbook.SheetNames[0]);
+
+      // マルチシート形式かどうか判定（検査データ、治療データ、臨床イベントシートがあるか）
+      const hasLabSheet = workbook.SheetNames.some(n => n.includes('検査'));
+      const hasTreatmentSheet = workbook.SheetNames.some(n => n.includes('治療'));
+      const hasEventSheet = workbook.SheetNames.some(n => n.includes('臨床') || n.includes('イベント'));
+
+      if (hasLabSheet && (hasTreatmentSheet || hasEventSheet)) {
+        // マルチシート形式：全シートを自動解析
+        setIsMultiSheetExcel(true);
+        parseAllExcelSheets(workbook);
+        setSelectedSheet('全シート');
+      } else {
+        // 従来形式：最初のシートのみ
+        setIsMultiSheetExcel(false);
+        setSelectedSheet(workbook.SheetNames[0]);
+        parseExcelSheet(workbook, workbook.SheetNames[0]);
+        setParsedExcelTreatments([]);
+        setParsedExcelEvents([]);
+      }
     };
     reader.readAsArrayBuffer(file);
+  };
+
+  // マルチシートExcelの全シート解析
+  const parseAllExcelSheets = (workbook) => {
+    // 検査データシートを解析
+    const labSheetName = workbook.SheetNames.find(n => n.includes('検査'));
+    if (labSheetName) {
+      parseExcelSheet(workbook, labSheetName);
+    } else {
+      setParsedExcelData([]);
+    }
+
+    // 治療データシートを解析
+    const treatmentSheetName = workbook.SheetNames.find(n => n.includes('治療'));
+    if (treatmentSheetName) {
+      parseTreatmentSheet(workbook, treatmentSheetName);
+    } else {
+      setParsedExcelTreatments([]);
+    }
+
+    // 臨床イベントシートを解析
+    const eventSheetName = workbook.SheetNames.find(n => n.includes('臨床') || n.includes('イベント'));
+    if (eventSheetName) {
+      parseEventSheet(workbook, eventSheetName);
+    } else {
+      setParsedExcelEvents([]);
+    }
+  };
+
+  // 治療データシートの解析
+  const parseTreatmentSheet = (workbook, sheetName) => {
+    const sheet = workbook.Sheets[sheetName];
+    const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+
+    if (jsonData.length < 2) {
+      setParsedExcelTreatments([]);
+      return;
+    }
+
+    const header = jsonData[0];
+    const treatments = [];
+
+    // ヘッダーから列インデックスを特定
+    const colIndex = {
+      startDate: header.findIndex(h => h && h.toString().includes('開始')),
+      endDate: header.findIndex(h => h && h.toString().includes('終了')),
+      category: header.findIndex(h => h && h.toString().includes('カテゴリ')),
+      medicationName: header.findIndex(h => h && (h.toString().includes('薬剤') || h.toString().includes('薬品'))),
+      dosage: header.findIndex(h => h && h.toString().includes('用量')),
+      dosageUnit: header.findIndex(h => h && h.toString().includes('単位'))
+    };
+
+    for (let i = 1; i < jsonData.length; i++) {
+      const row = jsonData[i];
+      if (!row || row.length === 0) continue;
+
+      const formatDate = (val) => {
+        if (!val) return '';
+        if (typeof val === 'number') {
+          const date = XLSX.SSF.parse_date_code(val);
+          return `${date.y}-${String(date.m).padStart(2,'0')}-${String(date.d).padStart(2,'0')}`;
+        }
+        return val.toString().replace(/\//g, '-');
+      };
+
+      const treatment = {
+        startDate: formatDate(row[colIndex.startDate]),
+        endDate: formatDate(row[colIndex.endDate]),
+        category: colIndex.category >= 0 ? (row[colIndex.category] || 'その他') : 'その他',
+        medicationName: colIndex.medicationName >= 0 ? row[colIndex.medicationName] : '',
+        dosage: colIndex.dosage >= 0 ? row[colIndex.dosage] : '',
+        dosageUnit: colIndex.dosageUnit >= 0 ? row[colIndex.dosageUnit] : ''
+      };
+
+      if (treatment.medicationName && treatment.startDate) {
+        treatments.push(treatment);
+      }
+    }
+
+    console.log('Parsed treatments:', treatments);
+    setParsedExcelTreatments(treatments);
+    setSelectedTreatmentIndices(treatments.map((_, i) => i));
+  };
+
+  // 臨床イベントシートの解析
+  const parseEventSheet = (workbook, sheetName) => {
+    const sheet = workbook.Sheets[sheetName];
+    const jsonData = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+
+    if (jsonData.length < 2) {
+      setParsedExcelEvents([]);
+      return;
+    }
+
+    const header = jsonData[0];
+    const events = [];
+
+    // ヘッダーから列インデックスを特定
+    const colIndex = {
+      date: header.findIndex(h => h && h.toString().includes('日付')),
+      eventType: header.findIndex(h => h && (h.toString().includes('イベント') || h.toString().includes('タイプ') || h.toString().includes('種類'))),
+      note: header.findIndex(h => h && (h.toString().includes('詳細') || h.toString().includes('備考') || h.toString().includes('メモ')))
+    };
+
+    for (let i = 1; i < jsonData.length; i++) {
+      const row = jsonData[i];
+      if (!row || row.length === 0) continue;
+
+      const formatDate = (val) => {
+        if (!val) return '';
+        if (typeof val === 'number') {
+          const date = XLSX.SSF.parse_date_code(val);
+          return `${date.y}-${String(date.m).padStart(2,'0')}-${String(date.d).padStart(2,'0')}`;
+        }
+        return val.toString().replace(/\//g, '-');
+      };
+
+      const event = {
+        startDate: formatDate(row[colIndex.date]),
+        eventType: colIndex.eventType >= 0 ? row[colIndex.eventType] : '',
+        note: colIndex.note >= 0 ? (row[colIndex.note] || '') : ''
+      };
+
+      if (event.eventType && event.startDate) {
+        events.push(event);
+      }
+    }
+
+    console.log('Parsed events:', events);
+    setParsedExcelEvents(events);
+    setSelectedEventIndices(events.map((_, i) => i));
   };
 
   const parseExcelSheet = (workbook, sheetName) => {
@@ -6683,6 +7515,7 @@ function PatientDetailView({ patient, onBack }) {
     const result = Object.values(labDataByDate).sort((a, b) => a.date.localeCompare(b.date));
     console.log('Parsed Excel Data:', result);
     setParsedExcelData(result);
+    setSelectedLabIndices(result.map((_, i) => i));
   };
 
   const handleSheetChange = (sheetName) => {
@@ -6693,13 +7526,24 @@ function PatientDetailView({ patient, onBack }) {
   };
 
   const importExcelData = async () => {
-    if (parsedExcelData.length === 0) return;
+    const hasSelectedLab = selectedLabIndices.length > 0;
+    const hasSelectedTreatments = selectedTreatmentIndices.length > 0;
+    const hasSelectedEvents = selectedEventIndices.length > 0;
+
+    if (!hasSelectedLab && !hasSelectedTreatments && !hasSelectedEvents) {
+      alert('インポートする項目を選択してください');
+      return;
+    }
 
     setIsImporting(true);
 
     try {
-      for (const dayData of parsedExcelData) {
-        if (dayData.data.length === 0) continue;
+      let labCount = 0, treatmentCount = 0, eventCount = 0;
+
+      // 選択された検査データをインポート
+      for (const idx of selectedLabIndices) {
+        const dayData = parsedExcelData[idx];
+        if (!dayData || dayData.data.length === 0) continue;
 
         await addDoc(
           collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
@@ -6711,21 +7555,76 @@ function PatientDetailView({ patient, onBack }) {
             createdAt: serverTimestamp()
           }
         );
+        labCount++;
+      }
+
+      // 選択された治療データをインポート
+      for (const idx of selectedTreatmentIndices) {
+        const t = parsedExcelTreatments[idx];
+        if (!t) continue;
+
+        await addDoc(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+          {
+            category: t.category || 'その他',
+            medicationName: t.medicationName,
+            dosage: t.dosage ? String(t.dosage) : '',
+            dosageUnit: t.dosageUnit || '',
+            startDate: t.startDate,
+            endDate: t.endDate || '',
+            source: 'excel',
+            createdAt: serverTimestamp()
+          }
+        );
+        treatmentCount++;
+      }
+
+      // 選択された臨床イベントをインポート
+      for (const idx of selectedEventIndices) {
+        const e = parsedExcelEvents[idx];
+        if (!e) continue;
+
+        await addDoc(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          {
+            eventType: e.eventType,
+            startDate: e.startDate,
+            endDate: e.endDate || '',
+            severity: e.severity || '',
+            note: e.note || '',
+            source: 'excel',
+            createdAt: serverTimestamp()
+          }
+        );
+        eventCount++;
       }
 
       // 患者の検査件数を更新
-      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
-        labCount: (labResults.length || 0) + parsedExcelData.length
-      });
+      if (labCount > 0) {
+        await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+          labCount: (labResults.length || 0) + labCount
+        });
+      }
 
       setShowExcelModal(false);
       setExcelData(null);
       setExcelSheets([]);
       setParsedExcelData([]);
-      alert(`${parsedExcelData.length}件の検査データをインポートしました`);
+      setParsedExcelTreatments([]);
+      setParsedExcelEvents([]);
+      setSelectedLabIndices([]);
+      setSelectedTreatmentIndices([]);
+      setSelectedEventIndices([]);
+      setIsMultiSheetExcel(false);
+
+      const messages = [];
+      if (labCount > 0) messages.push(`検査データ: ${labCount}件`);
+      if (treatmentCount > 0) messages.push(`治療データ: ${treatmentCount}件`);
+      if (eventCount > 0) messages.push(`臨床イベント: ${eventCount}件`);
+      alert(`インポート完了!\n${messages.join('\n')}`);
     } catch (err) {
       console.error('Error importing Excel data:', err);
-      alert('インポートに失敗しました');
+      alert('インポートに失敗しました: ' + err.message);
     }
 
     setIsImporting(false);
@@ -6765,6 +7664,75 @@ function PatientDetailView({ patient, onBack }) {
     } catch (err) {
       console.error('Error deleting all lab results:', err);
       alert('削除に失敗しました');
+    }
+  };
+
+  // 全治療データを一括削除
+  const deleteAllTreatments = async () => {
+    if (!confirm(`この患者の全治療データ（${treatments.length}件）を削除しますか？この操作は取り消せません。`)) return;
+
+    try {
+      for (const t of treatments) {
+        await deleteDoc(
+          doc(db, 'users', user.uid, 'patients', patient.id, 'treatments', t.id)
+        );
+      }
+      alert('全治療データを削除しました');
+    } catch (err) {
+      console.error('Error deleting all treatments:', err);
+      alert('削除に失敗しました');
+    }
+  };
+
+  // 全臨床イベントを一括削除
+  const deleteAllClinicalEvents = async () => {
+    if (!confirm(`この患者の全臨床イベント（${clinicalEvents.length}件）を削除しますか？この操作は取り消せません。`)) return;
+
+    try {
+      for (const e of clinicalEvents) {
+        await deleteDoc(
+          doc(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents', e.id)
+        );
+      }
+      alert('全臨床イベントを削除しました');
+    } catch (err) {
+      console.error('Error deleting all clinical events:', err);
+      alert('削除に失敗しました');
+    }
+  };
+
+  // 全データを一括削除（検査・治療・臨床イベント）
+  const deleteAllPatientData = async () => {
+    const totalCount = labResults.length + treatments.length + clinicalEvents.length;
+    if (totalCount === 0) {
+      alert('削除するデータがありません');
+      return;
+    }
+
+    if (!confirm(`この患者の全データを削除しますか？\n\n検査データ: ${labResults.length}件\n治療データ: ${treatments.length}件\n臨床イベント: ${clinicalEvents.length}件\n\nこの操作は取り消せません。`)) return;
+
+    try {
+      // 検査データを削除
+      for (const lab of labResults) {
+        await deleteDoc(doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', lab.id));
+      }
+      // 治療データを削除
+      for (const t of treatments) {
+        await deleteDoc(doc(db, 'users', user.uid, 'patients', patient.id, 'treatments', t.id));
+      }
+      // 臨床イベントを削除
+      for (const e of clinicalEvents) {
+        await deleteDoc(doc(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents', e.id));
+      }
+
+      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+        labCount: 0
+      });
+
+      alert(`全データを削除しました（計${totalCount}件）`);
+    } catch (err) {
+      console.error('Error deleting all patient data:', err);
+      alert('削除に失敗しました: ' + err.message);
     }
   };
 
@@ -6981,6 +7949,26 @@ function PatientDetailView({ patient, onBack }) {
             </div>
           )}
           <span style={styles.diagnosisBadge}>{patient?.diagnosis}</span>
+          {(labResults.length > 0 || treatments.length > 0 || clinicalEvents.length > 0) && (
+            <button
+              onClick={deleteAllPatientData}
+              style={{
+                padding: '4px 10px',
+                background: '#fef2f2',
+                color: '#dc2626',
+                border: '1px solid #fecaca',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '12px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '4px'
+              }}
+              title="検査・治療・臨床イベントを全て削除"
+            >
+              <span>🗑️</span> 全データ削除
+            </button>
+          )}
         </div>
         <div style={{display: 'flex', gap: '10px'}}>
           <button
@@ -7170,560 +8158,12 @@ function PatientDetailView({ patient, onBack }) {
             </div>
           ) : (
             <>
-              {/* 臨床経過タイムライン（同一症状をまとめて表示・重症度の階段状変化） */}
-              {(() => {
-                // 発症日がない場合はスキップ
-                if (!patient.onsetDate) return null;
-
-                // 同じイベントタイプでグループ化
-                const eventGroups = {};
-                clinicalEvents.forEach(e => {
-                  const type = e.eventType;
-                  if (!eventGroups[type]) {
-                    eventGroups[type] = {
-                      type: type,
-                      inputType: e.inputType,
-                      entries: []
-                    };
-                  }
-                  eventGroups[type].entries.push(e);
-                });
-
-                // 各グループ内でソート
-                Object.values(eventGroups).forEach(group => {
-                  group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
-                });
-
-                const groupList = Object.values(eventGroups).sort((a, b) => {
-                  const aFirst = a.entries[0]?.startDate || '';
-                  const bFirst = b.entries[0]?.startDate || '';
-                  return new Date(aFirst) - new Date(bFirst);
-                });
-
-                // タイムラインの範囲を計算
-                const allDays = clinicalEvents.flatMap(e => {
-                  const start = calcDaysFromOnset(e.startDate);
-                  const end = e.endDate ? calcDaysFromOnset(e.endDate) : start;
-                  return [start, end];
-                }).filter(d => d !== null);
-
-                if (allDays.length === 0) return null;
-
-                const minDay = Math.min(...allDays, 0);
-                const maxDay = Math.max(...allDays) + 3;
-                const dayRange = maxDay - minDay || 1;
-
-                // 症状タイプごとの色
-                const eventColors = {
-                  '意識障害': '#dc2626',
-                  'てんかん発作': '#ea580c',
-                  '不随意運動': '#d97706',
-                  '麻痺': '#ca8a04',
-                  '感覚障害': '#65a30d',
-                  '失語': '#16a34a',
-                  '認知機能障害': '#0d9488',
-                  '精神症状': '#0891b2',
-                  '発熱': '#ef4444',
-                  '頭痛': '#f97316',
-                  '髄膜刺激症状': '#84cc16',
-                  '人工呼吸器管理': '#7c3aed',
-                  'ICU入室': '#9333ea'
-                };
-
-                // 重症度スコア（高さ計算用）
-                const getSeverityScore = (event) => {
-                  if (event.jcs) {
-                    // JCSスコアを数値化
-                    if (event.jcs === '0') return 0;
-                    if (event.jcs.startsWith('I-')) return parseInt(event.jcs.split('-')[1]) || 1;
-                    if (event.jcs.startsWith('II-')) return 10 + (parseInt(event.jcs.split('-')[1]) || 10);
-                    if (event.jcs.startsWith('III-')) return 100 + (parseInt(event.jcs.split('-')[1]) || 100);
-                    return 1;
-                  }
-                  if (event.frequency) {
-                    const freqScores = { hourly: 6, several_daily: 5, daily: 4, several_weekly: 3, weekly: 2, monthly: 1, rare: 0.5 };
-                    return freqScores[event.frequency] || 1;
-                  }
-                  if (event.severity) {
-                    const sevScores = { '重症': 3, '中等症': 2, '軽症': 1 };
-                    return sevScores[event.severity] || 1;
-                  }
-                  if (event.presence) {
-                    return event.presence === 'あり' ? 1 : 0;
-                  }
-                  return 1;
-                };
-
-                // グループ内の最大スコア
-                const getMaxScore = (entries) => {
-                  const scores = entries.map(e => getSeverityScore(e)).filter(s => s > 0);
-                  return scores.length > 0 ? Math.max(...scores) : 1;
-                };
-
-                // 詳細ラベル取得
-                const getDetailLabel = (event) => {
-                  if (event.jcs) return `JCS ${event.jcs}`;
-                  if (event.frequency) {
-                    const freqLabels = { hourly: '毎時間', several_daily: '1日数回', daily: '毎日', several_weekly: '週数回', weekly: '週1回', monthly: '月1回', rare: '稀' };
-                    return freqLabels[event.frequency] || event.frequency;
-                  }
-                  if (event.severity) return event.severity;
-                  if (event.presence) return event.presence;
-                  return '';
-                };
-
-                return (
-                  <div style={{
-                    marginBottom: '20px',
-                    padding: '16px',
-                    background: 'white',
-                    borderRadius: '12px',
-                    border: '1px solid #e5e7eb'
-                  }}>
-                    <h3 style={{fontSize: '14px', fontWeight: '600', color: '#1f2937', marginBottom: '16px'}}>
-                      臨床経過タイムライン（症状推移）
-                    </h3>
-
-                    {/* X軸（Day表示）- 経過が長い場合は間隔を自動調整 */}
-                    <div style={{marginLeft: '160px', marginBottom: '8px', position: 'relative', height: '20px'}}>
-                      {(() => {
-                        // 表示間隔を自動調整（ラベルが被らないように）
-                        let step = 5;
-                        if (dayRange > 50) step = 10;
-                        if (dayRange > 100) step = 20;
-                        if (dayRange > 200) step = 30;
-                        if (dayRange > 500) step = 50;
-                        if (dayRange > 1000) step = 100;
-
-                        const labels = [];
-                        const firstDay = Math.ceil(minDay / step) * step;
-                        for (let day = firstDay; day <= maxDay; day += step) {
-                          labels.push(day);
-                        }
-                        if (labels[0] !== minDay && minDay >= 0) labels.unshift(minDay);
-
-                        return labels.map((day, i) => {
-                          const leftPercent = ((day - minDay) / dayRange) * 100;
-                          return (
-                            <span
-                              key={i}
-                              style={{
-                                position: 'absolute',
-                                left: `${leftPercent}%`,
-                                transform: 'translateX(-50%)',
-                                fontSize: '10px',
-                                color: '#6b7280',
-                                whiteSpace: 'nowrap'
-                              }}
-                            >
-                              Day {day}
-                            </span>
-                          );
-                        });
-                      })()}
-                    </div>
-
-                    {/* 症状ごとのタイムライン */}
-                    <div style={{display: 'flex', flexDirection: 'column', gap: '12px'}}>
-                      {groupList.map((group, gIdx) => {
-                        const color = eventColors[group.type] || '#6b7280';
-                        const maxScore = getMaxScore(group.entries);
-                        const maxBarHeight = 40;
-
-                        // 有無タイプ（presence）は固定高さ
-                        const isPresenceType = group.inputType === 'presence';
-
-                        return (
-                          <div key={gIdx} style={{display: 'flex', alignItems: 'flex-end', minHeight: `${maxBarHeight + 20}px`}}>
-                            {/* 症状名ラベル */}
-                            <div style={{
-                              width: '160px',
-                              flexShrink: 0,
-                              fontSize: '11px',
-                              color: '#374151',
-                              paddingRight: '10px',
-                              textAlign: 'right',
-                              paddingBottom: '4px'
-                            }}>
-                              <div style={{
-                                display: 'inline-flex',
-                                alignItems: 'center',
-                                gap: '6px',
-                                background: color + '20',
-                                border: `1px solid ${color}`,
-                                borderRadius: '4px',
-                                padding: '2px 8px',
-                                maxWidth: '100%'
-                              }}>
-                                <span style={{
-                                  width: '8px',
-                                  height: '8px',
-                                  borderRadius: '50%',
-                                  background: color,
-                                  flexShrink: 0
-                                }} />
-                                <span style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
-                                  {group.type}
-                                </span>
-                              </div>
-                            </div>
-
-                            {/* タイムラインエリア */}
-                            <div style={{
-                              flex: 1,
-                              position: 'relative',
-                              height: `${maxBarHeight + 10}px`,
-                              background: '#fafafa',
-                              borderRadius: '4px',
-                              borderBottom: '1px solid #e5e7eb'
-                            }}>
-                              {group.entries.map((entry, eIdx) => {
-                                const startDay = calcDaysFromOnset(entry.startDate);
-                                const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
-                                const isSingleDay = startDay === endDay;
-                                const score = getSeverityScore(entry);
-                                const detailLabel = getDetailLabel(entry);
-
-                                const leftPercent = ((startDay - minDay) / dayRange) * 100;
-                                const widthPercent = isSingleDay ? 1.5 : ((endDay - startDay) / dayRange) * 100;
-
-                                // スコアに応じた高さ（階段状）
-                                const heightPercent = isPresenceType ? (entry.presence === 'あり' ? 60 : 20) : (score / maxScore) * 100;
-                                const barHeight = Math.max((heightPercent / 100) * maxBarHeight, 8);
-
-                                if (isSingleDay) {
-                                  // 単発は丸で表示
-                                  return (
-                                    <div
-                                      key={eIdx}
-                                      style={{
-                                        position: 'absolute',
-                                        left: `${leftPercent}%`,
-                                        bottom: '0',
-                                        transform: 'translateX(-50%)',
-                                        width: `${Math.max(barHeight * 0.6, 12)}px`,
-                                        height: `${barHeight}px`,
-                                        background: color,
-                                        borderRadius: '50% 50% 0 0'
-                                      }}
-                                      title={`${group.type}: Day ${startDay}${detailLabel ? ` (${detailLabel})` : ''}`}
-                                    />
-                                  );
-                                }
-
-                                // 継続症状は階段状のバー
-                                return (
-                                  <div
-                                    key={eIdx}
-                                    style={{
-                                      position: 'absolute',
-                                      left: `${leftPercent}%`,
-                                      width: `${Math.max(widthPercent, 0.8)}%`,
-                                      height: `${barHeight}px`,
-                                      bottom: '0',
-                                      background: `linear-gradient(180deg, ${color} 0%, ${color}cc 100%)`,
-                                      borderRadius: '4px 4px 0 0',
-                                      display: 'flex',
-                                      alignItems: 'center',
-                                      justifyContent: 'center',
-                                      overflow: 'visible',
-                                      borderLeft: eIdx > 0 ? '1px solid rgba(255,255,255,0.5)' : 'none'
-                                    }}
-                                    title={`${group.type}: Day ${startDay}${endDay !== startDay ? `〜${endDay}` : ''}${detailLabel ? ` (${detailLabel})` : ''}`}
-                                  >
-                                    {detailLabel && widthPercent > 5 && (
-                                      <span style={{
-                                        fontSize: '8px',
-                                        color: 'white',
-                                        fontWeight: '600',
-                                        textShadow: '0 0 2px rgba(0,0,0,0.4)',
-                                        whiteSpace: 'nowrap'
-                                      }}>
-                                        {detailLabel}
-                                      </span>
-                                    )}
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    {/* 凡例 */}
-                    <div style={{marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #e5e7eb', display: 'flex', flexWrap: 'wrap', gap: '12px', fontSize: '10px'}}>
-                      {Object.entries(eventColors).map(([type, color]) => {
-                        const hasType = clinicalEvents.some(e => e.eventType === type);
-                        if (!hasType) return null;
-                        return (
-                          <div key={type} style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
-                            <div style={{width: '10px', height: '10px', borderRadius: '50%', background: color}} />
-                            <span style={{color: '#6b7280'}}>{type}</span>
-                          </div>
-                        );
-                      })}
-                      <div style={{color: '#6b7280', marginLeft: '8px'}}>
-                        ※ バーの高さ = 重症度/頻度（同一症状内で相対的）
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {/* 治療タイムライン（臨床経過セクション内） */}
-              {(() => {
-                if (!patient.onsetDate) return null;
-                if (treatments.length === 0) return null;
-
-                // 同じ薬剤名でグループ化
-                const medicationGroups = {};
-                treatments.forEach(t => {
-                  const name = t.medicationName;
-                  if (!medicationGroups[name]) {
-                    medicationGroups[name] = {
-                      name: name,
-                      category: t.category,
-                      entries: []
-                    };
-                  }
-                  medicationGroups[name].entries.push(t);
-                });
-
-                Object.values(medicationGroups).forEach(group => {
-                  group.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate));
-                });
-
-                const groupList = Object.values(medicationGroups).sort((a, b) => {
-                  const aFirst = a.entries[0]?.startDate || '';
-                  const bFirst = b.entries[0]?.startDate || '';
-                  return new Date(aFirst) - new Date(bFirst);
-                });
-
-                // タイムラインの範囲を計算（臨床経過と合わせる）
-                const allEventDays = clinicalEvents.flatMap(e => {
-                  const start = calcDaysFromOnset(e.startDate);
-                  const end = e.endDate ? calcDaysFromOnset(e.endDate) : start;
-                  return [start, end];
-                }).filter(d => d !== null);
-
-                const allTreatmentDays = treatments.flatMap(t => {
-                  const start = calcDaysFromOnset(t.startDate);
-                  const end = t.endDate ? calcDaysFromOnset(t.endDate) : start;
-                  return [start, end];
-                }).filter(d => d !== null);
-
-                const allDays = [...allEventDays, ...allTreatmentDays];
-                if (allDays.length === 0) return null;
-
-                const minDay = Math.min(...allDays, 0);
-                const maxDay = Math.max(...allDays) + 3;
-                const dayRange = maxDay - minDay || 1;
-
-                const categoryColors = {
-                  '抗てんかん薬': '#f59e0b',
-                  'ステロイド': '#ec4899',
-                  '免疫グロブリン': '#3b82f6',
-                  '血漿交換': '#6366f1',
-                  '免疫抑制剤': '#8b5cf6',
-                  '抗ウイルス薬': '#14b8a6',
-                  '抗菌薬': '#eab308',
-                  '抗浮腫薬': '#0ea5e9',
-                  'その他': '#6b7280'
-                };
-
-                const getMaxDosage = (entries) => {
-                  const dosages = entries.map(e => parseFloat(e.dosage) || 0).filter(d => d > 0);
-                  return dosages.length > 0 ? Math.max(...dosages) : 1;
-                };
-
-                return (
-                  <div style={{
-                    marginTop: '20px',
-                    padding: '16px',
-                    background: 'white',
-                    borderRadius: '12px',
-                    border: '1px solid #e5e7eb'
-                  }}>
-                    <h3 style={{fontSize: '14px', fontWeight: '600', color: '#1f2937', marginBottom: '16px'}}>
-                      治療タイムライン（投与量推移）
-                    </h3>
-
-                    {/* X軸（Day表示）- 経過が長い場合は間隔を自動調整 */}
-                    <div style={{marginLeft: '160px', marginBottom: '8px', position: 'relative', height: '20px'}}>
-                      {(() => {
-                        // 表示間隔を自動調整（ラベルが被らないように）
-                        let step = 5;
-                        if (dayRange > 50) step = 10;
-                        if (dayRange > 100) step = 20;
-                        if (dayRange > 200) step = 30;
-                        if (dayRange > 500) step = 50;
-                        if (dayRange > 1000) step = 100;
-
-                        const labels = [];
-                        const firstDay = Math.ceil(minDay / step) * step;
-                        for (let day = firstDay; day <= maxDay; day += step) {
-                          labels.push(day);
-                        }
-                        if (labels[0] !== minDay && minDay >= 0) labels.unshift(minDay);
-
-                        return labels.map((day, i) => {
-                          const leftPercent = ((day - minDay) / dayRange) * 100;
-                          return (
-                            <span
-                              key={i}
-                              style={{
-                                position: 'absolute',
-                                left: `${leftPercent}%`,
-                                transform: 'translateX(-50%)',
-                                fontSize: '10px',
-                                color: '#6b7280',
-                                whiteSpace: 'nowrap'
-                              }}
-                            >
-                              Day {day}
-                            </span>
-                          );
-                        });
-                      })()}
-                    </div>
-
-                    {/* 薬剤ごとのタイムライン */}
-                    <div style={{display: 'flex', flexDirection: 'column', gap: '12px'}}>
-                      {groupList.map((group, gIdx) => {
-                        const color = categoryColors[group.category] || categoryColors['その他'];
-                        const maxDosage = getMaxDosage(group.entries);
-                        const maxBarHeight = 40;
-
-                        const allSingleDay = group.entries.every(e => {
-                          const start = calcDaysFromOnset(e.startDate);
-                          const end = e.endDate ? calcDaysFromOnset(e.endDate) : start;
-                          return start === end;
-                        });
-
-                        return (
-                          <div key={gIdx} style={{display: 'flex', alignItems: 'flex-end', minHeight: `${maxBarHeight + 20}px`}}>
-                            <div style={{
-                              width: '160px',
-                              flexShrink: 0,
-                              fontSize: '11px',
-                              color: '#374151',
-                              paddingRight: '10px',
-                              textAlign: 'right',
-                              paddingBottom: '4px'
-                            }}>
-                              <div style={{
-                                display: 'inline-block',
-                                background: color + '20',
-                                border: `1px solid ${color}`,
-                                borderRadius: '4px',
-                                padding: '2px 6px',
-                                maxWidth: '100%',
-                                overflow: 'hidden',
-                                textOverflow: 'ellipsis',
-                                whiteSpace: 'nowrap'
-                              }} title={group.name}>
-                                {group.name}
-                              </div>
-                            </div>
-
-                            <div style={{
-                              flex: 1,
-                              position: 'relative',
-                              height: `${maxBarHeight + 10}px`,
-                              background: '#fafafa',
-                              borderRadius: '4px',
-                              borderBottom: '1px solid #e5e7eb'
-                            }}>
-                              {group.entries.map((entry, eIdx) => {
-                                const startDay = calcDaysFromOnset(entry.startDate);
-                                const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
-                                const isSingleDay = startDay === endDay;
-                                const dosage = parseFloat(entry.dosage) || 0;
-
-                                const leftPercent = ((startDay - minDay) / dayRange) * 100;
-                                const widthPercent = isSingleDay ? 1.5 : ((endDay - startDay) / dayRange) * 100;
-                                const heightPercent = dosage > 0 ? (dosage / maxDosage) * 100 : 50;
-                                const barHeight = Math.max((heightPercent / 100) * maxBarHeight, 8);
-
-                                if (isSingleDay && allSingleDay) {
-                                  return (
-                                    <div
-                                      key={eIdx}
-                                      style={{
-                                        position: 'absolute',
-                                        left: `${leftPercent}%`,
-                                        bottom: '0',
-                                        transform: 'translateX(-50%)',
-                                        width: 0,
-                                        height: 0,
-                                        borderLeft: '10px solid transparent',
-                                        borderRight: '10px solid transparent',
-                                        borderBottom: `${barHeight}px solid ${color}`
-                                      }}
-                                      title={`${group.name}: Day ${startDay}${dosage ? ` (${entry.dosage}${entry.dosageUnit || ''})` : ''}`}
-                                    />
-                                  );
-                                }
-
-                                return (
-                                  <div
-                                    key={eIdx}
-                                    style={{
-                                      position: 'absolute',
-                                      left: `${leftPercent}%`,
-                                      width: `${Math.max(widthPercent, 0.8)}%`,
-                                      height: `${barHeight}px`,
-                                      bottom: '0',
-                                      background: color,
-                                      borderRadius: '2px 2px 0 0',
-                                      display: 'flex',
-                                      alignItems: 'center',
-                                      justifyContent: 'center',
-                                      overflow: 'visible',
-                                      borderLeft: eIdx > 0 ? '1px solid rgba(255,255,255,0.5)' : 'none'
-                                    }}
-                                    title={`${group.name}: Day ${startDay}${endDay !== startDay ? `〜${endDay}` : ''}${dosage ? ` (${entry.dosage}${entry.dosageUnit || ''})` : ''}`}
-                                  >
-                                    {dosage > 0 && widthPercent > 4 && (
-                                      <span style={{
-                                        fontSize: '9px',
-                                        color: 'white',
-                                        fontWeight: '600',
-                                        textShadow: '0 0 2px rgba(0,0,0,0.4)',
-                                        whiteSpace: 'nowrap'
-                                      }}>
-                                        {entry.dosage}
-                                      </span>
-                                    )}
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          </div>
-                        );
-                      })}
-                    </div>
-
-                    {/* 凡例 */}
-                    <div style={{marginTop: '16px', paddingTop: '12px', borderTop: '1px solid #e5e7eb', display: 'flex', flexWrap: 'wrap', gap: '12px', fontSize: '10px'}}>
-                      {Object.entries(categoryColors).map(([cat, color]) => {
-                        const hasCat = treatments.some(t => t.category === cat);
-                        if (!hasCat) return null;
-                        return (
-                          <div key={cat} style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
-                            <div style={{width: '14px', height: '14px', background: color, borderRadius: '2px'}} />
-                            <span style={{color: '#6b7280'}}>{cat}</span>
-                          </div>
-                        );
-                      })}
-                      <div style={{color: '#6b7280', marginLeft: '8px'}}>
-                        ※ バーの高さ = 投与量（同一薬剤内で相対的）
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()}
+              {/* 症状一覧ヘッダー */}
+              {clinicalEvents.length > 0 && (
+                <h4 style={{fontSize: '14px', fontWeight: '600', color: '#b45309', marginBottom: '12px', display: 'flex', alignItems: 'center', gap: '8px'}}>
+                  <span>📋</span> 症状一覧
+                </h4>
+              )}
 
               {/* イベント一覧（編集用） */}
               <div style={{display: 'flex', flexDirection: 'column', gap: '10px'}}>
@@ -8122,17 +8562,45 @@ function PatientDetailView({ patient, onBack }) {
           )}
         </section>
 
-        {/* 経時データ分析セクション */}
+        {/* 経過グラフ作成セクション */}
         <section style={styles.section}>
           <div style={styles.sectionHeader}>
-            <h2 style={styles.sectionTitle}>経時データ分析</h2>
+            <h2 style={styles.sectionTitle}>経過グラフ作成</h2>
             <button
               onClick={() => setShowTimeSeriesOverlay(!showTimeSeriesOverlay)}
-              style={{...styles.addLabButton, background: showTimeSeriesOverlay ? '#bfdbfe' : '#dbeafe', color: '#1d4ed8'}}
+              style={{
+                ...styles.addLabButton,
+                background: showTimeSeriesOverlay ? '#bfdbfe' : 'linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%)',
+                color: showTimeSeriesOverlay ? '#1d4ed8' : 'white',
+                fontWeight: '600',
+                padding: '10px 20px',
+                fontSize: '14px'
+              }}
             >
-              <span>📈</span> {showTimeSeriesOverlay ? '閉じる' : '分析を開く'}
+              <span>📊</span> {showTimeSeriesOverlay ? '閉じる' : '経過表を作成・出力'}
             </button>
           </div>
+          {!showTimeSeriesOverlay && (
+            <div style={{
+              background: 'linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%)',
+              borderRadius: '8px',
+              padding: '16px',
+              border: '1px solid #bfdbfe'
+            }}>
+              <div style={{fontSize: '13px', color: '#1e40af', lineHeight: '1.6'}}>
+                検査値・治療薬・臨床経過を組み合わせた<strong>経過表</strong>を作成し、<strong>PNG画像</strong>や<strong>Excel</strong>で出力できます。
+              </div>
+              <div style={{fontSize: '12px', color: '#3b82f6', marginTop: '10px', display: 'flex', flexWrap: 'wrap', gap: '12px'}}>
+                <span>📊 検査値グラフ</span>
+                <span>💊 治療薬タイムライン</span>
+                <span>📋 臨床経過</span>
+                <span>📐 二軸表示対応</span>
+              </div>
+              <div style={{fontSize: '11px', color: '#6b7280', marginTop: '8px'}}>
+                💡 学会発表や論文用の経過表作成に最適です
+              </div>
+            </div>
+          )}
 
           {showTimeSeriesOverlay && (
             <div style={{
@@ -8141,11 +8609,65 @@ function PatientDetailView({ patient, onBack }) {
               padding: '20px',
               border: '1px solid #e2e8f0'
             }}>
+              {/* 操作ガイド */}
+              <div style={{
+                background: 'linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%)',
+                borderRadius: '8px',
+                padding: '12px 16px',
+                marginBottom: '20px',
+                border: '1px solid #bfdbfe'
+              }}>
+                <div style={{fontSize: '13px', fontWeight: '600', color: '#1e40af', marginBottom: '8px'}}>
+                  📋 経過表の作り方
+                </div>
+                <div style={{fontSize: '12px', color: '#3b82f6', lineHeight: '1.8'}}>
+                  <div><span style={{fontWeight: '600', color: '#1e40af'}}>①</span> 下記から表示したい<strong>検査項目</strong>を選択（2つ以上で二軸表示可能）</div>
+                  <div><span style={{fontWeight: '600', color: '#1e40af'}}>②</span> 必要に応じて<strong>治療薬</strong>や<strong>臨床経過</strong>を追加</div>
+                  <div><span style={{fontWeight: '600', color: '#1e40af'}}>③</span> 「分離表示」または「重ね表示」を選択</div>
+                  <div><span style={{fontWeight: '600', color: '#1e40af'}}>④</span> グラフ下のボタンで<strong>PNG画像</strong>や<strong>Excel</strong>に出力</div>
+                </div>
+                <div style={{fontSize: '11px', color: '#6b7280', marginTop: '8px', borderTop: '1px solid #bfdbfe', paddingTop: '8px'}}>
+                  💡 <strong>二軸表示</strong>：スケールの異なる検査値（例：血糖とインスリン）を1つのグラフで比較できます
+                </div>
+              </div>
+
               {/* 検査項目選択 */}
               <div style={{marginBottom: '20px'}}>
-                <h4 style={{fontSize: '14px', fontWeight: '600', color: '#1e40af', marginBottom: '12px'}}>
-                  検査項目を選択
-                </h4>
+                <div style={{display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px'}}>
+                  <h4 style={{fontSize: '14px', fontWeight: '600', color: '#1e40af', margin: 0}}>
+                    検査項目を選択
+                  </h4>
+                  {selectedLabItemsForChart.length >= 2 && (
+                    <label style={{display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer'}}>
+                      <input
+                        type="checkbox"
+                        checked={useDualAxis}
+                        onChange={(e) => {
+                          setUseDualAxis(e.target.checked);
+                          if (!e.target.checked) setSecondaryAxisItems([]);
+                        }}
+                      />
+                      <span style={{fontSize: '12px', color: '#6b7280'}}>二軸表示</span>
+                    </label>
+                  )}
+                </div>
+                {/* 二軸表示の使い方ヒント */}
+                {selectedLabItemsForChart.length >= 2 && useDualAxis && (
+                  <div style={{
+                    background: '#fef3c7',
+                    border: '1px solid #f59e0b',
+                    borderRadius: '6px',
+                    padding: '8px 12px',
+                    marginBottom: '12px',
+                    fontSize: '11px',
+                    color: '#92400e'
+                  }}>
+                    <strong>二軸表示の使い方：</strong>
+                    項目を<span style={{color: '#3b82f6', fontWeight: '600'}}>1回クリック→左軸（青）</span>、
+                    <span style={{color: '#f59e0b', fontWeight: '600'}}>2回クリック→右軸（黄）</span>、
+                    3回目で解除
+                  </div>
+                )}
                 <div style={{
                   display: 'flex',
                   flexWrap: 'wrap',
@@ -8163,36 +8685,55 @@ function PatientDetailView({ patient, onBack }) {
                     labResults.forEach(lab => {
                       lab.data?.forEach(item => allItems.add(item.item));
                     });
-                    return Array.from(allItems).sort().map(item => (
-                      <label
-                        key={item}
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '4px',
-                          padding: '4px 10px',
-                          background: selectedLabItemsForChart.includes(item) ? '#dbeafe' : '#f1f5f9',
-                          borderRadius: '16px',
-                          cursor: 'pointer',
-                          fontSize: '12px',
-                          border: selectedLabItemsForChart.includes(item) ? '1px solid #3b82f6' : '1px solid transparent'
-                        }}
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selectedLabItemsForChart.includes(item)}
-                          onChange={() => {
-                            setSelectedLabItemsForChart(prev =>
-                              prev.includes(item)
-                                ? prev.filter(i => i !== item)
-                                : [...prev, item]
-                            );
+                    return Array.from(allItems).sort().map(item => {
+                      const isSelected = selectedLabItemsForChart.includes(item);
+                      const isSecondaryAxis = secondaryAxisItems.includes(item);
+                      return (
+                        <div
+                          key={item}
+                          style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '4px',
+                            padding: '4px 10px',
+                            background: isSelected ? (isSecondaryAxis ? '#fef3c7' : '#dbeafe') : '#f1f5f9',
+                            borderRadius: '16px',
+                            cursor: 'pointer',
+                            fontSize: '12px',
+                            border: isSelected ? `1px solid ${isSecondaryAxis ? '#f59e0b' : '#3b82f6'}` : '1px solid transparent'
                           }}
-                          style={{display: 'none'}}
-                        />
-                        {item}
-                      </label>
-                    ));
+                          onClick={() => {
+                            if (!isSelected) {
+                              setSelectedLabItemsForChart(prev => [...prev, item]);
+                            } else if (useDualAxis && !isSecondaryAxis) {
+                              // 二軸モードで選択済み→右軸に移動
+                              setSecondaryAxisItems(prev => [...prev, item]);
+                            } else if (useDualAxis && isSecondaryAxis) {
+                              // 右軸→選択解除
+                              setSecondaryAxisItems(prev => prev.filter(i => i !== item));
+                              setSelectedLabItemsForChart(prev => prev.filter(i => i !== item));
+                            } else {
+                              // 通常モード→選択解除
+                              setSelectedLabItemsForChart(prev => prev.filter(i => i !== item));
+                            }
+                          }}
+                        >
+                          {item}
+                          {useDualAxis && isSelected && (
+                            <span style={{
+                              fontSize: '9px',
+                              padding: '1px 4px',
+                              borderRadius: '4px',
+                              background: isSecondaryAxis ? '#f59e0b' : '#3b82f6',
+                              color: 'white',
+                              marginLeft: '4px'
+                            }}>
+                              {isSecondaryAxis ? '右' : '左'}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    });
                   })()}
                   {labResults.length === 0 && (
                     <span style={{color: '#6b7280', fontSize: '12px'}}>検査データがありません</span>
@@ -8384,8 +8925,8 @@ function PatientDetailView({ patient, onBack }) {
                 )}
               </div>
 
-              {/* 表示オプション */}
-              {(showTreatmentsOnChart || showEventsOnChart) && (
+              {/* 表示オプション - 検査項目2つ以上または治療薬/臨床経過表示時に表示 */}
+              {(selectedLabItemsForChart.length >= 2 || showTreatmentsOnChart || showEventsOnChart) && (
                 <div style={{
                   marginBottom: '20px',
                   padding: '12px',
@@ -9159,7 +9700,7 @@ function PatientDetailView({ patient, onBack }) {
                     // ダミー用（古いrenderTimeline参照を維持）
                     const renderTimeline = renderClinicalTimeline;
 
-                    // 検査データのグラフ（X軸をタイムラインと揃える）
+                    // 検査データのグラフ（X軸をタイムラインと揃える）- 二軸対応
                     const renderLabChartAligned = () => {
                       if (selectedLabItemsForChart.length === 0) return null;
 
@@ -9177,20 +9718,64 @@ function PatientDetailView({ patient, onBack }) {
                         });
                         if (dataPoints.length > 0) {
                           dataPoints.sort((a, b) => a.x - b.x);
+                          const isSecondary = useDualAxis && secondaryAxisItems.includes(item);
+                          const baseColor = isSecondary
+                            ? ['#f59e0b', '#f97316', '#ea580c', '#dc2626'][idx % 4]
+                            : labColors[idx % labColors.length];
                           datasets.push({
-                            label: item,
+                            label: item + (isSecondary ? ' [右]' : ''),
                             data: dataPoints,
-                            borderColor: labColors[idx % labColors.length],
-                            backgroundColor: labColors[idx % labColors.length],
+                            borderColor: baseColor,
+                            backgroundColor: baseColor,
                             tension: 0.2,
                             pointRadius: 4,
                             pointHoverRadius: 6,
-                            borderWidth: 2
+                            borderWidth: 2,
+                            yAxisID: isSecondary ? 'ySecondary' : 'y'
                           });
                         }
                       });
 
                       if (datasets.length === 0) return null;
+
+                      const hasSecondaryLabData = useDualAxis && selectedLabItemsForChart.some(item => secondaryAxisItems.includes(item));
+
+                      const scales = {
+                        x: {
+                          type: 'linear',
+                          min: minDay,
+                          max: maxDay,
+                          title: {
+                            display: true,
+                            text: 'days',
+                            font: { size: 11 }
+                          },
+                          ticks: {
+                            stepSize: 5,
+                            font: { size: 10 }
+                          },
+                          grid: {
+                            color: '#e5e7eb'
+                          }
+                        },
+                        y: {
+                          type: 'linear',
+                          position: 'left',
+                          title: { display: true, text: '検査値（左軸）', color: '#3b82f6', font: { size: 11 } },
+                          ticks: { color: '#3b82f6', font: { size: 10 } },
+                          grid: { color: '#e5e7eb' }
+                        }
+                      };
+
+                      if (hasSecondaryLabData) {
+                        scales.ySecondary = {
+                          type: 'linear',
+                          position: 'right',
+                          title: { display: true, text: '検査値（右軸）', color: '#f59e0b', font: { size: 11 } },
+                          ticks: { color: '#f59e0b', font: { size: 10 } },
+                          grid: { drawOnChartArea: false }
+                        };
+                      }
 
                       return (
                         <div style={{ marginLeft: '120px' }}>
@@ -9218,35 +9803,7 @@ function PatientDetailView({ patient, onBack }) {
                                   display: false
                                 }
                               },
-                              scales: {
-                                x: {
-                                  type: 'linear',
-                                  min: minDay,
-                                  max: maxDay,
-                                  title: {
-                                    display: true,
-                                    text: 'days',
-                                    font: { size: 11 }
-                                  },
-                                  ticks: {
-                                    stepSize: 5,
-                                    font: { size: 10 }
-                                  },
-                                  grid: {
-                                    color: '#e5e7eb'
-                                  }
-                                },
-                                y: {
-                                  type: 'linear',
-                                  position: 'left',
-                                  grid: {
-                                    color: '#e5e7eb'
-                                  },
-                                  ticks: {
-                                    font: { size: 10 }
-                                  }
-                                }
-                              }
+                              scales
                             }}
                           />
                         </div>
@@ -9273,13 +9830,17 @@ function PatientDetailView({ patient, onBack }) {
                         });
                         if (dataPoints.length > 0) {
                           dataPoints.sort((a, b) => a.x - b.x);
+                          const isSecondary = useDualAxis && secondaryAxisItems.includes(item);
+                          const baseColor = isSecondary
+                            ? ['#f59e0b', '#f97316', '#ea580c', '#dc2626'][idx % 4]
+                            : labColors[idx % labColors.length];
                           datasets.push({
-                            label: item,
+                            label: item + (isSecondary ? ' [右]' : ''),
                             data: dataPoints,
-                            borderColor: labColors[idx % labColors.length],
-                            backgroundColor: labColors[idx % labColors.length] + '20',
+                            borderColor: baseColor,
+                            backgroundColor: baseColor + '20',
                             tension: 0.2,
-                            yAxisID: 'y',
+                            yAxisID: isSecondary ? 'ySecondary' : 'y',
                             pointRadius: 4,
                             pointHoverRadius: 6
                           });
@@ -9352,10 +9913,24 @@ function PatientDetailView({ patient, onBack }) {
                       if (datasets.length === 0) return null;
 
                       const hasLabData = selectedLabItemsForChart.length > 0;
+                      const hasSecondaryLabData = useDualAxis && selectedLabItemsForChart.some(item => secondaryAxisItems.includes(item));
                       const hasTreatmentData = showTreatmentsOnChart && selectedTreatmentsForChart.length > 0;
                       const hasEventData = showEventsOnChart && selectedEventsForChart.length > 0;
                       const scales = { x: { type: 'linear', title: { display: true, text: 'days' } } };
-                      if (hasLabData) scales.y = { type: 'linear', position: 'left', title: { display: true, text: '検査値' } };
+                      if (hasLabData) scales.y = {
+                        type: 'linear',
+                        position: 'left',
+                        title: { display: true, text: '検査値（左軸）', color: '#3b82f6' },
+                        ticks: { color: '#3b82f6' },
+                        grid: { color: '#e5e7eb' }
+                      };
+                      if (hasSecondaryLabData) scales.ySecondary = {
+                        type: 'linear',
+                        position: 'right',
+                        title: { display: true, text: '検査値（右軸）', color: '#f59e0b' },
+                        ticks: { color: '#f59e0b' },
+                        grid: { drawOnChartArea: false }
+                      };
                       if (hasTreatmentData) scales.y1 = { type: 'linear', position: 'right', title: { display: true, text: '投与量' }, grid: { drawOnChartArea: false } };
                       if (hasEventData) scales.y2 = { type: 'linear', position: hasLabData ? 'right' : 'left', title: { display: true, text: '重症度' }, grid: { drawOnChartArea: false } };
 
@@ -9753,6 +10328,9 @@ function PatientDetailView({ patient, onBack }) {
               </button>
               <button onClick={() => setShowExcelModal(true)} style={{...styles.addLabButton, background: '#e0f2fe', color: '#0369a1'}}>
                 <span>📊</span> Excelから追加
+              </button>
+              <button onClick={() => setShowSummaryModal(true)} style={{...styles.addLabButton, background: '#fef3c7', color: '#92400e'}}>
+                <span>📋</span> サマリーから作成
               </button>
               {labResults.length > 0 && (
                 <button onClick={deleteAllLabResults} style={{...styles.addLabButton, background: '#fef2f2', color: '#dc2626'}}>
@@ -10343,435 +10921,6 @@ function PatientDetailView({ patient, onBack }) {
         </div>
       )}
 
-      {/* 臨床経過タイムラインモーダル */}
-      {showClinicalTimeline && (
-        <div style={styles.modalOverlay}>
-          <div style={{...styles.modal, maxWidth: '95vw', maxHeight: '90vh', overflow: 'auto'}}>
-            <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px'}}>
-              <h2 style={styles.modalTitle}>臨床経過タイムライン - {patient?.displayId}</h2>
-              <button
-                onClick={() => setShowClinicalTimeline(false)}
-                style={{
-                  background: 'transparent',
-                  border: 'none',
-                  fontSize: '24px',
-                  cursor: 'pointer',
-                  color: '#6b7280'
-                }}
-              >
-                ×
-              </button>
-            </div>
-
-            <div ref={timelineRef} style={{background: 'white', padding: '20px'}}>
-              {/* 患者情報 */}
-              <div style={{
-                marginBottom: '24px',
-                padding: '16px',
-                background: '#f9fafb',
-                borderRadius: '8px',
-                display: 'flex',
-                gap: '24px',
-                flexWrap: 'wrap'
-              }}>
-                <div><strong>患者ID:</strong> {patient?.displayId}</div>
-                <div><strong>診断:</strong> {patient?.diagnosis}</div>
-                <div><strong>群:</strong> {patient?.group || '未設定'}</div>
-                <div><strong>発症日:</strong> {patient?.onsetDate || '未設定'}</div>
-              </div>
-
-              {(() => {
-                if (!patient.onsetDate) {
-                  return <p style={{color: '#6b7280'}}>発症日が設定されていないため、タイムラインを表示できません。</p>;
-                }
-
-                // 全データのDay範囲を計算
-                const allDays = [
-                  ...treatments.flatMap(t => [
-                    calcDaysFromOnset(t.startDate),
-                    t.endDate ? calcDaysFromOnset(t.endDate) : calcDaysFromOnset(t.startDate)
-                  ]),
-                  ...clinicalEvents.flatMap(e => [
-                    calcDaysFromOnset(e.startDate),
-                    e.endDate ? calcDaysFromOnset(e.endDate) : calcDaysFromOnset(e.startDate)
-                  ])
-                ].filter(d => d !== null);
-
-                if (allDays.length === 0) {
-                  return <p style={{color: '#6b7280'}}>表示するデータがありません。</p>;
-                }
-
-                const minDay = Math.min(...allDays, 0);
-                const maxDay = Math.max(...allDays) + 3;
-                const dayRange = maxDay - minDay || 1;
-
-                // カテゴリの色
-                const treatmentColors = {
-                  '抗てんかん薬': '#f59e0b',
-                  'ステロイド': '#ec4899',
-                  '免疫グロブリン': '#3b82f6',
-                  '血漿交換': '#6366f1',
-                  '免疫抑制剤': '#8b5cf6',
-                  '抗ウイルス薬': '#14b8a6',
-                  '抗菌薬': '#eab308',
-                  '抗浮腫薬': '#0ea5e9',
-                  'その他': '#6b7280'
-                };
-
-                const eventColors = {
-                  '意識障害': '#dc2626',
-                  'てんかん発作': '#ea580c',
-                  '不随意運動': '#d97706',
-                  '麻痺': '#ca8a04',
-                  '感覚障害': '#65a30d',
-                  '失語': '#16a34a',
-                  '認知機能障害': '#0d9488',
-                  '精神症状': '#0891b2',
-                  '発熱': '#ef4444',
-                  '頭痛': '#f97316',
-                  '髄膜刺激症状': '#84cc16',
-                  '人工呼吸器管理': '#7c3aed',
-                  'ICU入室': '#9333ea'
-                };
-
-                return (
-                  <>
-                    {/* X軸（Day表示）- 経過が長い場合は間隔を自動調整 */}
-                    <div style={{marginLeft: '180px', marginBottom: '8px', position: 'relative', height: '24px', borderBottom: '1px solid #e5e7eb'}}>
-                      {(() => {
-                        // 表示間隔を自動調整（ラベルが被らないように）
-                        let step = 5;
-                        if (dayRange > 50) step = 10;
-                        if (dayRange > 100) step = 20;
-                        if (dayRange > 200) step = 30;
-                        if (dayRange > 500) step = 50;
-                        if (dayRange > 1000) step = 100;
-
-                        const labels = [];
-                        const firstDay = Math.ceil(minDay / step) * step;
-                        for (let day = firstDay; day <= maxDay; day += step) {
-                          labels.push(day);
-                        }
-                        if (labels[0] !== minDay && minDay >= 0) labels.unshift(minDay);
-
-                        return labels.map((day, i) => {
-                          const leftPercent = ((day - minDay) / dayRange) * 100;
-                          return (
-                            <div key={i} style={{position: 'absolute', left: `${leftPercent}%`, transform: 'translateX(-50%)'}}>
-                              <span style={{fontSize: '11px', color: '#374151', fontWeight: '500'}}>Day {day}</span>
-                              <div style={{width: '1px', height: '8px', background: '#d1d5db', margin: '0 auto'}} />
-                            </div>
-                          );
-                        });
-                      })()}
-                    </div>
-
-                    {/* 臨床症状セクション（同じ症状は横並び、頻度/重症度で高さが変化） */}
-                    {clinicalEvents.length > 0 && (
-                      <>
-                        <div style={{fontSize: '13px', fontWeight: '600', color: '#374151', marginBottom: '8px', marginTop: '16px'}}>
-                          臨床症状
-                        </div>
-                        <div style={{display: 'flex', flexDirection: 'column', gap: '4px', marginBottom: '20px'}}>
-                          {(() => {
-                            // 頻度レベル
-                            const frequencyLevels = {
-                              'hourly': { level: 7, label: '毎時' },
-                              'several_daily': { level: 6, label: '数回/日' },
-                              'daily': { level: 5, label: '毎日' },
-                              'several_weekly': { level: 4, label: '数回/週' },
-                              'weekly': { level: 3, label: '週1' },
-                              'monthly': { level: 2, label: '月1' },
-                              'rare': { level: 1, label: '稀' }
-                            };
-                            // JCSレベル
-                            const jcsLevels = {
-                              '0': { level: 0, label: '清明' },
-                              'I-1': { level: 1, label: 'I-1' },
-                              'I-2': { level: 2, label: 'I-2' },
-                              'I-3': { level: 3, label: 'I-3' },
-                              'II-10': { level: 4, label: 'II-10' },
-                              'II-20': { level: 5, label: 'II-20' },
-                              'II-30': { level: 6, label: 'II-30' },
-                              'III-100': { level: 7, label: 'III-100' },
-                              'III-200': { level: 8, label: 'III-200' },
-                              'III-300': { level: 9, label: 'III-300' }
-                            };
-                            // 重症度レベル
-                            const severityLevels = {
-                              '軽度': { level: 1, label: '軽度' },
-                              '中等度': { level: 2, label: '中等度' },
-                              '重度': { level: 3, label: '重度' }
-                            };
-
-                            // イベントタイプごとにグループ化
-                            const groups = {};
-                            clinicalEvents.forEach(e => {
-                              if (!groups[e.eventType]) {
-                                groups[e.eventType] = { type: e.eventType, entries: [] };
-                              }
-                              groups[e.eventType].entries.push(e);
-                            });
-                            Object.values(groups).forEach(g => g.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate)));
-
-                            return Object.values(groups).map((group, gIdx) => {
-                              const color = eventColors[group.type] || '#6b7280';
-
-                              // レベルベースかどうか判定
-                              const isFrequencyBased = group.entries.some(e => e.frequency);
-                              const isJCSBased = group.entries.some(e => e.jcs);
-                              const isSeverityBased = group.entries.some(e => e.severity);
-                              const hasLevels = isFrequencyBased || isJCSBased || isSeverityBased;
-
-                              const maxBarHeight = hasLevels ? 50 : 26;
-                              let maxLevel = 7;
-                              if (isJCSBased) maxLevel = 9;
-                              if (isSeverityBased) maxLevel = 3;
-
-                              return (
-                                <div key={gIdx} style={{display: 'flex', alignItems: hasLevels ? 'flex-end' : 'center', height: `${maxBarHeight + 8}px`}}>
-                                  <div style={{
-                                    width: '180px',
-                                    flexShrink: 0,
-                                    fontSize: '11px',
-                                    color: '#374151',
-                                    paddingRight: '12px',
-                                    textAlign: 'right',
-                                    display: 'flex',
-                                    alignItems: 'center',
-                                    justifyContent: 'flex-end',
-                                    gap: '6px',
-                                    paddingBottom: hasLevels ? '4px' : '0'
-                                  }}>
-                                    <span style={{
-                                      width: '8px',
-                                      height: '8px',
-                                      borderRadius: '50%',
-                                      background: color,
-                                      flexShrink: 0
-                                    }} />
-                                    <span style={{overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap'}}>
-                                      {group.type}
-                                    </span>
-                                  </div>
-
-                                  <div style={{
-                                    flex: 1,
-                                    position: 'relative',
-                                    height: `${maxBarHeight}px`,
-                                    background: '#fafafa'
-                                  }}>
-                                    {group.entries.map((entry, eIdx) => {
-                                      const startDay = calcDaysFromOnset(entry.startDate);
-                                      const endDay = entry.endDate ? calcDaysFromOnset(entry.endDate) : startDay;
-                                      const leftPercent = ((startDay - minDay) / dayRange) * 100;
-                                      const widthPercent = Math.max(((endDay - startDay) / dayRange) * 100, 2);
-
-                                      // レベルとラベルを決定
-                                      let level = maxLevel;
-                                      let labelText = '';
-                                      if (entry.frequency && frequencyLevels[entry.frequency]) {
-                                        level = frequencyLevels[entry.frequency].level;
-                                        labelText = frequencyLevels[entry.frequency].label;
-                                      } else if (entry.jcs && jcsLevels[entry.jcs]) {
-                                        level = jcsLevels[entry.jcs].level;
-                                        labelText = jcsLevels[entry.jcs].label;
-                                      } else if (entry.severity && severityLevels[entry.severity]) {
-                                        level = severityLevels[entry.severity].level;
-                                        labelText = severityLevels[entry.severity].label;
-                                      } else if (entry.presence) {
-                                        labelText = entry.presence;
-                                      }
-
-                                      const barHeight = hasLevels
-                                        ? Math.max((level / maxLevel) * maxBarHeight, 14)
-                                        : maxBarHeight - 8;
-
-                                      return (
-                                        <div
-                                          key={eIdx}
-                                          style={{
-                                            position: 'absolute',
-                                            left: `${leftPercent}%`,
-                                            width: `${widthPercent}%`,
-                                            height: `${barHeight}px`,
-                                            bottom: 0,
-                                            background: color,
-                                            borderRadius: '2px 2px 0 0',
-                                            display: 'flex',
-                                            alignItems: 'center',
-                                            justifyContent: 'center',
-                                            opacity: 0.85
-                                          }}
-                                          title={`${group.type}: Day ${startDay}〜${endDay}${labelText ? ` (${labelText})` : ''}`}
-                                        >
-                                          {widthPercent > 4 && barHeight > 14 && labelText && (
-                                            <span style={{fontSize: '9px', color: 'white', fontWeight: '600'}}>
-                                              {labelText}
-                                            </span>
-                                          )}
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
-                                </div>
-                              );
-                            });
-                          })()}
-                        </div>
-                      </>
-                    )}
-
-                    {/* 治療セクション */}
-                    {treatments.length > 0 && (
-                      <>
-                        <div style={{fontSize: '13px', fontWeight: '600', color: '#374151', marginBottom: '8px'}}>
-                          治療
-                        </div>
-                        <div style={{display: 'flex', flexDirection: 'column', gap: '4px'}}>
-                          {treatments.sort((a, b) => new Date(a.startDate) - new Date(b.startDate)).map((t, idx) => {
-                            const startDay = calcDaysFromOnset(t.startDate);
-                            const endDay = t.endDate ? calcDaysFromOnset(t.endDate) : startDay;
-                            const isSingleDay = startDay === endDay;
-                            const color = treatmentColors[t.category] || treatmentColors['その他'];
-
-                            const leftPercent = ((startDay - minDay) / dayRange) * 100;
-                            const widthPercent = isSingleDay ? 0 : ((endDay - startDay) / dayRange) * 100;
-
-                            return (
-                              <div key={idx} style={{display: 'flex', alignItems: 'center', height: '26px'}}>
-                                <div style={{
-                                  width: '180px',
-                                  flexShrink: 0,
-                                  fontSize: '11px',
-                                  color: '#374151',
-                                  paddingRight: '12px',
-                                  textAlign: 'right',
-                                  overflow: 'hidden',
-                                  textOverflow: 'ellipsis',
-                                  whiteSpace: 'nowrap'
-                                }} title={t.medicationName}>
-                                  {t.medicationName}
-                                </div>
-
-                                <div style={{
-                                  flex: 1,
-                                  position: 'relative',
-                                  height: '100%',
-                                  background: '#fafafa'
-                                }}>
-                                  {isSingleDay ? (
-                                    <div
-                                      style={{
-                                        position: 'absolute',
-                                        left: `${leftPercent}%`,
-                                        top: '50%',
-                                        transform: 'translate(-50%, -50%)',
-                                        width: 0,
-                                        height: 0,
-                                        borderLeft: '8px solid transparent',
-                                        borderRight: '8px solid transparent',
-                                        borderBottom: `14px solid ${color}`
-                                      }}
-                                      title={`${t.medicationName}: Day ${startDay}${t.dosage ? ` (${t.dosage}${t.dosageUnit || ''})` : ''}`}
-                                    />
-                                  ) : (
-                                    <div
-                                      style={{
-                                        position: 'absolute',
-                                        left: `${leftPercent}%`,
-                                        width: `${Math.max(widthPercent, 0.5)}%`,
-                                        height: '18px',
-                                        top: '50%',
-                                        transform: 'translateY(-50%)',
-                                        background: color,
-                                        borderRadius: '4px',
-                                        display: 'flex',
-                                        alignItems: 'center',
-                                        justifyContent: 'center'
-                                      }}
-                                      title={`${t.medicationName}: Day ${startDay}〜${endDay}${t.dosage ? ` (${t.dosage}${t.dosageUnit || ''})` : ''}`}
-                                    >
-                                      {t.dosage && widthPercent > 5 && (
-                                        <span style={{fontSize: '9px', color: 'white', fontWeight: '500'}}>
-                                          {t.dosage}{t.dosageUnit ? t.dosageUnit.replace('/日', '') : ''}
-                                        </span>
-                                      )}
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </>
-                    )}
-
-                    {/* 凡例 */}
-                    <div style={{marginTop: '24px', paddingTop: '16px', borderTop: '1px solid #e5e7eb'}}>
-                      <div style={{fontSize: '12px', fontWeight: '600', color: '#374151', marginBottom: '8px'}}>凡例</div>
-                      <div style={{display: 'flex', flexWrap: 'wrap', gap: '16px'}}>
-                        <div>
-                          <div style={{fontSize: '10px', color: '#6b7280', marginBottom: '4px'}}>症状</div>
-                          <div style={{display: 'flex', flexWrap: 'wrap', gap: '8px'}}>
-                            {Object.entries(eventColors).map(([name, color]) => {
-                              const hasEvent = clinicalEvents.some(e => e.eventType === name);
-                              if (!hasEvent) return null;
-                              return (
-                                <div key={name} style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
-                                  <div style={{width: '10px', height: '10px', borderRadius: '50%', background: color}} />
-                                  <span style={{fontSize: '10px', color: '#6b7280'}}>{name}</span>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                        <div>
-                          <div style={{fontSize: '10px', color: '#6b7280', marginBottom: '4px'}}>治療</div>
-                          <div style={{display: 'flex', flexWrap: 'wrap', gap: '8px'}}>
-                            {Object.entries(treatmentColors).map(([name, color]) => {
-                              const hasTreat = treatments.some(t => t.category === name);
-                              if (!hasTreat) return null;
-                              return (
-                                <div key={name} style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
-                                  <div style={{width: '12px', height: '8px', borderRadius: '2px', background: color}} />
-                                  <span style={{fontSize: '10px', color: '#6b7280'}}>{name}</span>
-                                </div>
-                              );
-                            })}
-                          </div>
-                        </div>
-                        <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
-                          <div style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
-                            <div style={{
-                              width: 0,
-                              height: 0,
-                              borderLeft: '6px solid transparent',
-                              borderRight: '6px solid transparent',
-                              borderBottom: '10px solid #6b7280'
-                            }} />
-                            <span style={{fontSize: '10px', color: '#6b7280'}}>単発治療</span>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-                  </>
-                );
-              })()}
-            </div>
-
-            <div style={{display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '20px'}}>
-              <button
-                onClick={() => setShowClinicalTimeline(false)}
-                style={styles.cancelButton}
-              >
-                閉じる
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* 検査データ追加モーダル */}
       {showAddLabModal && (
         <div style={styles.modalOverlay}>
@@ -10923,7 +11072,9 @@ function PatientDetailView({ patient, onBack }) {
       {showExcelModal && (
         <div style={styles.modalOverlay}>
           <div style={{...styles.modal, maxWidth: '800px'}}>
-            <h2 style={styles.modalTitle}>Excelから検査データをインポート</h2>
+            <h2 style={styles.modalTitle}>
+              {isMultiSheetExcel ? 'Excelから一括インポート' : 'Excelから検査データをインポート'}
+            </h2>
 
             {!excelData ? (
               <>
@@ -10949,7 +11100,31 @@ function PatientDetailView({ patient, onBack }) {
                     フォーマットを確認してからデータを作成できます
                   </p>
                 </div>
-                <div style={styles.uploadArea}>
+                <div
+                  style={{
+                    ...styles.uploadArea,
+                    border: isDraggingExcel ? '2px dashed #3b82f6' : '2px dashed #d1d5db',
+                    background: isDraggingExcel ? '#eff6ff' : '#f9fafb'
+                  }}
+                  onDragOver={(e) => {
+                    e.preventDefault();
+                    setIsDraggingExcel(true);
+                  }}
+                  onDragLeave={(e) => {
+                    e.preventDefault();
+                    setIsDraggingExcel(false);
+                  }}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setIsDraggingExcel(false);
+                    const file = e.dataTransfer.files[0];
+                    if (file && (file.name.endsWith('.xlsx') || file.name.endsWith('.xls'))) {
+                      handleExcelUpload({ target: { files: [file] } });
+                    } else {
+                      alert('Excelファイル(.xlsx, .xls)をドロップしてください');
+                    }
+                  }}
+                >
                   <label style={styles.uploadLabel}>
                     <input
                       type="file"
@@ -10960,7 +11135,7 @@ function PatientDetailView({ patient, onBack }) {
                     <div style={styles.uploadContent}>
                       <span style={styles.uploadIcon}>📊</span>
                       <span style={{fontWeight: '500', color: '#475569'}}>
-                      クリックしてExcelファイルを選択
+                      {isDraggingExcel ? 'ここにドロップ' : 'クリックまたはドラッグ＆ドロップ'}
                     </span>
                     <span style={styles.uploadHint}>
                       .xlsx または .xls ファイルに対応
@@ -10969,7 +11144,152 @@ function PatientDetailView({ patient, onBack }) {
                 </label>
               </div>
               </>
+            ) : isMultiSheetExcel ? (
+              /* マルチシート形式のプレビュー */
+              <div style={{maxHeight: '500px', overflowY: 'auto'}}>
+                <div style={{background: '#f0f9ff', border: '1px solid #bae6fd', borderRadius: '8px', padding: '12px', marginBottom: '16px'}}>
+                  <p style={{margin: 0, fontSize: '13px', color: '#0369a1'}}>
+                    マルチシート形式のExcelを検出しました。インポートする項目を選択してください。
+                  </p>
+                </div>
+
+                {/* 検査データプレビュー */}
+                {parsedExcelData.length > 0 && (
+                  <div style={{marginBottom: '20px'}}>
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px'}}>
+                      <h3 style={{fontSize: '14px', fontWeight: '600', color: '#374151', margin: 0}}>
+                        検査データ ({selectedLabIndices.length}/{parsedExcelData.length}日分)
+                      </h3>
+                      <div style={{display: 'flex', gap: '8px'}}>
+                        <button
+                          onClick={() => setSelectedLabIndices(parsedExcelData.map((_, i) => i))}
+                          style={{fontSize: '11px', padding: '4px 8px', background: '#e0f2fe', color: '#0369a1', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                        >全選択</button>
+                        <button
+                          onClick={() => setSelectedLabIndices([])}
+                          style={{fontSize: '11px', padding: '4px 8px', background: '#f1f5f9', color: '#64748b', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                        >全解除</button>
+                      </div>
+                    </div>
+                    <div style={{background: '#f8fafc', padding: '12px', borderRadius: '6px', maxHeight: '150px', overflow: 'auto'}}>
+                      {parsedExcelData.map((dayData, idx) => (
+                        <label key={idx} style={{display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', paddingBottom: '8px', borderBottom: idx < parsedExcelData.length - 1 ? '1px solid #e5e7eb' : 'none', cursor: 'pointer'}}>
+                          <input
+                            type="checkbox"
+                            checked={selectedLabIndices.includes(idx)}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedLabIndices([...selectedLabIndices, idx]);
+                              } else {
+                                setSelectedLabIndices(selectedLabIndices.filter(i => i !== idx));
+                              }
+                            }}
+                          />
+                          <strong style={{fontSize: '12px', color: '#1e40af'}}>{dayData.date}</strong>
+                          <span style={{fontSize: '12px', color: '#6b7280'}}>
+                            {dayData.data.length}項目
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 治療データプレビュー */}
+                {parsedExcelTreatments.length > 0 && (
+                  <div style={{marginBottom: '20px'}}>
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px'}}>
+                      <h3 style={{fontSize: '14px', fontWeight: '600', color: '#374151', margin: 0}}>
+                        治療データ ({selectedTreatmentIndices.length}/{parsedExcelTreatments.length}件)
+                      </h3>
+                      <div style={{display: 'flex', gap: '8px'}}>
+                        <button
+                          onClick={() => setSelectedTreatmentIndices(parsedExcelTreatments.map((_, i) => i))}
+                          style={{fontSize: '11px', padding: '4px 8px', background: '#e0f2fe', color: '#0369a1', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                        >全選択</button>
+                        <button
+                          onClick={() => setSelectedTreatmentIndices([])}
+                          style={{fontSize: '11px', padding: '4px 8px', background: '#f1f5f9', color: '#64748b', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                        >全解除</button>
+                      </div>
+                    </div>
+                    <div style={{background: '#f8fafc', padding: '12px', borderRadius: '6px', maxHeight: '150px', overflow: 'auto'}}>
+                      {parsedExcelTreatments.map((t, idx) => (
+                        <label key={idx} style={{display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px', fontSize: '13px', cursor: 'pointer'}}>
+                          <input
+                            type="checkbox"
+                            checked={selectedTreatmentIndices.includes(idx)}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedTreatmentIndices([...selectedTreatmentIndices, idx]);
+                              } else {
+                                setSelectedTreatmentIndices(selectedTreatmentIndices.filter(i => i !== idx));
+                              }
+                            }}
+                          />
+                          <strong>{t.medicationName}</strong>
+                          {t.dosage && <span> {t.dosage}{t.dosageUnit}</span>}
+                          <span style={{color: '#6b7280'}}>
+                            {t.startDate} 〜 {t.endDate || '継続中'}
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 臨床イベントプレビュー */}
+                {parsedExcelEvents.length > 0 && (
+                  <div style={{marginBottom: '20px'}}>
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px'}}>
+                      <h3 style={{fontSize: '14px', fontWeight: '600', color: '#374151', margin: 0}}>
+                        臨床イベント ({selectedEventIndices.length}/{parsedExcelEvents.length}件)
+                      </h3>
+                      <div style={{display: 'flex', gap: '8px'}}>
+                        <button
+                          onClick={() => setSelectedEventIndices(parsedExcelEvents.map((_, i) => i))}
+                          style={{fontSize: '11px', padding: '4px 8px', background: '#e0f2fe', color: '#0369a1', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                        >全選択</button>
+                        <button
+                          onClick={() => setSelectedEventIndices([])}
+                          style={{fontSize: '11px', padding: '4px 8px', background: '#f1f5f9', color: '#64748b', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                        >全解除</button>
+                      </div>
+                    </div>
+                    <div style={{background: '#f8fafc', padding: '12px', borderRadius: '6px', maxHeight: '150px', overflow: 'auto'}}>
+                      {parsedExcelEvents.map((e, idx) => (
+                        <label key={idx} style={{display: 'flex', alignItems: 'flex-start', gap: '8px', marginBottom: '8px', fontSize: '13px', cursor: 'pointer'}}>
+                          <input
+                            type="checkbox"
+                            checked={selectedEventIndices.includes(idx)}
+                            onChange={(ev) => {
+                              if (ev.target.checked) {
+                                setSelectedEventIndices([...selectedEventIndices, idx]);
+                              } else {
+                                setSelectedEventIndices(selectedEventIndices.filter(i => i !== idx));
+                              }
+                            }}
+                            style={{marginTop: '3px'}}
+                          />
+                          <div>
+                            <strong>{e.eventType}</strong>
+                            <span style={{color: '#6b7280', marginLeft: '8px'}}>{e.startDate}</span>
+                            {e.note && <p style={{margin: '4px 0 0 0', fontSize: '12px', color: '#6b7280'}}>{e.note}</p>}
+                          </div>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {parsedExcelData.length === 0 && parsedExcelTreatments.length === 0 && parsedExcelEvents.length === 0 && (
+                  <p style={{color: '#64748b', textAlign: 'center', padding: '40px'}}>
+                    インポート可能なデータが見つかりませんでした
+                  </p>
+                )}
+              </div>
             ) : (
+              /* 従来形式のプレビュー */
               <>
                 {/* シート選択 */}
                 <div style={{marginBottom: '20px'}}>
@@ -11036,21 +11356,318 @@ function PatientDetailView({ patient, onBack }) {
                   setExcelData(null);
                   setExcelSheets([]);
                   setParsedExcelData([]);
+                  setParsedExcelTreatments([]);
+                  setParsedExcelEvents([]);
+                  setSelectedLabIndices([]);
+                  setSelectedTreatmentIndices([]);
+                  setSelectedEventIndices([]);
+                  setIsMultiSheetExcel(false);
+                  setIsDraggingExcel(false);
                 }}
                 style={styles.cancelButton}
               >
                 キャンセル
               </button>
-              {excelData && parsedExcelData.length > 0 && (
+              {excelData && (parsedExcelData.length > 0 || parsedExcelTreatments.length > 0 || parsedExcelEvents.length > 0) && (
                 <button
                   onClick={importExcelData}
-                  style={{...styles.primaryButton, opacity: isImporting ? 0.7 : 1}}
-                  disabled={isImporting}
+                  style={{
+                    ...styles.primaryButton,
+                    opacity: isImporting || (selectedLabIndices.length === 0 && selectedTreatmentIndices.length === 0 && selectedEventIndices.length === 0) ? 0.5 : 1
+                  }}
+                  disabled={isImporting || (selectedLabIndices.length === 0 && selectedTreatmentIndices.length === 0 && selectedEventIndices.length === 0)}
                 >
-                  {isImporting ? 'インポート中...' : `${parsedExcelData.length}日分をインポート`}
+                  {isImporting ? 'インポート中...' :
+                    isMultiSheetExcel
+                      ? `選択項目をインポート (${selectedLabIndices.length + selectedTreatmentIndices.length + selectedEventIndices.length}件)`
+                      : `${selectedLabIndices.length}日分をインポート`
+                  }
                 </button>
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* サマリー解析モーダル */}
+      {showSummaryModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{...styles.modal, maxWidth: '800px', maxHeight: '90vh', overflow: 'auto'}}>
+            <h2 style={styles.modalTitle}>📋 サマリーから経過表を作成</h2>
+            <p style={{fontSize: '13px', color: '#6b7280', marginBottom: '20px'}}>
+              カルテサマリーの画像をアップロードすると、AIが検査値・治療薬・臨床経過を自動抽出します。
+            </p>
+
+            {summaryError && (
+              <div style={{background: '#fef2f2', border: '1px solid #fecaca', borderRadius: '8px', padding: '12px', marginBottom: '16px'}}>
+                <p style={{color: '#dc2626', fontSize: '13px', margin: 0}}>{summaryError}</p>
+              </div>
+            )}
+
+            {!summaryResult ? (
+              // 画像アップロード画面
+              <div>
+                <div
+                  style={{
+                    border: '2px dashed #d1d5db',
+                    borderRadius: '12px',
+                    padding: '40px',
+                    textAlign: 'center',
+                    background: summaryImage ? '#f0fdf4' : '#f9fafb',
+                    cursor: 'pointer'
+                  }}
+                  onClick={() => document.getElementById('summaryImageInput').click()}
+                >
+                  <input
+                    id="summaryImageInput"
+                    type="file"
+                    accept="image/*"
+                    style={{display: 'none'}}
+                    onChange={(e) => {
+                      const file = e.target.files[0];
+                      if (file) {
+                        setSummaryImage(file);
+                        setSummaryError('');
+                      }
+                    }}
+                  />
+                  {summaryImage ? (
+                    <div>
+                      <div style={{fontSize: '48px', marginBottom: '12px'}}>✅</div>
+                      <p style={{fontWeight: '600', color: '#059669'}}>{summaryImage.name}</p>
+                      <p style={{fontSize: '12px', color: '#6b7280'}}>クリックして変更</p>
+                    </div>
+                  ) : (
+                    <div>
+                      <div style={{fontSize: '48px', marginBottom: '12px'}}>📄</div>
+                      <p style={{fontWeight: '600', color: '#374151'}}>画像をドロップまたはクリック</p>
+                      <p style={{fontSize: '12px', color: '#6b7280'}}>対応形式: JPG, PNG, PDF</p>
+                    </div>
+                  )}
+                </div>
+
+                <div style={{marginTop: '20px', padding: '16px', background: '#fffbeb', borderRadius: '8px', border: '1px solid #fcd34d'}}>
+                  <p style={{fontSize: '12px', color: '#92400e', margin: 0}}>
+                    <strong>対応フォーマット:</strong> FUJITSU, IBM, NEC等の主要電子カルテ<br/>
+                    <strong>注意:</strong> 個人情報（氏名・ID等）は自動で除外されますが、念のため確認してください
+                  </p>
+                </div>
+
+                <div style={{...styles.modalActions, marginTop: '24px'}}>
+                  <button
+                    onClick={() => {
+                      setShowSummaryModal(false);
+                      setSummaryImage(null);
+                      setSummaryResult(null);
+                      setSummaryError('');
+                    }}
+                    style={styles.cancelButton}
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    onClick={async () => {
+                      if (!summaryImage) {
+                        setSummaryError('画像を選択してください');
+                        return;
+                      }
+                      setSummaryProcessing(true);
+                      setSummaryError('');
+                      try {
+                        const result = await processSummaryImage(summaryImage, (progress) => {
+                          console.log('Progress:', progress);
+                        });
+                        if (result.success) {
+                          setSummaryResult(result.data);
+                        } else {
+                          setSummaryError(result.error || '解析に失敗しました');
+                        }
+                      } catch (err) {
+                        setSummaryError(err.message || '解析中にエラーが発生しました');
+                      } finally {
+                        setSummaryProcessing(false);
+                      }
+                    }}
+                    disabled={!summaryImage || summaryProcessing}
+                    style={{
+                      ...styles.primaryButton,
+                      backgroundColor: summaryProcessing ? '#9ca3af' : '#f59e0b',
+                      cursor: summaryProcessing ? 'wait' : 'pointer'
+                    }}
+                  >
+                    {summaryProcessing ? '解析中...' : 'AIで解析'}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              // 解析結果プレビュー画面
+              <div>
+                <div style={{marginBottom: '20px', padding: '12px', background: '#f0fdf4', borderRadius: '8px', border: '1px solid #86efac'}}>
+                  <p style={{color: '#059669', fontSize: '13px', margin: 0, fontWeight: '500'}}>
+                    ✅ 解析完了 - 内容を確認して登録してください
+                  </p>
+                </div>
+
+                {/* 患者情報 */}
+                {summaryResult.patientInfo && (
+                  <div style={{marginBottom: '20px'}}>
+                    <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#374151'}}>患者情報</h3>
+                    <div style={{background: '#f8fafc', padding: '12px', borderRadius: '6px', fontSize: '13px'}}>
+                      <p style={{margin: '4px 0'}}><strong>診断:</strong> {summaryResult.patientInfo.diagnosis || '不明'}</p>
+                      <p style={{margin: '4px 0'}}><strong>発症日:</strong> {summaryResult.patientInfo.onsetDate || '不明'}</p>
+                    </div>
+                  </div>
+                )}
+
+                {/* 検査データ */}
+                {summaryResult.labResults && summaryResult.labResults.length > 0 && (
+                  <div style={{marginBottom: '20px'}}>
+                    <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#374151'}}>
+                      検査データ ({summaryResult.labResults.length}日分)
+                    </h3>
+                    <div style={{maxHeight: '150px', overflow: 'auto', background: '#f8fafc', padding: '12px', borderRadius: '6px'}}>
+                      {summaryResult.labResults.map((lab, idx) => (
+                        <div key={idx} style={{marginBottom: '8px', paddingBottom: '8px', borderBottom: '1px solid #e5e7eb'}}>
+                          <strong style={{fontSize: '12px', color: '#1e40af'}}>{lab.date}</strong>
+                          <span style={{fontSize: '12px', color: '#6b7280', marginLeft: '8px'}}>
+                            {lab.data?.length || 0}項目
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 治療薬 */}
+                {summaryResult.treatments && summaryResult.treatments.length > 0 && (
+                  <div style={{marginBottom: '20px'}}>
+                    <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#374151'}}>
+                      治療薬 ({summaryResult.treatments.length}件)
+                    </h3>
+                    <div style={{maxHeight: '150px', overflow: 'auto', background: '#f8fafc', padding: '12px', borderRadius: '6px'}}>
+                      {summaryResult.treatments.map((t, idx) => (
+                        <div key={idx} style={{marginBottom: '8px', fontSize: '13px'}}>
+                          <strong>{t.medicationName}</strong>
+                          {t.dosage && <span> {t.dosage}{t.dosageUnit}</span>}
+                          <span style={{color: '#6b7280', marginLeft: '8px'}}>
+                            {t.startDate} 〜 {t.endDate || '継続中'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* 臨床イベント */}
+                {summaryResult.clinicalEvents && summaryResult.clinicalEvents.length > 0 && (
+                  <div style={{marginBottom: '20px'}}>
+                    <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '8px', color: '#374151'}}>
+                      臨床イベント ({summaryResult.clinicalEvents.length}件)
+                    </h3>
+                    <div style={{maxHeight: '150px', overflow: 'auto', background: '#f8fafc', padding: '12px', borderRadius: '6px'}}>
+                      {summaryResult.clinicalEvents.map((e, idx) => (
+                        <div key={idx} style={{marginBottom: '8px', fontSize: '13px'}}>
+                          <strong>{e.eventType}</strong>
+                          <span style={{color: '#6b7280', marginLeft: '8px'}}>{e.startDate}</span>
+                          {e.note && <p style={{margin: '4px 0 0 0', fontSize: '12px', color: '#6b7280'}}>{e.note}</p>}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                <div style={{...styles.modalActions, marginTop: '24px'}}>
+                  <button
+                    onClick={() => {
+                      setSummaryResult(null);
+                      setSummaryImage(null);
+                    }}
+                    style={styles.cancelButton}
+                  >
+                    やり直す
+                  </button>
+                  <button
+                    onClick={async () => {
+                      try {
+                        let labCount = 0, treatmentCount = 0, eventCount = 0;
+
+                        // 検査データを登録
+                        if (summaryResult.labResults && summaryResult.labResults.length > 0) {
+                          for (const lab of summaryResult.labResults) {
+                            if (lab.date && lab.data && lab.data.length > 0) {
+                              await addDoc(
+                                collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+                                {
+                                  date: lab.date,
+                                  data: lab.data,
+                                  createdAt: serverTimestamp(),
+                                  source: 'summary'
+                                }
+                              );
+                              labCount++;
+                            }
+                          }
+                        }
+
+                        // 治療薬を登録
+                        if (summaryResult.treatments && summaryResult.treatments.length > 0) {
+                          for (const t of summaryResult.treatments) {
+                            if (t.medicationName && t.startDate) {
+                              await addDoc(
+                                collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+                                {
+                                  category: t.category || 'その他',
+                                  medicationName: t.medicationName,
+                                  dosage: t.dosage || '',
+                                  dosageUnit: t.dosageUnit || '',
+                                  startDate: t.startDate,
+                                  endDate: t.endDate || '',
+                                  createdAt: serverTimestamp(),
+                                  source: 'summary'
+                                }
+                              );
+                              treatmentCount++;
+                            }
+                          }
+                        }
+
+                        // 臨床イベントを登録
+                        if (summaryResult.clinicalEvents && summaryResult.clinicalEvents.length > 0) {
+                          for (const e of summaryResult.clinicalEvents) {
+                            if (e.eventType && e.startDate) {
+                              await addDoc(
+                                collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+                                {
+                                  eventType: e.eventType,
+                                  startDate: e.startDate,
+                                  endDate: e.endDate || '',
+                                  severity: e.severity || '',
+                                  note: e.note || '',
+                                  createdAt: serverTimestamp(),
+                                  source: 'summary'
+                                }
+                              );
+                              eventCount++;
+                            }
+                          }
+                        }
+
+                        alert(`登録完了!\n検査データ: ${labCount}件\n治療薬: ${treatmentCount}件\n臨床イベント: ${eventCount}件`);
+                        setShowSummaryModal(false);
+                        setSummaryResult(null);
+                        setSummaryImage(null);
+                      } catch (error) {
+                        console.error('データ登録エラー:', error);
+                        alert('登録に失敗しました: ' + error.message);
+                      }
+                    }}
+                    style={styles.primaryButton}
+                  >
+                    データを登録
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -11081,11 +11698,13 @@ function App() {
   return <PatientsListView onSelectPatient={setSelectedPatient} />;
 }
 
-// AuthProviderでラップしてエクスポート
+// AuthProviderとOrganizationProviderでラップしてエクスポート
 export default function AppWithAuth() {
   return (
     <AuthProvider>
-      <App />
+      <OrganizationProvider>
+        <App />
+      </OrganizationProvider>
     </AuthProvider>
   );
 }

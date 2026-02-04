@@ -8,12 +8,91 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    // ============================================================
+    // ヘルパー関数
+    // ============================================================
+
+    // システム管理者かどうかをチェック
+    function isSystemAdmin() {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/config/systemAdmin) &&
+        request.auth.token.email in get(/databases/$(database)/documents/config/systemAdmin).data.emails;
+    }
+
+    // 組織のメンバーかどうかをチェック
+    function isMemberOfOrg(orgId) {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/organizationMembers/$(request.auth.uid + '_' + orgId));
+    }
+
+    // 組織での役割を取得
+    function getOrgRole(orgId) {
+      return get(/databases/$(database)/documents/organizationMembers/$(request.auth.uid + '_' + orgId)).data.role;
+    }
+
+    // 組織のオーナーまたは管理者かどうか
+    function isOrgAdminOrOwner(orgId) {
+      return isMemberOfOrg(orgId) && getOrgRole(orgId) in ['owner', 'admin'];
+    }
+
+    // ============================================================
+    // 組織関連のルール（新システム）
+    // ============================================================
+
+    // 組織
+    match /organizations/{orgId} {
+      // メンバーは読み取り可能
+      allow read: if request.auth != null;
+      // システム管理者のみ作成可能
+      allow create: if isSystemAdmin();
+      // オーナー/管理者またはシステム管理者のみ更新可能
+      allow update: if isSystemAdmin() || isOrgAdminOrOwner(orgId);
+      // システム管理者のみ削除可能
+      allow delete: if isSystemAdmin();
+
+      // 組織内の患者データ
+      match /patients/{patientId} {
+        allow read, write: if isMemberOfOrg(orgId);
+
+        match /labResults/{labId} {
+          allow read, write: if isMemberOfOrg(orgId);
+        }
+
+        match /treatments/{treatmentId} {
+          allow read, write: if isMemberOfOrg(orgId);
+        }
+
+        match /clinicalEvents/{eventId} {
+          allow read, write: if isMemberOfOrg(orgId);
+        }
+      }
+    }
+
+    // 組織メンバーシップ
+    match /organizationMembers/{memberId} {
+      // 自分のメンバーシップは読み取り可能
+      allow read: if request.auth != null && (
+        resource.data.uid == request.auth.uid ||
+        resource.data.email == request.auth.token.email
+      );
+      // システム管理者または組織管理者のみ作成・更新・削除可能
+      allow create: if request.auth != null;
+      allow update, delete: if isSystemAdmin() || (
+        request.auth != null &&
+        isOrgAdminOrOwner(resource.data.orgId)
+      );
+    }
+
+    // ============================================================
+    // 既存のルール（後方互換性のため維持）
+    // ============================================================
+
     // ユーザーは自分のデータのみアクセス可能
     match /users/{userId} {
       // 認証済みユーザーが自分のドキュメントのみアクセス可能
       allow read, write: if request.auth != null && request.auth.uid == userId;
 
-      // 患者データ
+      // 患者データ（レガシー）
       match /patients/{patientId} {
         // 認証済みユーザーが自分の患者データのみアクセス可能
         allow read, write: if request.auth != null && request.auth.uid == userId;
@@ -49,11 +128,6 @@ service cloud.firestore {
       allow read: if request.auth != null;
       // 書き込みは認証済みユーザーのみ（アプリ側で管理者チェック）
       allow write: if request.auth != null;
-    }
-
-    // その他のドキュメントへのアクセスは禁止
-    match /{document=**} {
-      allow read, write: if false;
     }
   }
 }

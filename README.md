@@ -34,14 +34,23 @@ Firebase版の臨床データ管理Webアプリケーションです。神経疾
 | **統合タイムライン** | 治療薬と臨床イベントを同一タイムライン上に表示 |
 | **インライン編集** | 一覧画面から直接編集・削除 |
 
-### 経時データ分析・エクスポート
+### 経過グラフ作成・エクスポート
 | 機能 | 説明 |
 |------|------|
 | **オーバーレイ表示** | 検査値グラフに治療薬・臨床イベントを重ね合わせ |
 | **分離表示** | タイムラインをグラフの上または下に配置 |
+| **二軸表示** | 異なるスケールの検査値を左右の軸で表示 |
 | **PNG出力** | グラフ画像をダウンロード |
-| **CSV出力** | PowerPoint等で編集可能なデータ出力 |
-| **SVG出力** | ベクター形式でエクスポート（編集可能） |
+| **Excel出力** | データ編集用にエクスポート |
+
+### マルチテナント（組織分離）v1.4.0
+| 機能 | 説明 |
+|------|------|
+| **組織ごとのデータ分離** | 組織単位でデータを完全に分離 |
+| **組織セレクター** | 複数組織所属時にヘッダーで切り替え |
+| **システム管理パネル** | 組織作成・メンバー一括追加 |
+| **役割管理** | オーナー・管理者・メンバーの3段階 |
+| **メール一括登録** | コピー＆ペーストで複数メンバーを追加 |
 
 ## アーキテクチャ
 
@@ -63,16 +72,22 @@ Firebase版の臨床データ管理Webアプリケーションです。神経疾
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                   Firestore Database                         │
-│  users/{uid}/                                                │
+│                                                              │
+│  [v1.4+ マルチテナント構造]                                    │
+│  organizations/{orgId}/                                      │
 │    └── patients/{patientId}/                                 │
-│          ├── displayId, diagnosis, onsetDate, admissionDate  │
 │          ├── labResults/{labId}/                             │
-│          │     └── date, data[], createdAt                   │
 │          ├── treatments/{treatmentId}/                       │
-│          │     └── category, medication, dosage, unit,       │
-│          │         startDate, endDate, notes                 │
 │          └── clinicalEvents/{eventId}/                       │
-│                └── date, category, description, severity     │
+│                                                              │
+│  organizationMembers/{memberId}/                             │
+│    └── orgId, uid, email, role                               │
+│                                                              │
+│  [レガシー構造（後方互換性）]                                   │
+│  users/{uid}/patients/{patientId}/...                        │
+│                                                              │
+│  config/systemAdmin                                          │
+│    └── emails: ["admin@example.com"]                         │
 └─────────────────────────────────────────────────────────────┘
                            │
                            ▼
@@ -185,6 +200,32 @@ npm run build
 firebase deploy --only hosting
 ```
 
+### 7. システム管理者の設定（v1.4.0以降）
+
+マルチテナント機能を使用する場合、システム管理者を設定します。
+
+1. [Firebase Console](https://console.firebase.google.com) > Firestore Database
+2. `config` コレクションを選択（なければ作成）
+3. ドキュメントID `systemAdmin` で新規ドキュメントを作成
+4. フィールドを追加:
+   - **フィールド名**: `emails`
+   - **型**: `array`
+   - **値**: システム管理者のメールアドレス
+
+```
+config/systemAdmin
+  └── emails: ["admin@example.com", "admin2@example.com"]
+```
+
+設定後、アプリをリロードすると「🔧 システム管理」ボタンが表示されます。
+
+### 8. 組織の作成と管理
+
+1. システム管理パネルで「新規組織作成」
+2. 組織名、プラン（無料/有料）、オーナーのメールを入力
+3. 「メンバー一括追加」でメールアドレスをペースト
+4. メンバーがログインすると自動的に組織に紐付け
+
 ## ディレクトリ構成
 
 ```
@@ -225,8 +266,8 @@ clinical-data-firebase/
 
 ## 将来の拡張案
 
-- [ ] Cloud Vision APIによる高精度OCR
-- [ ] 複数ユーザー間でのデータ共有（共同研究用）
+- [x] Cloud Vision APIによる高精度OCR（v1.1.0で実装済み）
+- [x] 複数ユーザー間でのデータ共有（v1.4.0 マルチテナント機能で実装済み）
 - [ ] PDFレポート自動生成
 - [ ] 統計解析機能（生存分析等）
 - [ ] モバイル対応（PWA）

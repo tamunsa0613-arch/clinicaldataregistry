@@ -585,3 +585,192 @@ exports.processLabImage = onCall(
     }
   }
 );
+
+// ============================================================
+// カルテサマリー解析機能
+// Cloud Vision OCR + Claude API で構造化データを抽出
+// ============================================================
+
+const Anthropic = require("@anthropic-ai/sdk");
+
+// Claude APIクライアント（APIキーは環境変数から取得）
+let anthropicClient = null;
+
+function getAnthropicClient() {
+  if (!anthropicClient) {
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      throw new Error('ANTHROPIC_API_KEY環境変数が設定されていません');
+    }
+    anthropicClient = new Anthropic({ apiKey });
+  }
+  return anthropicClient;
+}
+
+// カルテサマリーから構造化データを抽出するプロンプト
+const SUMMARY_EXTRACTION_PROMPT = `あなたは医療データ抽出の専門家です。以下のカルテサマリーのテキストから、臨床経過表を作成するためのデータを抽出してください。
+
+## 抽出するデータ
+
+1. **検査データ** (labResults)
+   - 日付、検査項目名、数値、単位
+
+2. **治療薬** (treatments)
+   - 薬剤名、カテゴリ（抗てんかん薬、ステロイド、免疫グロブリン、血漿交換、免疫抑制剤、抗菌薬、その他）
+   - 用量、単位、開始日、終了日（分かる場合）
+
+3. **臨床イベント** (clinicalEvents)
+   - 日付、イベント種類（発熱、痙攣、意識障害、画像所見、入院、退院、手術など）
+   - 詳細・メモ
+
+## 出力形式
+
+以下のJSON形式で出力してください。日付は"YYYY-MM-DD"形式、不明な場合はnullとしてください。
+
+\`\`\`json
+{
+  "patientInfo": {
+    "diagnosis": "診断名",
+    "onsetDate": "発症日（推定）"
+  },
+  "labResults": [
+    {
+      "date": "2025-01-15",
+      "data": [
+        {"item": "WBC", "value": 8500, "unit": "/μL"},
+        {"item": "CRP", "value": 2.5, "unit": "mg/dL"}
+      ]
+    }
+  ],
+  "treatments": [
+    {
+      "category": "ステロイド",
+      "medicationName": "メチルプレドニゾロン",
+      "dosage": 1000,
+      "dosageUnit": "mg",
+      "startDate": "2025-01-15",
+      "endDate": "2025-01-17",
+      "note": "パルス療法"
+    }
+  ],
+  "clinicalEvents": [
+    {
+      "eventType": "痙攣",
+      "startDate": "2025-01-14",
+      "endDate": null,
+      "note": "全身性強直間代発作、約2分間"
+    }
+  ]
+}
+\`\`\`
+
+## 注意事項
+- 検査項目名は一般的な略称（WBC, CRP, AST, ALTなど）に正規化してください
+- 日付が「第○病日」などの相対表記の場合、可能なら絶対日付に変換してください
+- 不確かな情報は抽出しないでください
+- 個人を特定できる情報（氏名、ID、住所など）は除外してください
+
+## カルテサマリーテキスト
+
+`;
+
+// サマリー画像を処理するCloud Function
+exports.processSummaryImage = onCall(
+  {
+    cors: true,
+    maxInstances: 10,
+    timeoutSeconds: 120, // 長めのタイムアウト
+    memory: "512MiB"
+  },
+  async (request) => {
+    // 認証チェック
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', '認証が必要です');
+    }
+
+    const { imageBase64 } = request.data;
+
+    if (!imageBase64) {
+      throw new HttpsError('invalid-argument', '画像データが必要です');
+    }
+
+    try {
+      // Step 1: Cloud Vision APIでOCR
+      console.log('Step 1: Running OCR...');
+      const imageBuffer = Buffer.from(imageBase64, 'base64');
+
+      const [visionResult] = await visionClient.textDetection({
+        image: { content: imageBuffer }
+      });
+
+      const detections = visionResult.textAnnotations;
+
+      if (!detections || detections.length === 0) {
+        return {
+          success: false,
+          error: 'テキストが検出されませんでした。画像を確認してください。'
+        };
+      }
+
+      const ocrText = detections[0].description;
+      console.log('OCR Text Length:', ocrText.length);
+
+      // 個人情報を除去
+      let cleanedText = ocrText;
+      piiPatterns.forEach(pattern => {
+        cleanedText = cleanedText.replace(pattern, '[個人情報削除]');
+      });
+
+      // Step 2: Claude APIで構造化
+      console.log('Step 2: Structuring with Claude API...');
+
+      const client = getAnthropicClient();
+
+      const message = await client.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 4096,
+        messages: [
+          {
+            role: "user",
+            content: SUMMARY_EXTRACTION_PROMPT + cleanedText
+          }
+        ]
+      });
+
+      // レスポンスからJSONを抽出
+      const responseText = message.content[0].text;
+      console.log('Claude Response Length:', responseText.length);
+
+      // JSONブロックを抽出
+      const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/);
+      let extractedData;
+
+      if (jsonMatch) {
+        extractedData = JSON.parse(jsonMatch[1]);
+      } else {
+        // JSONブロックがない場合、全体をパースしてみる
+        try {
+          extractedData = JSON.parse(responseText);
+        } catch (e) {
+          throw new Error('Claude APIの応答からJSONを抽出できませんでした');
+        }
+      }
+
+      return {
+        success: true,
+        data: extractedData,
+        ocrTextLength: ocrText.length,
+        message: 'サマリーの解析が完了しました'
+      };
+
+    } catch (error) {
+      console.error('Summary Processing Error:', error);
+
+      if (error.message.includes('ANTHROPIC_API_KEY')) {
+        throw new HttpsError('failed-precondition', 'Claude APIキーが設定されていません。Firebase Functionsの環境変数を確認してください。');
+      }
+
+      throw new HttpsError('internal', `サマリー処理エラー: ${error.message}`);
+    }
+  }
+);
