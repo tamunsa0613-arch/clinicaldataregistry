@@ -1682,6 +1682,10 @@ function PatientsListView({ onSelectPatient }) {
   const [comparisonResults, setComparisonResults] = useState(null);
   const [dayRangeStart, setDayRangeStart] = useState('');
   const [dayRangeEnd, setDayRangeEnd] = useState('');
+  // サンプル選択モード: 'all'=全サンプル, 'first'=最初, 'last'=最後, 'closest'=指定日に最も近い
+  const [sampleSelectionMode, setSampleSelectionMode] = useState('all');
+  const [targetDay, setTargetDay] = useState(''); // 'closest'モードで使用
+  const [sampleDetails, setSampleDetails] = useState(null); // 患者別サンプル数の詳細
 
   // 統計解析用state
   const [showStatisticalAnalysis, setShowStatisticalAnalysis] = useState(false);
@@ -1691,6 +1695,23 @@ function PatientsListView({ onSelectPatient }) {
   const [statResults, setStatResults] = useState(null);
   const [showDataPoints, setShowDataPoints] = useState('black'); // 'black', 'white', 'none'
   const statisticalChartRef = useRef(null);
+
+  // ROC曲線解析用state
+  const [showRocAnalysis, setShowRocAnalysis] = useState(false);
+  const [rocSelectedItems, setRocSelectedItems] = useState([]);
+  const [rocResults, setRocResults] = useState(null);
+  const [isCalculatingRoc, setIsCalculatingRoc] = useState(false);
+  const [rocRawData, setRocRawData] = useState(null); // Rスクリプト用生データ
+  const rocChartRef = useRef(null);
+
+  // 相関解析用state
+  const [showCorrelationAnalysis, setShowCorrelationAnalysis] = useState(false);
+  const [correlationSelectedItems, setCorrelationSelectedItems] = useState([]);
+  const [correlationResults, setCorrelationResults] = useState(null);
+  const [isCalculatingCorrelation, setIsCalculatingCorrelation] = useState(false);
+  const [correlationType, setCorrelationType] = useState('spearman'); // 'spearman' or 'pearson'
+  const [correlationRawData, setCorrelationRawData] = useState(null); // Rスクリプト用生データ
+  const correlationChartRef = useRef(null);
 
   // 患者一括インポート用state
   const [showBulkImportModal, setShowBulkImportModal] = useState(false);
@@ -2861,6 +2882,1045 @@ function PatientsListView({ onSelectPatient }) {
     return 'n.s.';
   };
 
+  // ===== ROC曲線解析関数 =====
+
+  // ROC曲線の座標を計算
+  const calculateROC = (positiveValues, negativeValues) => {
+    if (!positiveValues || !negativeValues || positiveValues.length === 0 || negativeValues.length === 0) {
+      return null;
+    }
+
+    // 全ての値を閾値候補としてソート
+    const allValues = [...positiveValues, ...negativeValues].sort((a, b) => a - b);
+    const thresholds = [-Infinity, ...allValues, Infinity];
+
+    const rocPoints = [];
+    const nPos = positiveValues.length;
+    const nNeg = negativeValues.length;
+
+    for (const threshold of thresholds) {
+      // 閾値以上を陽性と予測
+      const tp = positiveValues.filter(v => v >= threshold).length;
+      const fp = negativeValues.filter(v => v >= threshold).length;
+      const tn = nNeg - fp;
+      const fn = nPos - tp;
+
+      const tpr = nPos > 0 ? tp / nPos : 0; // 感度 (True Positive Rate)
+      const fpr = nNeg > 0 ? fp / nNeg : 0; // 1-特異度 (False Positive Rate)
+      const specificity = nNeg > 0 ? tn / nNeg : 0;
+
+      rocPoints.push({
+        threshold: threshold === -Infinity ? 'min' : threshold === Infinity ? 'max' : threshold,
+        tpr,
+        fpr,
+        sensitivity: tpr,
+        specificity,
+        tp, fp, tn, fn
+      });
+    }
+
+    // FPRでソート（ROC曲線描画用）
+    rocPoints.sort((a, b) => a.fpr - b.fpr || b.tpr - a.tpr);
+
+    return rocPoints;
+  };
+
+  // AUCを台形法で計算
+  const calculateAUC = (rocPoints) => {
+    if (!rocPoints || rocPoints.length < 2) return 0;
+
+    let auc = 0;
+    for (let i = 1; i < rocPoints.length; i++) {
+      const width = rocPoints[i].fpr - rocPoints[i - 1].fpr;
+      const height = (rocPoints[i].tpr + rocPoints[i - 1].tpr) / 2;
+      auc += width * height;
+    }
+    return Math.max(0, Math.min(1, auc));
+  };
+
+  // AUCの95%信頼区間（Hanley-McNeil法の簡易版）
+  const calculateAUCCI = (auc, nPos, nNeg) => {
+    if (nPos < 2 || nNeg < 2) return { lower: 0, upper: 1 };
+
+    // Hanley-McNeil法による標準誤差の近似
+    const q1 = auc / (2 - auc);
+    const q2 = (2 * auc * auc) / (1 + auc);
+    const se = Math.sqrt((auc * (1 - auc) + (nPos - 1) * (q1 - auc * auc) + (nNeg - 1) * (q2 - auc * auc)) / (nPos * nNeg));
+
+    const z = 1.96; // 95% CI
+    const lower = Math.max(0, auc - z * se);
+    const upper = Math.min(1, auc + z * se);
+
+    return { lower, upper, se };
+  };
+
+  // 最適カットオフ値（Youden Index）
+  const findOptimalCutoff = (rocPoints) => {
+    if (!rocPoints || rocPoints.length === 0) return null;
+
+    let maxYouden = -1;
+    let optimalPoint = null;
+
+    for (const point of rocPoints) {
+      if (point.threshold === 'min' || point.threshold === 'max') continue;
+      const youdenIndex = point.sensitivity + point.specificity - 1;
+      if (youdenIndex > maxYouden) {
+        maxYouden = youdenIndex;
+        optimalPoint = { ...point, youdenIndex };
+      }
+    }
+
+    return optimalPoint;
+  };
+
+  // ROC解析を実行
+  const runRocAnalysis = async () => {
+    if (!selectedGroup1 || !selectedGroup2 || rocSelectedItems.length === 0) {
+      alert('2つの群とマーカーを選択してください');
+      return;
+    }
+
+    setIsCalculatingRoc(true);
+
+    const group1Patients = patients.filter(p => p.group === selectedGroup1);
+    const group2Patients = patients.filter(p => p.group === selectedGroup2);
+
+    const results = [];
+    const rawData = {}; // Rスクリプト用生データ
+
+    for (const itemName of rocSelectedItems) {
+      let group1Values = [];
+      let group2Values = [];
+
+      // Group 1のデータ収集
+      for (const patient of group1Patients) {
+        const labQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          orderBy('date', 'asc')
+        );
+        const labSnapshot = await getDocs(labQuery);
+
+        labSnapshot.docs.forEach(labDoc => {
+          const labData = labDoc.data();
+          const labDate = labData.date;
+          const dayFromOnset = calcDayFromOnset(patient, labDate);
+
+          if (!isInDayRange(dayFromOnset)) return;
+
+          if (labData.data && Array.isArray(labData.data)) {
+            const item = labData.data.find(d => d.item === itemName);
+            if (item && !isNaN(parseFloat(item.value))) {
+              group1Values.push(parseFloat(item.value));
+            }
+          }
+        });
+      }
+
+      // Group 2のデータ収集
+      for (const patient of group2Patients) {
+        const labQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          orderBy('date', 'asc')
+        );
+        const labSnapshot = await getDocs(labQuery);
+
+        labSnapshot.docs.forEach(labDoc => {
+          const labData = labDoc.data();
+          const labDate = labData.date;
+          const dayFromOnset = calcDayFromOnset(patient, labDate);
+
+          if (!isInDayRange(dayFromOnset)) return;
+
+          if (labData.data && Array.isArray(labData.data)) {
+            const item = labData.data.find(d => d.item === itemName);
+            if (item && !isNaN(parseFloat(item.value))) {
+              group2Values.push(parseFloat(item.value));
+            }
+          }
+        });
+      }
+
+      // 1患者1サンプルモードの場合
+      if (sampleSelectionMode !== 'all') {
+        // 簡易的に最初/最後/closest を適用（group1Valuesは単純配列なのでここでは省略）
+        // 実際にはpatient IDと紐づけて処理が必要だが、群間比較と同様のデータ構造が必要
+      }
+
+      if (group1Values.length >= 2 && group2Values.length >= 2) {
+        // Group2を陽性（疾患群）、Group1を陰性（コントロール群）として計算
+        // ユーザーの選択順に依存：group2が疾患群と仮定
+        const rocPoints = calculateROC(group2Values, group1Values);
+
+        if (rocPoints) {
+          const auc = calculateAUC(rocPoints);
+          const ci = calculateAUCCI(auc, group2Values.length, group1Values.length);
+          const optimal = findOptimalCutoff(rocPoints);
+
+          // AUCが0.5未満の場合、方向を逆転
+          let finalAuc = auc;
+          let finalRocPoints = rocPoints;
+          let finalOptimal = optimal;
+          let inverted = false;
+
+          if (auc < 0.5) {
+            // 逆方向で再計算
+            const invertedRoc = calculateROC(group1Values, group2Values);
+            finalAuc = calculateAUC(invertedRoc);
+            finalRocPoints = invertedRoc;
+            finalOptimal = findOptimalCutoff(invertedRoc);
+            inverted = true;
+          }
+
+          const positiveGroup = inverted ? selectedGroup1 : selectedGroup2;
+          const negativeGroup = inverted ? selectedGroup2 : selectedGroup1;
+
+          results.push({
+            item: itemName,
+            auc: finalAuc,
+            ci: calculateAUCCI(finalAuc, group2Values.length, group1Values.length),
+            optimal: finalOptimal,
+            rocPoints: finalRocPoints,
+            nPositive: inverted ? group1Values.length : group2Values.length,
+            nNegative: inverted ? group2Values.length : group1Values.length,
+            positiveGroup,
+            negativeGroup,
+            inverted
+          });
+
+          // Rスクリプト用の生データを保存
+          rawData[itemName] = {
+            positiveValues: inverted ? [...group1Values] : [...group2Values],
+            negativeValues: inverted ? [...group2Values] : [...group1Values],
+            positiveGroup,
+            negativeGroup
+          };
+        }
+      }
+    }
+
+    setRocResults(results);
+    setRocRawData(rawData);
+    setIsCalculatingRoc(false);
+  };
+
+  // ROC曲線のカラーパレット
+  const rocColors = [
+    '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6',
+    '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#6366f1'
+  ];
+
+  // ===== ROC曲線解析関数 ここまで =====
+
+  // ===== 相関解析関数 =====
+
+  // Pearson相関係数
+  const pearsonCorrelation = (x, y) => {
+    if (!x || !y || x.length !== y.length || x.length < 3) {
+      return { r: null, p: null };
+    }
+    const n = x.length;
+    const sumX = x.reduce((a, b) => a + b, 0);
+    const sumY = y.reduce((a, b) => a + b, 0);
+    const sumXY = x.reduce((acc, xi, i) => acc + xi * y[i], 0);
+    const sumX2 = x.reduce((acc, xi) => acc + xi * xi, 0);
+    const sumY2 = y.reduce((acc, yi) => acc + yi * yi, 0);
+
+    const numerator = n * sumXY - sumX * sumY;
+    const denominator = Math.sqrt((n * sumX2 - sumX * sumX) * (n * sumY2 - sumY * sumY));
+
+    if (denominator === 0) return { r: 0, p: 1 };
+
+    const r = numerator / denominator;
+
+    // t検定でp値を計算
+    const t = r * Math.sqrt((n - 2) / (1 - r * r));
+    const df = n - 2;
+    // p値近似（両側検定）
+    const p = 2 * (1 - tDistCDF(Math.abs(t), df));
+
+    return { r, p: Math.max(0.0001, p) };
+  };
+
+  // t分布CDF（簡易版）
+  const tDistCDF = (t, df) => {
+    const x = df / (df + t * t);
+    return 1 - 0.5 * betaIncomplete(df / 2, 0.5, x);
+  };
+
+  // Spearman順位相関係数
+  const spearmanCorrelation = (x, y) => {
+    if (!x || !y || x.length !== y.length || x.length < 3) {
+      return { r: null, p: null };
+    }
+    const n = x.length;
+
+    // 順位に変換
+    const rankArray = (arr) => {
+      const sorted = arr.map((v, i) => ({ v, i })).sort((a, b) => a.v - b.v);
+      const ranks = new Array(n);
+      let i = 0;
+      while (i < n) {
+        let j = i;
+        while (j < n - 1 && sorted[j].v === sorted[j + 1].v) j++;
+        const avgRank = (i + j) / 2 + 1;
+        for (let k = i; k <= j; k++) {
+          ranks[sorted[k].i] = avgRank;
+        }
+        i = j + 1;
+      }
+      return ranks;
+    };
+
+    const rankX = rankArray(x);
+    const rankY = rankArray(y);
+
+    // Pearson相関を順位に適用
+    return pearsonCorrelation(rankX, rankY);
+  };
+
+  // 相関解析を実行
+  const runCorrelationAnalysis = async () => {
+    if (correlationSelectedItems.length < 2) {
+      alert('2つ以上のマーカーを選択してください');
+      return;
+    }
+
+    setIsCalculatingCorrelation(true);
+
+    // 選択された患者からデータを収集
+    const targetPatients = selectedPatientIds.length > 0
+      ? patients.filter(p => selectedPatientIds.includes(p.id))
+      : patients;
+
+    // マーカーごとのデータを収集（患者×日付ごとにペアを作成）
+    const dataByPatientDate = {}; // { patientId_date: { marker1: value, marker2: value, ... } }
+
+    for (const patient of targetPatients) {
+      const labQuery = query(
+        collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+        orderBy('date', 'asc')
+      );
+      const labSnapshot = await getDocs(labQuery);
+
+      labSnapshot.docs.forEach(labDoc => {
+        const labData = labDoc.data();
+        const labDate = labData.date;
+        const dayFromOnset = calcDayFromOnset(patient, labDate);
+
+        if (!isInDayRange(dayFromOnset)) return;
+
+        const key = `${patient.id}_${labDate}`;
+        if (!dataByPatientDate[key]) {
+          dataByPatientDate[key] = {};
+        }
+
+        if (labData.data && Array.isArray(labData.data)) {
+          correlationSelectedItems.forEach(itemName => {
+            const item = labData.data.find(d => d.item === itemName);
+            if (item && !isNaN(parseFloat(item.value))) {
+              dataByPatientDate[key][itemName] = parseFloat(item.value);
+            }
+          });
+        }
+      });
+    }
+
+    // 相関行列を計算
+    const items = correlationSelectedItems;
+    const matrix = [];
+    const pMatrix = [];
+
+    for (let i = 0; i < items.length; i++) {
+      matrix[i] = [];
+      pMatrix[i] = [];
+      for (let j = 0; j < items.length; j++) {
+        if (i === j) {
+          matrix[i][j] = 1;
+          pMatrix[i][j] = 0;
+        } else {
+          // 両方のマーカーが存在するデータポイントのみ使用
+          const pairs = Object.values(dataByPatientDate)
+            .filter(d => d[items[i]] !== undefined && d[items[j]] !== undefined)
+            .map(d => [d[items[i]], d[items[j]]]);
+
+          if (pairs.length >= 3) {
+            const x = pairs.map(p => p[0]);
+            const y = pairs.map(p => p[1]);
+            const result = correlationType === 'spearman'
+              ? spearmanCorrelation(x, y)
+              : pearsonCorrelation(x, y);
+            matrix[i][j] = result.r ?? 0;
+            pMatrix[i][j] = result.p ?? 1;
+          } else {
+            matrix[i][j] = null;
+            pMatrix[i][j] = null;
+          }
+        }
+      }
+    }
+
+    // ペア数をカウント
+    const pairCounts = [];
+    for (let i = 0; i < items.length; i++) {
+      pairCounts[i] = [];
+      for (let j = 0; j < items.length; j++) {
+        const pairs = Object.values(dataByPatientDate)
+          .filter(d => d[items[i]] !== undefined && d[items[j]] !== undefined);
+        pairCounts[i][j] = pairs.length;
+      }
+    }
+
+    setCorrelationResults({
+      items,
+      matrix,
+      pMatrix,
+      pairCounts,
+      type: correlationType
+    });
+
+    // Rスクリプト用の生データを保存
+    setCorrelationRawData(dataByPatientDate);
+    setIsCalculatingCorrelation(false);
+  };
+
+  // 相関係数の色を取得
+  const getCorrelationColor = (r) => {
+    if (r === null) return '#f3f4f6'; // グレー
+    // 青(-1) → 白(0) → 赤(+1)
+    const absR = Math.abs(r);
+    if (r > 0) {
+      // 赤方向
+      const red = 255;
+      const green = Math.round(255 * (1 - absR));
+      const blue = Math.round(255 * (1 - absR));
+      return `rgb(${red}, ${green}, ${blue})`;
+    } else if (r < 0) {
+      // 青方向
+      const red = Math.round(255 * (1 - absR));
+      const green = Math.round(255 * (1 - absR));
+      const blue = 255;
+      return `rgb(${red}, ${green}, ${blue})`;
+    }
+    return '#ffffff';
+  };
+
+  // 有意性マーカー
+  const getCorrelationSignificance = (p) => {
+    if (p === null) return '';
+    if (p < 0.001) return '***';
+    if (p < 0.01) return '**';
+    if (p < 0.05) return '*';
+    return '';
+  };
+
+  // ===== 相関解析関数 ここまで =====
+
+  // ===== Rスクリプト・生データエクスポート関数 =====
+
+  // 群間比較用の生データCSVを生成
+  const exportGroupComparisonRawData = () => {
+    if (!comparisonResults || comparisonResults.length === 0) return;
+
+    // 各検査項目ごとにデータを整理
+    let csvContent = 'patient_id,group,item,value,date,day_from_onset\n';
+
+    comparisonResults.forEach(r => {
+      // Group 1のデータ
+      r.group1.data.forEach(d => {
+        csvContent += `${d.id},${selectedGroup1},${r.item},${d.value},${d.date},${d.day ?? ''}\n`;
+      });
+      // Group 2のデータ
+      r.group2.data.forEach(d => {
+        csvContent += `${d.id},${selectedGroup2},${r.item},${d.value},${d.date},${d.day ?? ''}\n`;
+      });
+    });
+
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+    const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `group_comparison_raw_data_${selectedGroup1}_vs_${selectedGroup2}_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 群間比較用のRスクリプトを生成
+  const exportGroupComparisonRScript = () => {
+    if (!comparisonResults || comparisonResults.length === 0) return;
+
+    const items = comparisonResults.map(r => r.item);
+
+    const rScript = `# ============================================
+# 群間統計比較 - Rスクリプト
+# 生成日時: ${new Date().toLocaleString('ja-JP')}
+# 群1: ${selectedGroup1}
+# 群2: ${selectedGroup2}
+# ============================================
+
+# 必要なパッケージをインストール（未インストールの場合）
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("dplyr")) install.packages("dplyr")
+if (!require("tidyr")) install.packages("tidyr")
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# データ読み込み
+# ※ CSVファイルのパスを適宜変更してください
+data <- read.csv("group_comparison_raw_data_${selectedGroup1}_vs_${selectedGroup2}_${new Date().toISOString().split('T')[0]}.csv",
+                 fileEncoding = "UTF-8-BOM")
+
+# データ確認
+head(data)
+str(data)
+
+# 検査項目リスト
+items <- c(${items.map(i => `"${i}"`).join(', ')})
+
+# ============================================
+# 統計解析
+# ============================================
+
+results <- data.frame()
+
+for (item_name in items) {
+  item_data <- data %>% filter(item == item_name)
+
+  group1_vals <- item_data %>% filter(group == "${selectedGroup1}") %>% pull(value)
+  group2_vals <- item_data %>% filter(group == "${selectedGroup2}") %>% pull(value)
+
+  if (length(group1_vals) >= 2 && length(group2_vals) >= 2) {
+    # 正規性検定（Shapiro-Wilk）
+    shapiro_g1 <- if(length(group1_vals) >= 3 && length(group1_vals) <= 5000) shapiro.test(group1_vals)$p.value else NA
+    shapiro_g2 <- if(length(group2_vals) >= 3 && length(group2_vals) <= 5000) shapiro.test(group2_vals)$p.value else NA
+
+    # Welchのt検定
+    t_result <- t.test(group1_vals, group2_vals, var.equal = FALSE)
+
+    # Mann-Whitney U検定（Wilcoxon順位和検定）
+    wilcox_result <- wilcox.test(group1_vals, group2_vals, exact = FALSE)
+
+    results <- rbind(results, data.frame(
+      item = item_name,
+      n_group1 = length(group1_vals),
+      mean_group1 = mean(group1_vals),
+      sd_group1 = sd(group1_vals),
+      median_group1 = median(group1_vals),
+      n_group2 = length(group2_vals),
+      mean_group2 = mean(group2_vals),
+      sd_group2 = sd(group2_vals),
+      median_group2 = median(group2_vals),
+      shapiro_p_group1 = shapiro_g1,
+      shapiro_p_group2 = shapiro_g2,
+      t_statistic = t_result$statistic,
+      t_p_value = t_result$p.value,
+      wilcox_p_value = wilcox_result$p.value
+    ))
+  }
+}
+
+# 結果表示
+print(results)
+
+# 結果保存
+write.csv(results, "group_comparison_results_R.csv", row.names = FALSE)
+
+# ============================================
+# Box Plot作成
+# ============================================
+
+for (item_name in items) {
+  item_data <- data %>% filter(item == item_name)
+
+  if (nrow(item_data) > 0) {
+    p <- ggplot(item_data, aes(x = group, y = value, fill = group)) +
+      geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+      geom_jitter(width = 0.2, alpha = 0.5, size = 1.5) +
+      labs(title = item_name,
+           x = "Group",
+           y = "Value") +
+      theme_classic() +
+      theme(legend.position = "none",
+            plot.title = element_text(hjust = 0.5, face = "bold"))
+
+    # p値を追加
+    result_row <- results %>% filter(item == item_name)
+    if (nrow(result_row) > 0) {
+      p_val <- result_row$wilcox_p_value[1]
+      p_text <- if(p_val < 0.001) "p < 0.001" else paste0("p = ", round(p_val, 3))
+      p <- p + annotate("text", x = 1.5, y = max(item_data$value) * 1.1,
+                        label = p_text, size = 4)
+    }
+
+    print(p)
+    ggsave(paste0("boxplot_", gsub("/", "_", item_name), ".png"), p, width = 6, height = 5, dpi = 300)
+  }
+}
+
+# ============================================
+# 複数項目を1つのグラフに（オプション）
+# ============================================
+
+if (length(items) <= 6) {
+  p_all <- ggplot(data, aes(x = group, y = value, fill = group)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.5, size = 1) +
+    facet_wrap(~ item, scales = "free_y") +
+    labs(x = "Group", y = "Value") +
+    theme_classic() +
+    theme(legend.position = "bottom",
+          strip.text = element_text(face = "bold"))
+
+  print(p_all)
+  ggsave("boxplot_all_items.png", p_all, width = 10, height = 8, dpi = 300)
+}
+
+cat("\\n解析完了！\\n")
+`;
+
+    const blob = new Blob([rScript], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `group_comparison_analysis_${selectedGroup1}_vs_${selectedGroup2}.R`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // ROC解析用の生データCSVを生成
+  const exportRocRawData = () => {
+    if (!rocResults || rocResults.length === 0) return;
+
+    let csvContent = 'marker,group,group_label,value\n';
+
+    rocResults.forEach(r => {
+      // rocPointsから元データを復元するのは難しいので、
+      // 解析時にrawDataを保存しておく必要がある
+      // ここではrocRawDataステートを使用
+      if (rocRawData && rocRawData[r.item]) {
+        const { positiveValues, negativeValues, positiveGroup, negativeGroup } = rocRawData[r.item];
+        positiveValues.forEach(v => {
+          csvContent += `${r.item},positive,${positiveGroup},${v}\n`;
+        });
+        negativeValues.forEach(v => {
+          csvContent += `${r.item},negative,${negativeGroup},${v}\n`;
+        });
+      }
+    });
+
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+    const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `roc_raw_data_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // ROC解析用のRスクリプトを生成
+  const exportRocRScript = () => {
+    if (!rocResults || rocResults.length === 0) return;
+
+    const markers = rocResults.map(r => r.item);
+
+    const rScript = `# ============================================
+# ROC曲線解析 - Rスクリプト
+# 生成日時: ${new Date().toLocaleString('ja-JP')}
+# マーカー: ${markers.join(', ')}
+# ============================================
+
+# 必要なパッケージをインストール（未インストールの場合）
+if (!require("pROC")) install.packages("pROC")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("dplyr")) install.packages("dplyr")
+
+library(pROC)
+library(ggplot2)
+library(dplyr)
+
+# データ読み込み
+# ※ CSVファイルのパスを適宜変更してください
+data <- read.csv("roc_raw_data_${new Date().toISOString().split('T')[0]}.csv",
+                 fileEncoding = "UTF-8-BOM")
+
+# データ確認
+head(data)
+table(data$marker, data$group)
+
+# マーカーリスト
+markers <- c(${markers.map(m => `"${m}"`).join(', ')})
+
+# ============================================
+# ROC解析
+# ============================================
+
+results <- data.frame()
+roc_objects <- list()
+
+for (marker_name in markers) {
+  marker_data <- data %>% filter(marker == marker_name)
+
+  if (nrow(marker_data) >= 4) {
+    # group列を0/1に変換（positive = 1, negative = 0）
+    marker_data$outcome <- ifelse(marker_data$group == "positive", 1, 0)
+
+    # ROC曲線を計算
+    roc_obj <- roc(marker_data$outcome, marker_data$value, quiet = TRUE)
+    roc_objects[[marker_name]] <- roc_obj
+
+    # AUCと95%信頼区間
+    auc_val <- auc(roc_obj)
+    ci_val <- ci.auc(roc_obj, method = "delong")
+
+    # 最適カットオフ（Youden Index）
+    coords_best <- coords(roc_obj, "best", ret = c("threshold", "sensitivity", "specificity"))
+
+    results <- rbind(results, data.frame(
+      marker = marker_name,
+      auc = as.numeric(auc_val),
+      ci_lower = ci_val[1],
+      ci_upper = ci_val[3],
+      cutoff = coords_best$threshold,
+      sensitivity = coords_best$sensitivity,
+      specificity = coords_best$specificity,
+      youden_index = coords_best$sensitivity + coords_best$specificity - 1,
+      n_positive = sum(marker_data$outcome == 1),
+      n_negative = sum(marker_data$outcome == 0)
+    ))
+  }
+}
+
+# 結果表示
+print(results)
+
+# 結果保存
+write.csv(results, "roc_analysis_results_R.csv", row.names = FALSE)
+
+# ============================================
+# ROC曲線プロット
+# ============================================
+
+# 個別ROC曲線
+for (marker_name in names(roc_objects)) {
+  roc_obj <- roc_objects[[marker_name]]
+  result_row <- results %>% filter(marker == marker_name)
+
+  png(paste0("roc_curve_", gsub("/", "_", marker_name), ".png"), width = 600, height = 600, res = 100)
+  plot(roc_obj,
+       main = paste0("ROC Curve: ", marker_name),
+       col = "blue", lwd = 2,
+       print.auc = TRUE, print.auc.y = 0.4,
+       print.thres = TRUE, print.thres.col = "red")
+  abline(a = 0, b = 1, lty = 2, col = "gray")
+  dev.off()
+}
+
+# 複数マーカーを1つのグラフに
+if (length(roc_objects) > 1) {
+  colors <- rainbow(length(roc_objects))
+
+  png("roc_curves_combined.png", width = 800, height = 700, res = 100)
+  plot(roc_objects[[1]], col = colors[1], lwd = 2, main = "ROC Curves Comparison")
+
+  for (i in 2:length(roc_objects)) {
+    plot(roc_objects[[i]], col = colors[i], lwd = 2, add = TRUE)
+  }
+
+  legend("bottomright",
+         legend = paste0(names(roc_objects), " (AUC=", round(results$auc, 3), ")"),
+         col = colors, lwd = 2)
+  abline(a = 0, b = 1, lty = 2, col = "gray")
+  dev.off()
+}
+
+# ggplot2版（より美しいグラフ）
+roc_plot_data <- data.frame()
+for (marker_name in names(roc_objects)) {
+  roc_obj <- roc_objects[[marker_name]]
+  auc_val <- round(auc(roc_obj), 3)
+  roc_plot_data <- rbind(roc_plot_data, data.frame(
+    marker = paste0(marker_name, " (AUC=", auc_val, ")"),
+    specificity = roc_obj$specificities,
+    sensitivity = roc_obj$sensitivities
+  ))
+}
+
+p_roc <- ggplot(roc_plot_data, aes(x = 1 - specificity, y = sensitivity, color = marker)) +
+  geom_line(linewidth = 1) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray50") +
+  labs(title = "ROC Curves",
+       x = "1 - Specificity (False Positive Rate)",
+       y = "Sensitivity (True Positive Rate)",
+       color = "Marker") +
+  theme_classic() +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5, face = "bold")) +
+  coord_equal()
+
+print(p_roc)
+ggsave("roc_curves_ggplot.png", p_roc, width = 8, height = 7, dpi = 300)
+
+# ============================================
+# AUC比較（DeLong検定）
+# ============================================
+
+if (length(roc_objects) >= 2) {
+  cat("\\n=== AUC比較（DeLong検定）===\\n")
+  marker_names <- names(roc_objects)
+  for (i in 1:(length(marker_names)-1)) {
+    for (j in (i+1):length(marker_names)) {
+      comparison <- roc.test(roc_objects[[marker_names[i]]],
+                             roc_objects[[marker_names[j]]],
+                             method = "delong")
+      cat(sprintf("%s vs %s: p = %.4f\\n",
+                  marker_names[i], marker_names[j], comparison$p.value))
+    }
+  }
+}
+
+cat("\\n解析完了！\\n")
+`;
+
+    const blob = new Blob([rScript], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `roc_analysis_${markers.length}markers.R`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 相関解析用の生データCSVを生成
+  const exportCorrelationRawData = () => {
+    if (!correlationResults || !correlationRawData) return;
+
+    const items = correlationResults.items;
+
+    // Wide format: 行 = patient_date, 列 = markers
+    let csvContent = 'sample_id,' + items.join(',') + '\n';
+
+    Object.entries(correlationRawData).forEach(([key, values]) => {
+      const row = [key];
+      items.forEach(item => {
+        row.push(values[item] !== undefined ? values[item] : '');
+      });
+      csvContent += row.join(',') + '\n';
+    });
+
+    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+    const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `correlation_raw_data_${correlationResults.type}_${new Date().toISOString().split('T')[0]}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // 相関解析用のRスクリプトを生成
+  const exportCorrelationRScript = () => {
+    if (!correlationResults) return;
+
+    const items = correlationResults.items;
+    const corrType = correlationResults.type;
+
+    const rScript = `# ============================================
+# 相関解析 - Rスクリプト
+# 生成日時: ${new Date().toLocaleString('ja-JP')}
+# 相関係数タイプ: ${corrType === 'spearman' ? 'Spearman順位相関' : 'Pearson積率相関'}
+# マーカー数: ${items.length}
+# ============================================
+
+# 必要なパッケージをインストール（未インストールの場合）
+if (!require("corrplot")) install.packages("corrplot")
+if (!require("Hmisc")) install.packages("Hmisc")
+if (!require("ggplot2")) install.packages("ggplot2")
+if (!require("reshape2")) install.packages("reshape2")
+
+library(corrplot)
+library(Hmisc)
+library(ggplot2)
+library(reshape2)
+
+# データ読み込み
+# ※ CSVファイルのパスを適宜変更してください
+data <- read.csv("correlation_raw_data_${corrType}_${new Date().toISOString().split('T')[0]}.csv",
+                 fileEncoding = "UTF-8-BOM", row.names = 1)
+
+# データ確認
+head(data)
+dim(data)
+
+# 数値データのみ抽出
+numeric_data <- data[, sapply(data, is.numeric)]
+
+# ============================================
+# 相関行列の計算
+# ============================================
+
+# ${corrType === 'spearman' ? 'Spearman順位相関' : 'Pearson積率相関'}係数と p値
+cor_result <- rcorr(as.matrix(numeric_data), type = "${corrType}")
+
+# 相関係数行列
+cor_matrix <- cor_result$r
+print(round(cor_matrix, 3))
+
+# p値行列
+p_matrix <- cor_result$P
+print(round(p_matrix, 4))
+
+# サンプル数行列
+n_matrix <- cor_result$n
+print(n_matrix)
+
+# 結果をCSVに保存
+write.csv(round(cor_matrix, 4), "correlation_matrix_R.csv")
+write.csv(round(p_matrix, 4), "correlation_pvalues_R.csv")
+
+# ============================================
+# 相関ヒートマップ（corrplot）
+# ============================================
+
+# 基本的なヒートマップ
+png("correlation_heatmap_basic.png", width = 800, height = 800, res = 100)
+corrplot(cor_matrix, method = "color", type = "full",
+         tl.col = "black", tl.srt = 45,
+         addCoef.col = "black", number.cex = 0.7,
+         col = colorRampPalette(c("#3B82F6", "white", "#EF4444"))(200),
+         title = "${corrType === 'spearman' ? 'Spearman' : 'Pearson'} Correlation Matrix",
+         mar = c(0, 0, 2, 0))
+dev.off()
+
+# 有意な相関のみ表示（p < 0.05）
+png("correlation_heatmap_significant.png", width = 800, height = 800, res = 100)
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.col = "black", tl.srt = 45,
+         p.mat = p_matrix, sig.level = 0.05, insig = "blank",
+         addCoef.col = "black", number.cex = 0.7,
+         col = colorRampPalette(c("#3B82F6", "white", "#EF4444"))(200),
+         title = "Significant Correlations (p < 0.05)",
+         mar = c(0, 0, 2, 0))
+dev.off()
+
+# 階層的クラスタリング付き
+png("correlation_heatmap_clustered.png", width = 900, height = 800, res = 100)
+corrplot(cor_matrix, method = "color", type = "full",
+         order = "hclust", addrect = 3,
+         tl.col = "black", tl.srt = 45,
+         addCoef.col = "black", number.cex = 0.6,
+         col = colorRampPalette(c("#3B82F6", "white", "#EF4444"))(200),
+         title = "Clustered Correlation Matrix",
+         mar = c(0, 0, 2, 0))
+dev.off()
+
+# ============================================
+# ggplot2版ヒートマップ
+# ============================================
+
+# 相関行列をlong formatに変換
+cor_melted <- melt(cor_matrix)
+p_melted <- melt(p_matrix)
+cor_melted$p_value <- p_melted$value
+cor_melted$sig <- ifelse(cor_melted$p_value < 0.001, "***",
+                         ifelse(cor_melted$p_value < 0.01, "**",
+                                ifelse(cor_melted$p_value < 0.05, "*", "")))
+
+p_heatmap <- ggplot(cor_melted, aes(x = Var1, y = Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(round(value, 2), sig)), size = 3) +
+  scale_fill_gradient2(low = "#3B82F6", mid = "white", high = "#EF4444",
+                       midpoint = 0, limits = c(-1, 1),
+                       name = "Correlation") +
+  labs(title = "${corrType === 'spearman' ? 'Spearman' : 'Pearson'} Correlation Heatmap",
+       x = "", y = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+        plot.title = element_text(hjust = 0.5, face = "bold"),
+        panel.grid = element_blank()) +
+  coord_fixed()
+
+print(p_heatmap)
+ggsave("correlation_heatmap_ggplot.png", p_heatmap, width = 10, height = 9, dpi = 300)
+
+# ============================================
+# 散布図マトリックス（オプション）
+# ============================================
+
+if (ncol(numeric_data) <= 6) {
+  png("scatter_matrix.png", width = 1000, height = 1000, res = 100)
+  pairs(numeric_data,
+        lower.panel = function(x, y) {
+          points(x, y, pch = 19, col = adjustcolor("blue", 0.5))
+          abline(lm(y ~ x), col = "red", lwd = 2)
+        },
+        upper.panel = function(x, y) {
+          r <- cor(x, y, use = "complete.obs", method = "${corrType}")
+          text(mean(range(x, na.rm = TRUE)),
+               mean(range(y, na.rm = TRUE)),
+               paste0("r=", round(r, 2)), cex = 1.5)
+        },
+        main = "Scatter Plot Matrix")
+  dev.off()
+}
+
+# ============================================
+# 詳細な相関ペアリスト
+# ============================================
+
+# 全てのペアの相関係数をリスト化
+pairs_list <- data.frame()
+vars <- colnames(cor_matrix)
+for (i in 1:(length(vars)-1)) {
+  for (j in (i+1):length(vars)) {
+    pairs_list <- rbind(pairs_list, data.frame(
+      var1 = vars[i],
+      var2 = vars[j],
+      r = cor_matrix[i, j],
+      p_value = p_matrix[i, j],
+      n = n_matrix[i, j],
+      abs_r = abs(cor_matrix[i, j])
+    ))
+  }
+}
+
+# 相関の強さでソート
+pairs_list <- pairs_list[order(-pairs_list$abs_r), ]
+
+cat("\\n=== 相関係数ランキング（|r|順）===\\n")
+print(pairs_list[, c("var1", "var2", "r", "p_value", "n")])
+
+# 保存
+write.csv(pairs_list, "correlation_pairs_list.csv", row.names = FALSE)
+
+cat("\\n解析完了！\\n")
+`;
+
+    const blob = new Blob([rScript], { type: 'text/plain;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `correlation_analysis_${corrType}_${items.length}markers.R`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  // ===== Rスクリプト・生データエクスポート関数 ここまで =====
+
   // エクスポート実行（形式選択後）
   const executeExport = async (format) => {
     if (patients.length === 0) {
@@ -3365,6 +4425,12 @@ function PatientsListView({ onSelectPatient }) {
     setComparisonResults(null);
     setSelectedGroup1('');
     setSelectedGroup2('');
+    // サンプル選択関連のリセット
+    setSampleSelectionMode('all');
+    setTargetDay('');
+    setSampleDetails(null);
+    setDayRangeStart('');
+    setDayRangeEnd('');
 
     // 全患者の検査項目と群を収集
     const itemsSet = new Set();
@@ -3604,6 +4670,65 @@ function PatientsListView({ onSelectPatient }) {
     return true;
   };
 
+  // 患者ごとに1サンプルを選択するヘルパー関数
+  const selectOnePerPatient = (dataArray, mode, targetDayNum) => {
+    if (!dataArray || !Array.isArray(dataArray) || dataArray.length === 0) {
+      return [];
+    }
+    // 患者IDでグループ化
+    const byPatient = {};
+    dataArray.forEach(d => {
+      if (!d || d.id === undefined || d.id === null) return;
+      if (!byPatient[d.id]) byPatient[d.id] = [];
+      byPatient[d.id].push(d);
+    });
+
+    const selected = [];
+    Object.entries(byPatient).forEach(([patientId, samples]) => {
+      if (!samples || samples.length === 0) return;
+      if (mode === 'first') {
+        // 最初のサンプル
+        samples.sort((a, b) => (a.day ?? 0) - (b.day ?? 0));
+        selected.push(samples[0]);
+      } else if (mode === 'last') {
+        // 最後のサンプル
+        samples.sort((a, b) => (b.day ?? 0) - (a.day ?? 0));
+        selected.push(samples[0]);
+      } else if (mode === 'closest') {
+        // 指定日に最も近いサンプル
+        const target = parseInt(targetDayNum) || 0;
+        samples.sort((a, b) => Math.abs((a.day ?? 0) - target) - Math.abs((b.day ?? 0) - target));
+        selected.push(samples[0]);
+      }
+    });
+    return selected;
+  };
+
+  // サンプル詳細を計算
+  const calculateSampleDetails = (dataArray) => {
+    if (!dataArray || !Array.isArray(dataArray)) {
+      return { uniquePatients: 0, totalSamples: 0, patientsWithMultiple: 0, byPatient: {} };
+    }
+    const byPatient = {};
+    dataArray.forEach(d => {
+      if (!d || d.id === undefined || d.id === null) return;
+      if (!byPatient[d.id]) byPatient[d.id] = { count: 0, days: [] };
+      byPatient[d.id].count++;
+      byPatient[d.id].days.push(d.day ?? null);
+    });
+
+    const uniquePatients = Object.keys(byPatient).length;
+    const totalSamples = dataArray.length;
+    const patientsWithMultiple = Object.values(byPatient).filter(p => p && p.count > 1).length;
+
+    return {
+      uniquePatients,
+      totalSamples,
+      patientsWithMultiple,
+      byPatient
+    };
+  };
+
   const runGroupComparison = async () => {
     if (!selectedGroup1 || !selectedGroup2 || selectedItems.length === 0) {
       alert('2つの群と検査項目を選択してください');
@@ -3611,15 +4736,17 @@ function PatientsListView({ onSelectPatient }) {
     }
 
     setIsLoadingAnalysis(true);
+    setSampleDetails(null);
 
     const group1Patients = patients.filter(p => p.group === selectedGroup1);
     const group2Patients = patients.filter(p => p.group === selectedGroup2);
 
     const results = [];
+    const allSampleDetails = { group1: null, group2: null };
 
     for (const itemName of selectedItems) {
-      const group1Data = []; // { id, value, date, day }
-      const group2Data = []; // { id, value, date, day }
+      let group1Data = []; // { id, value, date, day }
+      let group2Data = []; // { id, value, date, day }
 
       // Group 1のデータ収集
       for (const patient of group1Patients) {
@@ -3681,6 +4808,18 @@ function PatientsListView({ onSelectPatient }) {
         });
       }
 
+      // サンプル詳細を計算（1つ目の検査項目で計算）
+      if (results.length === 0) {
+        allSampleDetails.group1 = calculateSampleDetails(group1Data);
+        allSampleDetails.group2 = calculateSampleDetails(group2Data);
+      }
+
+      // 1患者1サンプルモードの場合、選択を適用
+      if (sampleSelectionMode !== 'all') {
+        group1Data = selectOnePerPatient(group1Data, sampleSelectionMode, targetDay);
+        group2Data = selectOnePerPatient(group2Data, sampleSelectionMode, targetDay);
+      }
+
       // 数値のみの配列を抽出（統計計算用）
       const group1Values = group1Data.map(d => d.value);
       const group2Values = group2Data.map(d => d.value);
@@ -3689,10 +4828,15 @@ function PatientsListView({ onSelectPatient }) {
         const tResult = tTest(group1Values, group2Values);
         const mwResult = mannWhitneyU(group1Values, group2Values);
 
+        // 患者数をカウント
+        const group1UniquePatients = new Set(group1Data.map(d => d.id)).size;
+        const group2UniquePatients = new Set(group2Data.map(d => d.id)).size;
+
         results.push({
           item: itemName,
           group1: {
             n: group1Values.length,
+            nPatients: group1UniquePatients,
             mean: mean(group1Values).toFixed(2),
             std: group1Values.length > 1 ? std(group1Values).toFixed(2) : '-',
             median: [...group1Values].sort((a, b) => a - b)[Math.floor(group1Values.length / 2)].toFixed(2),
@@ -3701,6 +4845,7 @@ function PatientsListView({ onSelectPatient }) {
           },
           group2: {
             n: group2Values.length,
+            nPatients: group2UniquePatients,
             mean: mean(group2Values).toFixed(2),
             std: group2Values.length > 1 ? std(group2Values).toFixed(2) : '-',
             median: [...group2Values].sort((a, b) => a - b)[Math.floor(group2Values.length / 2)].toFixed(2),
@@ -3713,6 +4858,7 @@ function PatientsListView({ onSelectPatient }) {
       }
     }
 
+    setSampleDetails(allSampleDetails);
     setComparisonResults(results);
     setIsLoadingAnalysis(false);
   };
@@ -4926,11 +6072,82 @@ function PatientsListView({ onSelectPatient }) {
                             </p>
                           </div>
 
+                          {/* サンプル選択モード */}
+                          <div style={{
+                            padding: '12px',
+                            background: '#fef3c7',
+                            borderRadius: '8px',
+                            marginBottom: '16px',
+                            border: '1px solid #fcd34d'
+                          }}>
+                            <label style={{...styles.inputLabel, marginBottom: '8px', display: 'block'}}>
+                              🔬 サンプル選択モード
+                            </label>
+                            <div style={{display: 'flex', flexWrap: 'wrap', gap: '12px', alignItems: 'center'}}>
+                              <label style={{display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontSize: '13px'}}>
+                                <input
+                                  type="radio"
+                                  name="sampleMode"
+                                  checked={sampleSelectionMode === 'all'}
+                                  onChange={() => setSampleSelectionMode('all')}
+                                />
+                                全サンプル
+                              </label>
+                              <label style={{display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontSize: '13px'}}>
+                                <input
+                                  type="radio"
+                                  name="sampleMode"
+                                  checked={sampleSelectionMode === 'first'}
+                                  onChange={() => setSampleSelectionMode('first')}
+                                />
+                                最初の1点/患者
+                              </label>
+                              <label style={{display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontSize: '13px'}}>
+                                <input
+                                  type="radio"
+                                  name="sampleMode"
+                                  checked={sampleSelectionMode === 'last'}
+                                  onChange={() => setSampleSelectionMode('last')}
+                                />
+                                最後の1点/患者
+                              </label>
+                              <label style={{display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', fontSize: '13px'}}>
+                                <input
+                                  type="radio"
+                                  name="sampleMode"
+                                  checked={sampleSelectionMode === 'closest'}
+                                  onChange={() => setSampleSelectionMode('closest')}
+                                />
+                                指定日に最も近い
+                              </label>
+                              {sampleSelectionMode === 'closest' && (
+                                <div style={{display: 'flex', alignItems: 'center', gap: '4px'}}>
+                                  <span style={{fontSize: '12px'}}>Day</span>
+                                  <input
+                                    type="number"
+                                    value={targetDay}
+                                    onChange={(e) => setTargetDay(e.target.value)}
+                                    style={{...styles.input, width: '60px', padding: '4px 8px'}}
+                                    placeholder="0"
+                                  />
+                                </div>
+                              )}
+                            </div>
+                            <p style={{fontSize: '11px', color: '#92400e', marginTop: '8px', marginBottom: 0}}>
+                              ⚠️ 「全サンプル」は同一患者の複数データが含まれる可能性があります（独立性の仮定に注意）
+                            </p>
+                          </div>
+
                           <p style={{fontSize: '12px', color: '#6b7280', marginBottom: '12px'}}>
                             ※ 上で選択した検査項目について、2群間の統計比較を行います
                             {(dayRangeStart !== '' || dayRangeEnd !== '') && (
                               <span style={{color: '#7c3aed', fontWeight: '500'}}>
                                 （Day {dayRangeStart || '?'} 〜 {dayRangeEnd || '?'} のみ）
+                              </span>
+                            )}
+                            {sampleSelectionMode !== 'all' && (
+                              <span style={{color: '#b45309', fontWeight: '500'}}>
+                                　・1患者1サンプル（{sampleSelectionMode === 'first' ? '最初' : sampleSelectionMode === 'last' ? '最後' : `Day ${targetDay || 0}に最も近い`}）
                               </span>
                             )}
                           </p>
@@ -4947,6 +6164,67 @@ function PatientsListView({ onSelectPatient }) {
                           >
                             {isLoadingAnalysis ? '計算中...' : '統計比較を実行'}
                           </button>
+
+                          {/* サンプル詳細表示 */}
+                          {sampleDetails && (
+                            <div style={{
+                              marginTop: '16px',
+                              padding: '12px',
+                              background: sampleSelectionMode === 'all' && (sampleDetails.group1?.patientsWithMultiple > 0 || sampleDetails.group2?.patientsWithMultiple > 0)
+                                ? '#fef2f2' : '#f0fdf4',
+                              borderRadius: '8px',
+                              border: `1px solid ${sampleSelectionMode === 'all' && (sampleDetails.group1?.patientsWithMultiple > 0 || sampleDetails.group2?.patientsWithMultiple > 0) ? '#fecaca' : '#bbf7d0'}`
+                            }}>
+                              <div style={{fontWeight: '600', fontSize: '13px', marginBottom: '8px', color: '#1f2937'}}>
+                                📊 サンプル詳細
+                              </div>
+                              <div style={{display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '16px', fontSize: '12px'}}>
+                                <div>
+                                  <div style={{fontWeight: '500', color: '#6b7280', marginBottom: '4px'}}>{selectedGroup1}</div>
+                                  <div>患者数: <strong>{sampleDetails.group1?.uniquePatients || 0}</strong>人</div>
+                                  <div>総サンプル数: <strong>{sampleDetails.group1?.totalSamples || 0}</strong>件</div>
+                                  {sampleDetails.group1?.patientsWithMultiple > 0 && (
+                                    <div style={{color: '#dc2626', marginTop: '4px'}}>
+                                      ⚠️ 複数サンプル患者: {sampleDetails.group1.patientsWithMultiple}人
+                                    </div>
+                                  )}
+                                </div>
+                                <div>
+                                  <div style={{fontWeight: '500', color: '#6b7280', marginBottom: '4px'}}>{selectedGroup2}</div>
+                                  <div>患者数: <strong>{sampleDetails.group2?.uniquePatients || 0}</strong>人</div>
+                                  <div>総サンプル数: <strong>{sampleDetails.group2?.totalSamples || 0}</strong>件</div>
+                                  {sampleDetails.group2?.patientsWithMultiple > 0 && (
+                                    <div style={{color: '#dc2626', marginTop: '4px'}}>
+                                      ⚠️ 複数サンプル患者: {sampleDetails.group2.patientsWithMultiple}人
+                                    </div>
+                                  )}
+                                </div>
+                              </div>
+                              {sampleSelectionMode === 'all' && (sampleDetails.group1?.patientsWithMultiple > 0 || sampleDetails.group2?.patientsWithMultiple > 0) && (
+                                <div style={{
+                                  marginTop: '12px',
+                                  padding: '8px',
+                                  background: '#fee2e2',
+                                  borderRadius: '4px',
+                                  fontSize: '11px',
+                                  color: '#b91c1c'
+                                }}>
+                                  <strong>統計的注意:</strong> 同一患者から複数サンプルが含まれています。
+                                  独立性の仮定が満たされない可能性があります。
+                                  「1患者1サンプル」モードの使用を検討してください。
+                                </div>
+                              )}
+                              {sampleSelectionMode !== 'all' && (
+                                <div style={{
+                                  marginTop: '8px',
+                                  fontSize: '11px',
+                                  color: '#166534'
+                                }}>
+                                  ✓ 1患者1サンプルモード適用済み（独立性の仮定を満たします）
+                                </div>
+                              )}
+                            </div>
+                          )}
 
                           {/* 統計結果表示 */}
                           {comparisonResults && comparisonResults.length > 0 && (
@@ -4970,10 +6248,10 @@ function PatientsListView({ onSelectPatient }) {
                                     </tr>
                                     <tr style={{background: '#f8fafc', fontSize: '11px'}}>
                                       <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}></th>
-                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>n</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}} title="サンプル数 (患者数)">n (pts)</th>
                                       <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>Mean±SD</th>
                                       <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>Median</th>
-                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>n</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}} title="サンプル数 (患者数)">n (pts)</th>
                                       <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>Mean±SD</th>
                                       <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>Median</th>
                                       <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}></th>
@@ -4984,10 +6262,20 @@ function PatientsListView({ onSelectPatient }) {
                                     {comparisonResults.map((r, idx) => (
                                       <tr key={idx} style={{background: idx % 2 === 0 ? 'white' : '#f8fafc'}}>
                                         <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', fontWeight: '500'}}>{r.item}</td>
-                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group1.n}</td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
+                                          {r.group1.n}
+                                          {r.group1.nPatients && r.group1.nPatients !== r.group1.n && (
+                                            <span style={{fontSize: '10px', color: '#6b7280'}}> ({r.group1.nPatients})</span>
+                                          )}
+                                        </td>
                                         <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group1.mean}±{r.group1.std}</td>
                                         <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group1.median}</td>
-                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group2.n}</td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
+                                          {r.group2.n}
+                                          {r.group2.nPatients && r.group2.nPatients !== r.group2.n && (
+                                            <span style={{fontSize: '10px', color: '#6b7280'}}> ({r.group2.nPatients})</span>
+                                          )}
+                                        </td>
                                         <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group2.mean}±{r.group2.std}</td>
                                         <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>{r.group2.median}</td>
                                         <td style={{
@@ -5016,18 +6304,41 @@ function PatientsListView({ onSelectPatient }) {
                               <p style={{fontSize: '11px', color: '#6b7280', marginTop: '8px'}}>
                                 * p &lt; 0.05（統計的に有意）　t検定: Welchのt検定（パラメトリック）　U検定: Mann-Whitney U検定（ノンパラメトリック）
                               </p>
-                              <button
-                                onClick={exportComparisonCSV}
-                                style={{
-                                  ...styles.addButton,
-                                  backgroundColor: '#28a745',
-                                  padding: '8px 16px',
-                                  fontSize: '13px',
-                                  marginTop: '12px'
-                                }}
-                              >
-                                📊 統計結果CSVダウンロード
-                              </button>
+                              <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap', marginTop: '12px'}}>
+                                <button
+                                  onClick={exportComparisonCSV}
+                                  style={{
+                                    ...styles.addButton,
+                                    backgroundColor: '#28a745',
+                                    padding: '8px 16px',
+                                    fontSize: '13px'
+                                  }}
+                                >
+                                  📊 統計結果CSV
+                                </button>
+                                <button
+                                  onClick={exportGroupComparisonRawData}
+                                  style={{
+                                    ...styles.addButton,
+                                    backgroundColor: '#2563eb',
+                                    padding: '8px 16px',
+                                    fontSize: '13px'
+                                  }}
+                                >
+                                  📥 生データCSV
+                                </button>
+                                <button
+                                  onClick={exportGroupComparisonRScript}
+                                  style={{
+                                    ...styles.addButton,
+                                    backgroundColor: '#7c3aed',
+                                    padding: '8px 16px',
+                                    fontSize: '13px'
+                                  }}
+                                >
+                                  📜 Rスクリプト
+                                </button>
+                              </div>
 
                               {/* 統計グラフ（Box Plot / Violin Plot） */}
                               <div style={{
@@ -5175,7 +6486,7 @@ function PatientsListView({ onSelectPatient }) {
 
                                     const stats1 = calculateStats(result.group1.values);
                                     const stats2 = calculateStats(result.group2.values);
-                                    if (!stats1 || !stats2) return <div key={chartIndex} style={{padding: '20px', color: '#6b7280'}}>データ不足: {itemName}</div>;
+                                    if (!stats1 || !stats2) return null; // データ不足の場合はnullを返してフィルタリング
 
                                     // 正規性検定
                                     const norm1 = shapiroWilkTest(result.group1.values);
@@ -5186,7 +6497,7 @@ function PatientsListView({ onSelectPatient }) {
                                     const testResult = bothNormal
                                       ? tTest(result.group1.values, result.group2.values)
                                       : mannWhitneyU(result.group1.values, result.group2.values);
-                                    const pValue = testResult.pValue;
+                                    const pValue = testResult.pValue ?? 1; // nullの場合は1（有意差なし）
                                     const sigMarker = getSignificanceMarker(pValue);
 
                                     // SVGでグラフを描画（複数表示用にコンパクトに）
@@ -5408,7 +6719,7 @@ function PatientsListView({ onSelectPatient }) {
                                   const chartDataList = statSelectedItems.map((item, idx) => renderChart(item, idx)).filter(Boolean);
 
                                   if (chartDataList.length === 0) {
-                                    return <div style={{padding: '20px', color: '#6b7280'}}>選択した項目にデータがありません</div>;
+                                    return <div style={{padding: '20px', color: '#6b7280'}}>選択した項目に十分なデータ数がないため統計が出力できません</div>;
                                   }
 
                                   return (
@@ -5585,10 +6896,879 @@ function PatientsListView({ onSelectPatient }) {
 
                           {comparisonResults && comparisonResults.length === 0 && (
                             <div style={{marginTop: '16px', padding: '16px', background: '#fef3c7', borderRadius: '8px', color: '#92400e', fontSize: '13px'}}>
-                              選択した項目にデータがありません。
+                              選択した項目に十分なデータ数がないため統計が出力できません。
                             </div>
                           )}
                         </>
+                      )}
+                    </>
+                  )}
+                </div>
+
+                {/* ROC曲線解析セクション */}
+                <div style={{
+                  marginTop: '30px',
+                  padding: '20px',
+                  background: '#fdf4ff',
+                  borderRadius: '12px',
+                  border: '1px solid #f0abfc'
+                }}>
+                  <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px'}}>
+                    <h3 style={{margin: 0, color: '#a21caf', fontSize: '16px'}}>📈 ROC曲線解析</h3>
+                    <button
+                      onClick={() => setShowRocAnalysis(!showRocAnalysis)}
+                      style={{
+                        background: showRocAnalysis ? '#a21caf' : 'white',
+                        color: showRocAnalysis ? 'white' : '#a21caf',
+                        border: '1px solid #a21caf',
+                        borderRadius: '6px',
+                        padding: '6px 12px',
+                        cursor: 'pointer',
+                        fontSize: '13px'
+                      }}
+                    >
+                      {showRocAnalysis ? '閉じる' : '開く'}
+                    </button>
+                  </div>
+
+                  {showRocAnalysis && (
+                    <>
+                      {availableGroups.length < 2 ? (
+                        <div style={{padding: '20px', textAlign: 'center', color: '#6b7280'}}>
+                          ROC解析には2つの群が必要です。<br/>
+                          患者登録時に「群」を設定してください。
+                        </div>
+                      ) : (
+                        <>
+                          {/* 群が選択されていない場合の警告 */}
+                          {(!selectedGroup1 || !selectedGroup2) && (
+                            <div style={{
+                              padding: '12px',
+                              background: '#fef3c7',
+                              borderRadius: '8px',
+                              marginBottom: '16px',
+                              border: '1px solid #fcd34d',
+                              fontSize: '13px',
+                              color: '#92400e'
+                            }}>
+                              ⚠️ 先に「📊 群間統計比較」セクションで<strong>群1と群2を選択</strong>してください。
+                            </div>
+                          )}
+
+                          <p style={{fontSize: '12px', color: '#6b7280', marginBottom: '16px'}}>
+                            群1を<strong>陰性（コントロール）</strong>、群2を<strong>陽性（疾患）</strong>として解析します。
+                            {selectedGroup1 && selectedGroup2 && (
+                              <span style={{marginLeft: '8px', color: '#a21caf'}}>
+                                （{selectedGroup1} vs {selectedGroup2}）
+                              </span>
+                            )}
+                          </p>
+
+                          {/* マーカー選択 */}
+                          <div style={{marginBottom: '16px'}}>
+                            <label style={{...styles.inputLabel, marginBottom: '8px', display: 'block'}}>
+                              解析するマーカーを選択（複数可）
+                            </label>
+                            <div style={{
+                              display: 'flex',
+                              flexWrap: 'wrap',
+                              gap: '8px',
+                              padding: '12px',
+                              background: 'white',
+                              borderRadius: '8px',
+                              border: '1px solid #e5e7eb',
+                              maxHeight: '150px',
+                              overflowY: 'auto'
+                            }}>
+                              {selectedItems.length === 0 ? (
+                                <div style={{color: '#9ca3af', fontSize: '13px'}}>
+                                  まず上部で検査項目を選択してください
+                                </div>
+                              ) : (
+                                selectedItems.map(item => (
+                                  <label key={item} style={{
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    gap: '4px',
+                                    padding: '6px 12px',
+                                    background: rocSelectedItems.includes(item) ? '#fae8ff' : '#f9fafb',
+                                    border: rocSelectedItems.includes(item) ? '2px solid #a21caf' : '1px solid #d1d5db',
+                                    borderRadius: '6px',
+                                    cursor: 'pointer',
+                                    fontSize: '12px',
+                                    transition: 'all 0.15s'
+                                  }}>
+                                    <input
+                                      type="checkbox"
+                                      checked={rocSelectedItems.includes(item)}
+                                      onChange={(e) => {
+                                        if (e.target.checked) {
+                                          setRocSelectedItems([...rocSelectedItems, item]);
+                                        } else {
+                                          setRocSelectedItems(rocSelectedItems.filter(i => i !== item));
+                                        }
+                                      }}
+                                      style={{display: 'none'}}
+                                    />
+                                    {rocSelectedItems.includes(item) && <span style={{color: '#a21caf'}}>✓</span>}
+                                    {item}
+                                  </label>
+                                ))
+                              )}
+                            </div>
+                            <div style={{marginTop: '6px', display: 'flex', gap: '8px'}}>
+                              <button
+                                onClick={() => setRocSelectedItems([...selectedItems])}
+                                disabled={selectedItems.length === 0}
+                                style={{fontSize: '11px', padding: '4px 8px', background: '#e5e7eb', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                              >
+                                全選択
+                              </button>
+                              <button
+                                onClick={() => setRocSelectedItems([])}
+                                style={{fontSize: '11px', padding: '4px 8px', background: '#e5e7eb', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                              >
+                                全解除
+                              </button>
+                              <span style={{fontSize: '11px', color: '#6b7280', marginLeft: '8px'}}>
+                                {rocSelectedItems.length}項目選択中
+                              </span>
+                            </div>
+                          </div>
+
+                          <button
+                            onClick={runRocAnalysis}
+                            disabled={!selectedGroup1 || !selectedGroup2 || rocSelectedItems.length === 0 || isCalculatingRoc}
+                            style={{
+                              ...styles.primaryButton,
+                              width: '100%',
+                              backgroundColor: '#a21caf',
+                              opacity: (!selectedGroup1 || !selectedGroup2 || rocSelectedItems.length === 0) ? 0.5 : 1
+                            }}
+                          >
+                            {isCalculatingRoc ? 'ROC曲線計算中...' : 'ROC曲線解析を実行'}
+                          </button>
+
+                          {/* ROC解析結果 */}
+                          {rocResults && rocResults.length > 0 && (
+                            <div style={{marginTop: '20px'}}>
+                              {/* 結果テーブル */}
+                              <div style={{overflowX: 'auto', marginBottom: '20px'}}>
+                                <table style={{
+                                  width: '100%',
+                                  borderCollapse: 'collapse',
+                                  fontSize: '12px',
+                                  background: 'white',
+                                  borderRadius: '8px',
+                                  overflow: 'hidden'
+                                }}>
+                                  <thead>
+                                    <tr style={{background: '#fdf4ff'}}>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>マーカー</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>AUC</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>95% CI</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>カットオフ</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>感度</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>特異度</th>
+                                      <th style={{padding: '10px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>n</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {rocResults.map((r, idx) => (
+                                      <tr key={idx} style={{background: idx % 2 === 0 ? 'white' : '#fdf4ff'}}>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', fontWeight: '500'}}>
+                                          <span style={{display: 'inline-block', width: '12px', height: '12px', borderRadius: '2px', background: rocColors[idx % rocColors.length], marginRight: '8px'}}></span>
+                                          {r.item}
+                                        </td>
+                                        <td style={{
+                                          padding: '8px',
+                                          borderBottom: '1px solid #e2e8f0',
+                                          textAlign: 'center',
+                                          fontWeight: (r.auc ?? 0) >= 0.7 ? 'bold' : 'normal',
+                                          color: (r.auc ?? 0) >= 0.9 ? '#059669' : (r.auc ?? 0) >= 0.7 ? '#d97706' : '#6b7280'
+                                        }}>
+                                          {(r.auc ?? 0).toFixed(3)}
+                                        </td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center', fontSize: '11px'}}>
+                                          {(r.ci?.lower ?? 0).toFixed(3)} - {(r.ci?.upper ?? 1).toFixed(3)}
+                                        </td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
+                                          {r.optimal ? (typeof r.optimal.threshold === 'number' ? r.optimal.threshold.toFixed(2) : '-') : '-'}
+                                        </td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
+                                          {r.optimal ? (r.optimal.sensitivity * 100).toFixed(1) + '%' : '-'}
+                                        </td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
+                                          {r.optimal ? (r.optimal.specificity * 100).toFixed(1) + '%' : '-'}
+                                        </td>
+                                        <td style={{padding: '8px', borderBottom: '1px solid #e2e8f0', textAlign: 'center', fontSize: '11px'}}>
+                                          {r.positiveGroup}: {r.nPositive}<br/>
+                                          {r.negativeGroup}: {r.nNegative}
+                                        </td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+
+                              {/* ROC曲線グラフ（SVG） */}
+                              <div style={{
+                                padding: '16px',
+                                background: 'white',
+                                borderRadius: '8px',
+                                border: '1px solid #e5e7eb'
+                              }}>
+                                <h4 style={{margin: '0 0 12px 0', fontSize: '14px', color: '#374151'}}>
+                                  ROC曲線
+                                </h4>
+                                {(() => {
+                                  const svgWidth = 500;
+                                  const svgHeight = 500;
+                                  const margin = { top: 40, right: 150, bottom: 60, left: 60 };
+                                  const chartWidth = svgWidth - margin.left - margin.right;
+                                  const chartHeight = svgHeight - margin.top - margin.bottom;
+
+                                  let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" style="font-family: Arial, sans-serif;">`;
+                                  svgContent += `<rect width="100%" height="100%" fill="white"/>`;
+
+                                  // タイトル
+                                  svgContent += `<text x="${svgWidth/2 - 50}" y="25" font-size="14" font-weight="bold">ROC Curve</text>`;
+
+                                  // 軸
+                                  svgContent += `<line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${margin.top + chartHeight}" stroke="#333" stroke-width="1"/>`;
+                                  svgContent += `<line x1="${margin.left}" y1="${margin.top + chartHeight}" x2="${margin.left + chartWidth}" y2="${margin.top + chartHeight}" stroke="#333" stroke-width="1"/>`;
+
+                                  // グリッド線と目盛り
+                                  for (let i = 0; i <= 10; i++) {
+                                    const val = i / 10;
+                                    const x = margin.left + val * chartWidth;
+                                    const y = margin.top + chartHeight - val * chartHeight;
+
+                                    // X軸目盛り
+                                    svgContent += `<line x1="${x}" y1="${margin.top + chartHeight}" x2="${x}" y2="${margin.top + chartHeight + 5}" stroke="#333" stroke-width="1"/>`;
+                                    if (i % 2 === 0) {
+                                      svgContent += `<text x="${x}" y="${margin.top + chartHeight + 18}" text-anchor="middle" font-size="10">${val.toFixed(1)}</text>`;
+                                    }
+                                    // X軸グリッド
+                                    svgContent += `<line x1="${x}" y1="${margin.top}" x2="${x}" y2="${margin.top + chartHeight}" stroke="#e5e7eb" stroke-width="1"/>`;
+
+                                    // Y軸目盛り
+                                    svgContent += `<line x1="${margin.left - 5}" y1="${y}" x2="${margin.left}" y2="${y}" stroke="#333" stroke-width="1"/>`;
+                                    if (i % 2 === 0) {
+                                      svgContent += `<text x="${margin.left - 10}" y="${y + 4}" text-anchor="end" font-size="10">${val.toFixed(1)}</text>`;
+                                    }
+                                    // Y軸グリッド
+                                    svgContent += `<line x1="${margin.left}" y1="${y}" x2="${margin.left + chartWidth}" y2="${y}" stroke="#e5e7eb" stroke-width="1"/>`;
+                                  }
+
+                                  // 対角線（参照線）
+                                  svgContent += `<line x1="${margin.left}" y1="${margin.top + chartHeight}" x2="${margin.left + chartWidth}" y2="${margin.top}" stroke="#999" stroke-width="1" stroke-dasharray="5,5"/>`;
+
+                                  // 軸ラベル
+                                  svgContent += `<text x="${margin.left + chartWidth/2}" y="${svgHeight - 15}" text-anchor="middle" font-size="12">1 - Specificity (False Positive Rate)</text>`;
+                                  svgContent += `<text x="15" y="${margin.top + chartHeight/2}" text-anchor="middle" font-size="12" transform="rotate(-90, 15, ${margin.top + chartHeight/2})">Sensitivity (True Positive Rate)</text>`;
+
+                                  // 各マーカーのROC曲線を描画
+                                  rocResults.forEach((result, idx) => {
+                                    const color = rocColors[idx % rocColors.length];
+                                    const points = result.rocPoints;
+
+                                    if (points && points.length > 1) {
+                                      let pathD = '';
+                                      points.forEach((p, i) => {
+                                        const x = margin.left + p.fpr * chartWidth;
+                                        const y = margin.top + chartHeight - p.tpr * chartHeight;
+                                        if (i === 0) {
+                                          pathD += `M ${x} ${y}`;
+                                        } else {
+                                          pathD += ` L ${x} ${y}`;
+                                        }
+                                      });
+                                      svgContent += `<path d="${pathD}" stroke="${color}" stroke-width="2" fill="none"/>`;
+
+                                      // 最適カットオフ点をマーク
+                                      if (result.optimal) {
+                                        const optX = margin.left + (1 - result.optimal.specificity) * chartWidth;
+                                        const optY = margin.top + chartHeight - result.optimal.sensitivity * chartHeight;
+                                        svgContent += `<circle cx="${optX}" cy="${optY}" r="5" fill="${color}" stroke="white" stroke-width="2"/>`;
+                                      }
+                                    }
+                                  });
+
+                                  // 凡例
+                                  const legendX = margin.left + chartWidth + 10;
+                                  let legendY = margin.top + 10;
+                                  rocResults.forEach((result, idx) => {
+                                    const color = rocColors[idx % rocColors.length];
+                                    svgContent += `<rect x="${legendX}" y="${legendY}" width="12" height="12" fill="${color}"/>`;
+                                    svgContent += `<text x="${legendX + 18}" y="${legendY + 10}" font-size="10">${result.item}</text>`;
+                                    svgContent += `<text x="${legendX + 18}" y="${legendY + 22}" font-size="9" fill="#666">AUC: ${(result.auc ?? 0).toFixed(3)}</text>`;
+                                    legendY += 35;
+                                  });
+
+                                  svgContent += '</svg>';
+
+                                  return (
+                                    <div>
+                                      <div
+                                        ref={rocChartRef}
+                                        style={{display: 'flex', justifyContent: 'center'}}
+                                        dangerouslySetInnerHTML={{__html: svgContent}}
+                                      />
+                                      {/* エクスポートボタン */}
+                                      <div style={{display: 'flex', gap: '10px', justifyContent: 'center', marginTop: '16px', flexWrap: 'wrap'}}>
+                                        <button
+                                          onClick={() => {
+                                            const blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
+                                            const url = URL.createObjectURL(blob);
+                                            const a = document.createElement('a');
+                                            a.href = url;
+                                            a.download = `ROC曲線_${rocResults.length}マーカー.svg`;
+                                            a.click();
+                                            URL.revokeObjectURL(url);
+                                          }}
+                                          style={{...styles.addButton, backgroundColor: '#a21caf', padding: '8px 16px', fontSize: '12px'}}
+                                        >
+                                          🎨 SVG保存
+                                        </button>
+                                        <button
+                                          onClick={() => {
+                                            const canvas = document.createElement('canvas');
+                                            canvas.width = svgWidth * 2;
+                                            canvas.height = svgHeight * 2;
+                                            const ctx = canvas.getContext('2d');
+                                            ctx.scale(2, 2);
+                                            const img = new Image();
+                                            const svgBlob = new Blob([svgContent], {type: 'image/svg+xml;charset=utf-8'});
+                                            const svgUrl = URL.createObjectURL(svgBlob);
+                                            img.onload = () => {
+                                              ctx.fillStyle = 'white';
+                                              ctx.fillRect(0, 0, svgWidth, svgHeight);
+                                              ctx.drawImage(img, 0, 0);
+                                              URL.revokeObjectURL(svgUrl);
+                                              const pngUrl = canvas.toDataURL('image/png');
+                                              const a = document.createElement('a');
+                                              a.href = pngUrl;
+                                              a.download = `ROC曲線_${rocResults.length}マーカー.png`;
+                                              a.click();
+                                            };
+                                            img.src = svgUrl;
+                                          }}
+                                          style={{...styles.addButton, backgroundColor: '#059669', padding: '8px 16px', fontSize: '12px'}}
+                                        >
+                                          📷 PNG保存
+                                        </button>
+                                        <button
+                                          onClick={() => {
+                                            // CSV出力
+                                            const headers = ['マーカー', 'AUC', '95%CI下限', '95%CI上限', 'カットオフ', '感度', '特異度', 'Youden Index', '陽性群n', '陰性群n'];
+                                            const rows = rocResults.map(r => [
+                                              r.item,
+                                              (r.auc ?? 0).toFixed(4),
+                                              (r.ci?.lower ?? 0).toFixed(4),
+                                              (r.ci?.upper ?? 1).toFixed(4),
+                                              r.optimal ? (typeof r.optimal.threshold === 'number' ? r.optimal.threshold.toFixed(4) : '') : '',
+                                              r.optimal ? (r.optimal.sensitivity ?? 0).toFixed(4) : '',
+                                              r.optimal ? (r.optimal.specificity ?? 0).toFixed(4) : '',
+                                              r.optimal ? (r.optimal.youdenIndex ?? 0).toFixed(4) : '',
+                                              r.nPositive ?? 0,
+                                              r.nNegative ?? 0
+                                            ]);
+                                            const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+                                            const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+                                            const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8' });
+                                            const url = URL.createObjectURL(blob);
+                                            const a = document.createElement('a');
+                                            a.href = url;
+                                            a.download = `ROC解析結果_${new Date().toISOString().split('T')[0]}.csv`;
+                                            document.body.appendChild(a);
+                                            a.click();
+                                            document.body.removeChild(a);
+                                            URL.revokeObjectURL(url);
+                                          }}
+                                          style={{...styles.addButton, backgroundColor: '#2563eb', padding: '8px 16px', fontSize: '12px'}}
+                                        >
+                                          📊 結果CSV
+                                        </button>
+                                        <button
+                                          onClick={exportRocRawData}
+                                          disabled={!rocRawData}
+                                          style={{...styles.addButton, backgroundColor: '#0891b2', padding: '8px 16px', fontSize: '12px', opacity: rocRawData ? 1 : 0.5}}
+                                        >
+                                          📥 生データCSV
+                                        </button>
+                                        <button
+                                          onClick={exportRocRScript}
+                                          style={{...styles.addButton, backgroundColor: '#7c3aed', padding: '8px 16px', fontSize: '12px'}}
+                                        >
+                                          📜 Rスクリプト
+                                        </button>
+                                      </div>
+                                    </div>
+                                  );
+                                })()}
+                              </div>
+
+                              {/* AUC判定基準 */}
+                              <div style={{marginTop: '12px', padding: '12px', background: '#f9fafb', borderRadius: '8px', fontSize: '11px', color: '#6b7280'}}>
+                                <strong>AUC判定基準:</strong>
+                                <span style={{marginLeft: '12px', color: '#059669'}}>●0.9以上: 優秀</span>
+                                <span style={{marginLeft: '12px', color: '#d97706'}}>●0.7-0.9: 良好</span>
+                                <span style={{marginLeft: '12px', color: '#6b7280'}}>●0.5-0.7: 不良</span>
+                                <span style={{marginLeft: '12px'}}>●0.5: ランダム</span>
+                              </div>
+                            </div>
+                          )}
+
+                          {rocResults && rocResults.length === 0 && (
+                            <div style={{marginTop: '16px', padding: '16px', background: '#fef3c7', borderRadius: '8px', color: '#92400e', fontSize: '13px'}}>
+                              選択したマーカーに十分なデータがありません（各群2件以上必要）。
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </>
+                  )}
+                </div>
+
+                {/* 相関解析セクション */}
+                <div style={{
+                  marginTop: '30px',
+                  padding: '20px',
+                  background: '#fff7ed',
+                  borderRadius: '12px',
+                  border: '1px solid #fed7aa'
+                }}>
+                  <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '16px'}}>
+                    <h3 style={{margin: 0, color: '#c2410c', fontSize: '16px'}}>🔥 相関解析</h3>
+                    <button
+                      onClick={() => setShowCorrelationAnalysis(!showCorrelationAnalysis)}
+                      style={{
+                        background: showCorrelationAnalysis ? '#c2410c' : 'white',
+                        color: showCorrelationAnalysis ? 'white' : '#c2410c',
+                        border: '1px solid #c2410c',
+                        borderRadius: '6px',
+                        padding: '6px 12px',
+                        cursor: 'pointer',
+                        fontSize: '13px'
+                      }}
+                    >
+                      {showCorrelationAnalysis ? '閉じる' : '開く'}
+                    </button>
+                  </div>
+
+                  {showCorrelationAnalysis && (
+                    <>
+                      <p style={{fontSize: '12px', color: '#6b7280', marginBottom: '16px'}}>
+                        選択したマーカー間の相関係数を計算し、ヒートマップで可視化します。
+                        {selectedPatientIds.length > 0 && (
+                          <span style={{marginLeft: '8px', color: '#c2410c'}}>
+                            （{selectedPatientIds.length}名の患者を対象）
+                          </span>
+                        )}
+                      </p>
+
+                      {/* 相関係数の種類選択 */}
+                      <div style={{marginBottom: '16px'}}>
+                        <label style={{...styles.inputLabel, marginBottom: '8px', display: 'block'}}>
+                          相関係数の種類
+                        </label>
+                        <div style={{display: 'flex', gap: '12px'}}>
+                          <label style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            padding: '8px 16px',
+                            background: correlationType === 'spearman' ? '#c2410c' : 'white',
+                            color: correlationType === 'spearman' ? 'white' : '#374151',
+                            border: '1px solid #d1d5db',
+                            borderRadius: '6px',
+                            cursor: 'pointer',
+                            fontSize: '13px'
+                          }}>
+                            <input
+                              type="radio"
+                              name="correlationType"
+                              checked={correlationType === 'spearman'}
+                              onChange={() => setCorrelationType('spearman')}
+                              style={{display: 'none'}}
+                            />
+                            Spearman（順位相関）
+                          </label>
+                          <label style={{
+                            display: 'flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            padding: '8px 16px',
+                            background: correlationType === 'pearson' ? '#c2410c' : 'white',
+                            color: correlationType === 'pearson' ? 'white' : '#374151',
+                            border: '1px solid #d1d5db',
+                            borderRadius: '6px',
+                            cursor: 'pointer',
+                            fontSize: '13px'
+                          }}>
+                            <input
+                              type="radio"
+                              name="correlationType"
+                              checked={correlationType === 'pearson'}
+                              onChange={() => setCorrelationType('pearson')}
+                              style={{display: 'none'}}
+                            />
+                            Pearson（積率相関）
+                          </label>
+                        </div>
+                        <p style={{fontSize: '11px', color: '#6b7280', marginTop: '6px'}}>
+                          ※ バイオマーカーには正規分布を仮定しないSpearmanを推奨
+                        </p>
+                      </div>
+
+                      {/* マーカー選択 */}
+                      <div style={{marginBottom: '16px'}}>
+                        <label style={{...styles.inputLabel, marginBottom: '8px', display: 'block'}}>
+                          解析するマーカーを選択（2つ以上）
+                        </label>
+                        <div style={{
+                          display: 'flex',
+                          flexWrap: 'wrap',
+                          gap: '8px',
+                          padding: '12px',
+                          background: 'white',
+                          borderRadius: '8px',
+                          border: '1px solid #e5e7eb',
+                          maxHeight: '150px',
+                          overflowY: 'auto'
+                        }}>
+                          {selectedItems.length === 0 ? (
+                            <div style={{color: '#9ca3af', fontSize: '13px'}}>
+                              まず上部で検査項目を選択してください
+                            </div>
+                          ) : (
+                            selectedItems.map(item => (
+                              <label key={item} style={{
+                                display: 'flex',
+                                alignItems: 'center',
+                                gap: '4px',
+                                padding: '6px 12px',
+                                background: correlationSelectedItems.includes(item) ? '#ffedd5' : '#f9fafb',
+                                border: correlationSelectedItems.includes(item) ? '2px solid #c2410c' : '1px solid #d1d5db',
+                                borderRadius: '6px',
+                                cursor: 'pointer',
+                                fontSize: '12px',
+                                transition: 'all 0.15s'
+                              }}>
+                                <input
+                                  type="checkbox"
+                                  checked={correlationSelectedItems.includes(item)}
+                                  onChange={(e) => {
+                                    if (e.target.checked) {
+                                      setCorrelationSelectedItems([...correlationSelectedItems, item]);
+                                    } else {
+                                      setCorrelationSelectedItems(correlationSelectedItems.filter(i => i !== item));
+                                    }
+                                  }}
+                                  style={{display: 'none'}}
+                                />
+                                {correlationSelectedItems.includes(item) && <span style={{color: '#c2410c'}}>✓</span>}
+                                {item}
+                              </label>
+                            ))
+                          )}
+                        </div>
+                        <div style={{marginTop: '6px', display: 'flex', gap: '8px'}}>
+                          <button
+                            onClick={() => setCorrelationSelectedItems([...selectedItems])}
+                            disabled={selectedItems.length === 0}
+                            style={{fontSize: '11px', padding: '4px 8px', background: '#e5e7eb', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                          >
+                            全選択
+                          </button>
+                          <button
+                            onClick={() => setCorrelationSelectedItems([])}
+                            style={{fontSize: '11px', padding: '4px 8px', background: '#e5e7eb', border: 'none', borderRadius: '4px', cursor: 'pointer'}}
+                          >
+                            全解除
+                          </button>
+                          <span style={{fontSize: '11px', color: '#6b7280', marginLeft: '8px'}}>
+                            {correlationSelectedItems.length}項目選択中
+                          </span>
+                        </div>
+                      </div>
+
+                      <button
+                        onClick={runCorrelationAnalysis}
+                        disabled={correlationSelectedItems.length < 2 || isCalculatingCorrelation}
+                        style={{
+                          ...styles.primaryButton,
+                          width: '100%',
+                          backgroundColor: '#c2410c',
+                          opacity: correlationSelectedItems.length < 2 ? 0.5 : 1
+                        }}
+                      >
+                        {isCalculatingCorrelation ? '相関計算中...' : '相関解析を実行'}
+                      </button>
+
+                      {/* 相関解析結果 */}
+                      {correlationResults && (
+                        <div style={{marginTop: '20px'}}>
+                          {/* ヒートマップ */}
+                          <div style={{
+                            padding: '16px',
+                            background: 'white',
+                            borderRadius: '8px',
+                            border: '1px solid #e5e7eb'
+                          }}>
+                            <h4 style={{margin: '0 0 12px 0', fontSize: '14px', color: '#374151'}}>
+                              相関ヒートマップ（{correlationResults.type === 'spearman' ? 'Spearman' : 'Pearson'}）
+                            </h4>
+                            {(() => {
+                              const items = correlationResults.items;
+                              const n = items.length;
+                              const cellSize = Math.min(60, 400 / n);
+                              const labelWidth = 100;
+                              const margin = { top: 120, right: 80, bottom: 20, left: labelWidth };
+                              const svgWidth = margin.left + n * cellSize + margin.right;
+                              const svgHeight = margin.top + n * cellSize + margin.bottom;
+
+                              let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" style="font-family: Arial, sans-serif;">`;
+                              svgContent += `<rect width="100%" height="100%" fill="white"/>`;
+
+                              // タイトル
+                              svgContent += `<text x="${svgWidth/2}" y="20" text-anchor="middle" font-size="14" font-weight="bold">Correlation Heatmap (${correlationResults.type === 'spearman' ? 'Spearman' : 'Pearson'})</text>`;
+
+                              // 上部のラベル（斜め）
+                              items.forEach((item, i) => {
+                                const x = margin.left + i * cellSize + cellSize / 2;
+                                const y = margin.top - 10;
+                                svgContent += `<text x="${x}" y="${y}" text-anchor="start" font-size="${Math.min(11, cellSize/4)}" transform="rotate(-45, ${x}, ${y})">${item.length > 15 ? item.substring(0, 15) + '...' : item}</text>`;
+                              });
+
+                              // 左側のラベル
+                              items.forEach((item, i) => {
+                                const x = margin.left - 5;
+                                const y = margin.top + i * cellSize + cellSize / 2 + 4;
+                                svgContent += `<text x="${x}" y="${y}" text-anchor="end" font-size="${Math.min(11, cellSize/4)}">${item.length > 12 ? item.substring(0, 12) + '...' : item}</text>`;
+                              });
+
+                              // ヒートマップセル
+                              for (let i = 0; i < n; i++) {
+                                for (let j = 0; j < n; j++) {
+                                  const x = margin.left + j * cellSize;
+                                  const y = margin.top + i * cellSize;
+                                  const r = correlationResults.matrix[i][j];
+                                  const p = correlationResults.pMatrix[i][j];
+                                  const color = getCorrelationColor(r);
+                                  const sig = getCorrelationSignificance(p);
+
+                                  svgContent += `<rect x="${x}" y="${y}" width="${cellSize}" height="${cellSize}" fill="${color}" stroke="#e5e7eb" stroke-width="1"/>`;
+
+                                  if (r !== null) {
+                                    const textColor = Math.abs(r) > 0.5 ? 'white' : '#374151';
+                                    svgContent += `<text x="${x + cellSize/2}" y="${y + cellSize/2 - 2}" text-anchor="middle" font-size="${Math.min(10, cellSize/5)}" fill="${textColor}">${r.toFixed(2)}</text>`;
+                                    if (sig) {
+                                      svgContent += `<text x="${x + cellSize/2}" y="${y + cellSize/2 + 10}" text-anchor="middle" font-size="${Math.min(9, cellSize/6)}" fill="${textColor}">${sig}</text>`;
+                                    }
+                                  } else {
+                                    svgContent += `<text x="${x + cellSize/2}" y="${y + cellSize/2 + 4}" text-anchor="middle" font-size="${Math.min(10, cellSize/5)}" fill="#9ca3af">N/A</text>`;
+                                  }
+                                }
+                              }
+
+                              // カラースケール凡例
+                              const legendX = margin.left + n * cellSize + 20;
+                              const legendY = margin.top;
+                              const legendHeight = n * cellSize;
+                              const legendWidth = 20;
+
+                              // グラデーション定義
+                              svgContent += `<defs><linearGradient id="colorScale" x1="0%" y1="100%" x2="0%" y2="0%">`;
+                              svgContent += `<stop offset="0%" style="stop-color:rgb(59,130,246);stop-opacity:1"/>`;
+                              svgContent += `<stop offset="50%" style="stop-color:rgb(255,255,255);stop-opacity:1"/>`;
+                              svgContent += `<stop offset="100%" style="stop-color:rgb(239,68,68);stop-opacity:1"/>`;
+                              svgContent += `</linearGradient></defs>`;
+
+                              svgContent += `<rect x="${legendX}" y="${legendY}" width="${legendWidth}" height="${legendHeight}" fill="url(#colorScale)" stroke="#e5e7eb"/>`;
+                              svgContent += `<text x="${legendX + legendWidth + 5}" y="${legendY + 10}" font-size="10">+1</text>`;
+                              svgContent += `<text x="${legendX + legendWidth + 5}" y="${legendY + legendHeight/2 + 4}" font-size="10">0</text>`;
+                              svgContent += `<text x="${legendX + legendWidth + 5}" y="${legendY + legendHeight}" font-size="10">-1</text>`;
+
+                              // 有意水準の凡例
+                              svgContent += `<text x="${legendX}" y="${legendY + legendHeight + 20}" font-size="9">*p<0.05</text>`;
+                              svgContent += `<text x="${legendX}" y="${legendY + legendHeight + 32}" font-size="9">**p<0.01</text>`;
+                              svgContent += `<text x="${legendX}" y="${legendY + legendHeight + 44}" font-size="9">***p<0.001</text>`;
+
+                              svgContent += '</svg>';
+
+                              return (
+                                <div>
+                                  <div
+                                    ref={correlationChartRef}
+                                    style={{display: 'flex', justifyContent: 'center', overflowX: 'auto'}}
+                                    dangerouslySetInnerHTML={{__html: svgContent}}
+                                  />
+                                  {/* エクスポートボタン */}
+                                  <div style={{display: 'flex', gap: '10px', justifyContent: 'center', marginTop: '16px', flexWrap: 'wrap'}}>
+                                    <button
+                                      onClick={() => {
+                                        const blob = new Blob([svgContent], { type: 'image/svg+xml;charset=utf-8' });
+                                        const url = URL.createObjectURL(blob);
+                                        const a = document.createElement('a');
+                                        a.href = url;
+                                        a.download = `相関ヒートマップ_${correlationResults.type}_${n}項目.svg`;
+                                        a.click();
+                                        URL.revokeObjectURL(url);
+                                      }}
+                                      style={{...styles.addButton, backgroundColor: '#c2410c', padding: '8px 16px', fontSize: '12px'}}
+                                    >
+                                      🎨 SVG保存
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        const canvas = document.createElement('canvas');
+                                        canvas.width = svgWidth * 2;
+                                        canvas.height = svgHeight * 2;
+                                        const ctx = canvas.getContext('2d');
+                                        ctx.scale(2, 2);
+                                        const img = new Image();
+                                        const svgBlob = new Blob([svgContent], {type: 'image/svg+xml;charset=utf-8'});
+                                        const svgUrl = URL.createObjectURL(svgBlob);
+                                        img.onload = () => {
+                                          ctx.fillStyle = 'white';
+                                          ctx.fillRect(0, 0, svgWidth, svgHeight);
+                                          ctx.drawImage(img, 0, 0);
+                                          URL.revokeObjectURL(svgUrl);
+                                          const pngUrl = canvas.toDataURL('image/png');
+                                          const a = document.createElement('a');
+                                          a.href = pngUrl;
+                                          a.download = `相関ヒートマップ_${correlationResults.type}_${n}項目.png`;
+                                          a.click();
+                                        };
+                                        img.src = svgUrl;
+                                      }}
+                                      style={{...styles.addButton, backgroundColor: '#059669', padding: '8px 16px', fontSize: '12px'}}
+                                    >
+                                      📷 PNG保存
+                                    </button>
+                                    <button
+                                      onClick={() => {
+                                        // CSV出力（相関行列）
+                                        const items = correlationResults.items;
+                                        const headers = ['', ...items];
+                                        const rows = items.map((item, i) => [
+                                          item,
+                                          ...items.map((_, j) => {
+                                            const r = correlationResults.matrix[i][j];
+                                            const p = correlationResults.pMatrix[i][j];
+                                            const sig = getCorrelationSignificance(p);
+                                            return r !== null ? `${r.toFixed(4)}${sig}` : 'N/A';
+                                          })
+                                        ]);
+                                        const csvContent = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+                                        const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+                                        const blob = new Blob([bom, csvContent], { type: 'text/csv;charset=utf-8' });
+                                        const url = URL.createObjectURL(blob);
+                                        const a = document.createElement('a');
+                                        a.href = url;
+                                        a.download = `相関行列_${correlationResults.type}_${new Date().toISOString().split('T')[0]}.csv`;
+                                        document.body.appendChild(a);
+                                        a.click();
+                                        document.body.removeChild(a);
+                                        URL.revokeObjectURL(url);
+                                      }}
+                                      style={{...styles.addButton, backgroundColor: '#2563eb', padding: '8px 16px', fontSize: '12px'}}
+                                    >
+                                      📊 相関行列CSV
+                                    </button>
+                                    <button
+                                      onClick={exportCorrelationRawData}
+                                      disabled={!correlationRawData}
+                                      style={{...styles.addButton, backgroundColor: '#0891b2', padding: '8px 16px', fontSize: '12px', opacity: correlationRawData ? 1 : 0.5}}
+                                    >
+                                      📥 生データCSV
+                                    </button>
+                                    <button
+                                      onClick={exportCorrelationRScript}
+                                      style={{...styles.addButton, backgroundColor: '#7c3aed', padding: '8px 16px', fontSize: '12px'}}
+                                    >
+                                      📜 Rスクリプト
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })()}
+                          </div>
+
+                          {/* 相関係数テーブル（詳細） */}
+                          <div style={{marginTop: '16px'}}>
+                            <details>
+                              <summary style={{cursor: 'pointer', fontSize: '13px', color: '#374151', marginBottom: '8px'}}>
+                                📋 詳細テーブルを表示
+                              </summary>
+                              <div style={{overflowX: 'auto', marginTop: '8px'}}>
+                                <table style={{
+                                  width: '100%',
+                                  borderCollapse: 'collapse',
+                                  fontSize: '11px',
+                                  background: 'white'
+                                }}>
+                                  <thead>
+                                    <tr style={{background: '#fff7ed'}}>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>マーカー1</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0', textAlign: 'left'}}>マーカー2</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>r</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>p値</th>
+                                      <th style={{padding: '6px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>n</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {correlationResults.items.flatMap((item1, i) =>
+                                      correlationResults.items.slice(i + 1).map((item2, jOffset) => {
+                                        const j = i + 1 + jOffset;
+                                        const r = correlationResults.matrix[i][j];
+                                        const p = correlationResults.pMatrix[i][j];
+                                        const n = correlationResults.pairCounts[i][j];
+                                        return (
+                                          <tr key={`${i}-${j}`}>
+                                            <td style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>{item1}</td>
+                                            <td style={{padding: '6px', borderBottom: '1px solid #e2e8f0'}}>{item2}</td>
+                                            <td style={{
+                                              padding: '6px',
+                                              borderBottom: '1px solid #e2e8f0',
+                                              textAlign: 'center',
+                                              fontWeight: r !== null && Math.abs(r) >= 0.5 ? 'bold' : 'normal',
+                                              color: r !== null ? (r > 0 ? '#dc2626' : '#2563eb') : '#9ca3af'
+                                            }}>
+                                              {r !== null ? r.toFixed(3) : 'N/A'}
+                                            </td>
+                                            <td style={{
+                                              padding: '6px',
+                                              borderBottom: '1px solid #e2e8f0',
+                                              textAlign: 'center',
+                                              fontWeight: p !== null && p < 0.05 ? 'bold' : 'normal'
+                                            }}>
+                                              {p !== null ? `${p.toFixed(4)}${getCorrelationSignificance(p)}` : 'N/A'}
+                                            </td>
+                                            <td style={{padding: '6px', borderBottom: '1px solid #e2e8f0', textAlign: 'center'}}>
+                                              {n}
+                                            </td>
+                                          </tr>
+                                        );
+                                      })
+                                    )}
+                                  </tbody>
+                                </table>
+                              </div>
+                            </details>
+                          </div>
+
+                          {/* 解釈ガイド */}
+                          <div style={{marginTop: '12px', padding: '12px', background: '#f9fafb', borderRadius: '8px', fontSize: '11px', color: '#6b7280'}}>
+                            <strong>相関係数の解釈:</strong>
+                            <span style={{marginLeft: '12px', color: '#dc2626'}}>●0.7以上: 強い正の相関</span>
+                            <span style={{marginLeft: '12px', color: '#f59e0b'}}>●0.4-0.7: 中程度の相関</span>
+                            <span style={{marginLeft: '12px', color: '#6b7280'}}>●0.4未満: 弱い相関</span>
+                            <span style={{marginLeft: '12px', color: '#2563eb'}}>●負の値: 逆相関</span>
+                          </div>
+                        </div>
                       )}
                     </>
                   )}
@@ -5606,6 +7786,17 @@ function PatientsListView({ onSelectPatient }) {
                   setComparisonResults(null);
                   setDayRangeStart('');
                   setDayRangeEnd('');
+                  setSampleSelectionMode('all');
+                  setTargetDay('');
+                  setSampleDetails(null);
+                  setShowGroupComparison(false);
+                  setShowCorrelationAnalysis(false);
+                  setCorrelationSelectedItems([]);
+                  setCorrelationResults(null);
+                  setStatSelectedItems([]);
+                  setShowRocAnalysis(false);
+                  setRocSelectedItems([]);
+                  setRocResults(null);
                 }}
                 style={styles.cancelButton}
               >
