@@ -1362,12 +1362,19 @@ const styles = {
 // ============================================================
 // ログイン画面
 // ============================================================
+// 所属施設リスト（無料利用可能な施設）
+const FREE_INSTITUTIONS = [
+  { id: 'tmd-ped', name: '東京科学大学小児科', domain: 'tmd.ac.jp' },
+  // 他の施設を追加する場合はここに追加
+];
+
 function LoginView() {
   const { signup, login } = useAuth();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isRegistering, setIsRegistering] = useState(false);
   const [showPasswordReset, setShowPasswordReset] = useState(false);
+  const [selectedInstitution, setSelectedInstitution] = useState('');
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
@@ -1410,13 +1417,50 @@ function LoginView() {
       setError('パスワードは6文字以上で入力してください');
       return;
     }
+    if (isRegistering && !selectedInstitution) {
+      setError('所属施設を選択してください');
+      return;
+    }
 
     setLoading(true);
     setError('');
 
     try {
       if (isRegistering) {
-        await signup(email, password);
+        const userCredential = await signup(email, password);
+        const uid = userCredential.user.uid;
+
+        // ユーザープロファイルを保存
+        await setDoc(doc(db, 'users', uid), {
+          email: email.toLowerCase(),
+          institution: selectedInstitution,
+          institutionName: FREE_INSTITUTIONS.find(i => i.id === selectedInstitution)?.name || 'その他',
+          createdAt: serverTimestamp(),
+          tier: selectedInstitution !== 'other' ? 'free' : 'external'
+        });
+
+        // 無料施設の場合、組織メンバーとして自動登録
+        if (selectedInstitution && selectedInstitution !== 'other') {
+          // 施設に対応する組織を検索
+          const orgsQuery = query(
+            collection(db, 'organizations'),
+            where('institutionId', '==', selectedInstitution)
+          );
+          const orgsSnapshot = await getDocs(orgsQuery);
+
+          if (!orgsSnapshot.empty) {
+            const orgDoc = orgsSnapshot.docs[0];
+            // 組織メンバーとして追加
+            await addDoc(collection(db, 'organizationMembers'), {
+              orgId: orgDoc.id,
+              uid: uid,
+              email: email.toLowerCase(),
+              role: 'member',
+              institution: selectedInstitution,
+              joinedAt: serverTimestamp()
+            });
+          }
+        }
       } else {
         await login(email, password);
       }
@@ -1512,6 +1556,32 @@ function LoginView() {
                 placeholder="••••••••"
               />
             </div>
+            {isRegistering && (
+              <div style={styles.inputGroup}>
+                <label style={styles.inputLabel}>所属施設</label>
+                <select
+                  value={selectedInstitution}
+                  onChange={(e) => setSelectedInstitution(e.target.value)}
+                  style={styles.input}
+                >
+                  <option value="">-- 選択してください --</option>
+                  {FREE_INSTITUTIONS.map(inst => (
+                    <option key={inst.id} value={inst.id}>{inst.name}</option>
+                  ))}
+                  <option value="other">その他（外部）</option>
+                </select>
+                {selectedInstitution && selectedInstitution !== 'other' && (
+                  <p style={{fontSize: '12px', color: '#059669', marginTop: '4px'}}>
+                    ✓ 無料でご利用いただけます
+                  </p>
+                )}
+                {selectedInstitution === 'other' && (
+                  <p style={{fontSize: '12px', color: '#6b7280', marginTop: '4px'}}>
+                    外部ユーザーとして登録されます
+                  </p>
+                )}
+              </div>
+            )}
             {error && <p style={styles.errorText}>{error}</p>}
             <button
               type="submit"
@@ -1577,11 +1647,14 @@ function PatientsListView({ onSelectPatient }) {
   const [newOrgName, setNewOrgName] = useState('');
   const [newOrgTier, setNewOrgTier] = useState('paid');
   const [newOrgOwnerEmail, setNewOrgOwnerEmail] = useState('');
+  const [newOrgInstitutionId, setNewOrgInstitutionId] = useState('');
   const [allOrganizations, setAllOrganizations] = useState([]);
   const [isCreatingOrg, setIsCreatingOrg] = useState(false);
   const [bulkMemberInput, setBulkMemberInput] = useState('');
   const [selectedOrgForMembers, setSelectedOrgForMembers] = useState('');
   const [orgMembers, setOrgMembers] = useState([]);
+  const [allUsers, setAllUsers] = useState([]);
+  const [adminPanelTab, setAdminPanelTab] = useState('organizations'); // 'organizations', 'users'
 
   // 管理者パネル用state
   const [showAdminPanel, setShowAdminPanel] = useState(false);
@@ -3762,6 +3835,9 @@ function PatientsListView({ onSelectPatient }) {
             style={{
               ...styles.logoutButton,
               backgroundColor: '#0ea5e9',
+              color: '#ffffff',
+              fontSize: '14px',
+              fontWeight: '600',
               marginRight: '8px',
               textDecoration: 'none',
               display: 'inline-block'
@@ -3776,6 +3852,9 @@ function PatientsListView({ onSelectPatient }) {
               style={{
                 ...styles.logoutButton,
                 backgroundColor: '#dc2626',
+                color: '#ffffff',
+                fontSize: '14px',
+                fontWeight: '600',
                 marginRight: '8px'
               }}
             >
@@ -3788,6 +3867,9 @@ function PatientsListView({ onSelectPatient }) {
               style={{
                 ...styles.logoutButton,
                 backgroundColor: '#7c3aed',
+                color: '#ffffff',
+                fontSize: '14px',
+                fontWeight: '600',
                 marginRight: '8px'
               }}
             >
@@ -5731,6 +5813,55 @@ function PatientsListView({ onSelectPatient }) {
               組織の作成・管理を行います。システム管理者のみアクセス可能です。
             </p>
 
+            {/* タブ切り替え */}
+            <div style={{display: 'flex', gap: '8px', marginBottom: '20px'}}>
+              <button
+                onClick={() => setAdminPanelTab('organizations')}
+                style={{
+                  padding: '8px 16px',
+                  background: adminPanelTab === 'organizations' ? '#3b82f6' : '#f1f5f9',
+                  color: adminPanelTab === 'organizations' ? 'white' : '#64748b',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '13px',
+                  fontWeight: '500'
+                }}
+              >
+                組織管理
+              </button>
+              <button
+                onClick={async () => {
+                  setAdminPanelTab('users');
+                  // ユーザー一覧を取得
+                  try {
+                    const usersSnapshot = await getDocs(collection(db, 'users'));
+                    const users = usersSnapshot.docs.map(doc => ({
+                      id: doc.id,
+                      ...doc.data()
+                    }));
+                    setAllUsers(users);
+                  } catch (err) {
+                    console.error('ユーザー取得エラー:', err);
+                  }
+                }}
+                style={{
+                  padding: '8px 16px',
+                  background: adminPanelTab === 'users' ? '#3b82f6' : '#f1f5f9',
+                  color: adminPanelTab === 'users' ? 'white' : '#64748b',
+                  border: 'none',
+                  borderRadius: '6px',
+                  cursor: 'pointer',
+                  fontSize: '13px',
+                  fontWeight: '500'
+                }}
+              >
+                ユーザー一覧
+              </button>
+            </div>
+
+            {adminPanelTab === 'organizations' && (
+              <>
             {/* 新規組織作成 */}
             <div style={{marginBottom: '24px', padding: '16px', background: '#fef3c7', borderRadius: '8px', border: '1px solid #f59e0b'}}>
               <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '12px', color: '#92400e'}}>
@@ -5763,18 +5894,33 @@ function PatientsListView({ onSelectPatient }) {
                       <option value="paid">有料</option>
                     </select>
                   </div>
-                  <div style={{flex: 2}}>
+                  <div style={{flex: 1}}>
                     <label style={{display: 'block', fontSize: '12px', color: '#6b7280', marginBottom: '4px'}}>
-                      オーナーのメールアドレス
+                      紐付け施設
                     </label>
-                    <input
-                      type="email"
-                      value={newOrgOwnerEmail}
-                      onChange={(e) => setNewOrgOwnerEmail(e.target.value)}
-                      placeholder="owner@example.com"
+                    <select
+                      value={newOrgInstitutionId}
+                      onChange={(e) => setNewOrgInstitutionId(e.target.value)}
                       style={{...styles.input, width: '100%'}}
-                    />
+                    >
+                      <option value="">-- 選択 --</option>
+                      {FREE_INSTITUTIONS.map(inst => (
+                        <option key={inst.id} value={inst.id}>{inst.name}</option>
+                      ))}
+                    </select>
                   </div>
+                </div>
+                <div>
+                  <label style={{display: 'block', fontSize: '12px', color: '#6b7280', marginBottom: '4px'}}>
+                    オーナーのメールアドレス
+                  </label>
+                  <input
+                    type="email"
+                    value={newOrgOwnerEmail}
+                    onChange={(e) => setNewOrgOwnerEmail(e.target.value)}
+                    placeholder="owner@example.com"
+                    style={{...styles.input, width: '100%'}}
+                  />
                 </div>
                 <button
                   onClick={async () => {
@@ -5784,11 +5930,31 @@ function PatientsListView({ onSelectPatient }) {
                     }
                     setIsCreatingOrg(true);
                     try {
-                      const orgId = await createOrganization(newOrgName.trim(), newOrgTier, newOrgOwnerEmail.trim() || null);
-                      alert(`組織「${newOrgName}」を作成しました (ID: ${orgId})`);
+                      // 組織を作成（institutionIdを含む）
+                      const orgRef = await addDoc(collection(db, 'organizations'), {
+                        name: newOrgName.trim(),
+                        tier: newOrgTier,
+                        institutionId: newOrgInstitutionId || null,
+                        createdAt: serverTimestamp(),
+                        createdBy: user.uid
+                      });
+
+                      // オーナーを設定
+                      if (newOrgOwnerEmail.trim()) {
+                        await addDoc(collection(db, 'organizationMembers'), {
+                          orgId: orgRef.id,
+                          email: newOrgOwnerEmail.toLowerCase(),
+                          uid: null,
+                          role: 'owner',
+                          joinedAt: serverTimestamp()
+                        });
+                      }
+
+                      alert(`組織「${newOrgName}」を作成しました`);
                       setNewOrgName('');
                       setNewOrgOwnerEmail('');
                       setNewOrgTier('paid');
+                      setNewOrgInstitutionId('');
                     } catch (err) {
                       alert('エラー: ' + err.message);
                     } finally {
@@ -5939,6 +6105,83 @@ function PatientsListView({ onSelectPatient }) {
                 </div>
               )}
             </div>
+              </>
+            )}
+
+            {/* ユーザー一覧タブ */}
+            {adminPanelTab === 'users' && (
+              <div style={{padding: '16px', background: '#f8fafc', borderRadius: '8px'}}>
+                <h3 style={{fontSize: '14px', fontWeight: '600', marginBottom: '12px', color: '#374151'}}>
+                  登録ユーザー一覧 ({allUsers.length}人)
+                </h3>
+                {allUsers.length === 0 ? (
+                  <p style={{fontSize: '13px', color: '#6b7280'}}>ユーザーがいません</p>
+                ) : (
+                  <div style={{maxHeight: '400px', overflow: 'auto'}}>
+                    <table style={{width: '100%', borderCollapse: 'collapse', fontSize: '12px'}}>
+                      <thead>
+                        <tr style={{background: '#e5e7eb'}}>
+                          <th style={{padding: '8px', textAlign: 'left', borderBottom: '1px solid #d1d5db'}}>メール</th>
+                          <th style={{padding: '8px', textAlign: 'left', borderBottom: '1px solid #d1d5db'}}>所属施設</th>
+                          <th style={{padding: '8px', textAlign: 'left', borderBottom: '1px solid #d1d5db'}}>プラン</th>
+                          <th style={{padding: '8px', textAlign: 'left', borderBottom: '1px solid #d1d5db'}}>登録日</th>
+                          <th style={{padding: '8px', textAlign: 'center', borderBottom: '1px solid #d1d5db'}}>操作</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {allUsers.map(u => (
+                          <tr key={u.id} style={{background: 'white'}}>
+                            <td style={{padding: '8px', borderBottom: '1px solid #e5e7eb'}}>{u.email}</td>
+                            <td style={{padding: '8px', borderBottom: '1px solid #e5e7eb'}}>
+                              {u.institutionName || u.institution || '-'}
+                            </td>
+                            <td style={{padding: '8px', borderBottom: '1px solid #e5e7eb'}}>
+                              <span style={{
+                                padding: '2px 6px',
+                                borderRadius: '4px',
+                                fontSize: '10px',
+                                backgroundColor: u.tier === 'free' ? '#dbeafe' : u.tier === 'external' ? '#fef2f2' : '#f3f4f6',
+                                color: u.tier === 'free' ? '#1e40af' : u.tier === 'external' ? '#dc2626' : '#6b7280'
+                              }}>
+                                {u.tier === 'free' ? '無料' : u.tier === 'external' ? '外部' : '未設定'}
+                              </span>
+                            </td>
+                            <td style={{padding: '8px', borderBottom: '1px solid #e5e7eb'}}>
+                              {u.createdAt?.toDate?.()?.toLocaleDateString?.() || '-'}
+                            </td>
+                            <td style={{padding: '8px', borderBottom: '1px solid #e5e7eb', textAlign: 'center'}}>
+                              <button
+                                onClick={async () => {
+                                  if (!confirm(`ユーザー「${u.email}」を削除しますか？\n※ユーザーのデータは削除されません。`)) return;
+                                  try {
+                                    await deleteDoc(doc(db, 'users', u.id));
+                                    setAllUsers(allUsers.filter(x => x.id !== u.id));
+                                    alert('ユーザーを削除しました');
+                                  } catch (err) {
+                                    alert('削除に失敗しました: ' + err.message);
+                                  }
+                                }}
+                                style={{
+                                  padding: '4px 8px',
+                                  background: '#fef2f2',
+                                  color: '#dc2626',
+                                  border: '1px solid #fecaca',
+                                  borderRadius: '4px',
+                                  cursor: 'pointer',
+                                  fontSize: '11px'
+                                }}
+                              >
+                                削除
+                              </button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </div>
+            )}
 
             <div style={styles.modalActions}>
               <button
@@ -6143,6 +6386,101 @@ function PatientDetailView({ patient, onBack }) {
   const [useDualAxis, setUseDualAxis] = useState(false); // 二軸表示
   const [secondaryAxisItems, setSecondaryAxisItems] = useState([]); // 右軸に表示する項目
   const overlayChartRef = useRef(null);
+
+  // グラフ表示オプション
+  const [chartLabelStyle, setChartLabelStyle] = useState('japanese'); // 'japanese', 'english', 'abbreviation'
+  const [chartColorStyle, setChartColorStyle] = useState('color'); // 'color', 'monochrome'
+
+  // ラベル変換マッピング
+  const labelTranslations = {
+    // 臨床症状
+    '意識障害': { english: 'Consciousness Disturbance', abbreviation: 'Consc.' },
+    'てんかん発作': { english: 'Epileptic Seizure', abbreviation: 'Sz' },
+    '不随意運動': { english: 'Involuntary Movement', abbreviation: 'Invol.Mov.' },
+    '麻痺': { english: 'Paralysis', abbreviation: 'Paralysis' },
+    '感覚障害': { english: 'Sensory Disturbance', abbreviation: 'Sens.' },
+    '失語': { english: 'Aphasia', abbreviation: 'Aphasia' },
+    '認知機能障害': { english: 'Cognitive Impairment', abbreviation: 'Cogn.' },
+    '精神症状': { english: 'Psychiatric Symptoms', abbreviation: 'Psych.' },
+    '発熱': { english: 'Fever', abbreviation: 'Fever' },
+    '頭痛': { english: 'Headache', abbreviation: 'HA' },
+    '髄膜刺激症状': { english: 'Meningeal Signs', abbreviation: 'Mening.' },
+    '人工呼吸器管理': { english: 'Mechanical Ventilation', abbreviation: 'MV' },
+    'ICU入室': { english: 'ICU Admission', abbreviation: 'ICU' },
+    '嘔吐': { english: 'Vomiting', abbreviation: 'Vomit' },
+    '腹痛': { english: 'Abdominal Pain', abbreviation: 'Abd.Pain' },
+    '下痢': { english: 'Diarrhea', abbreviation: 'Diarrhea' },
+    '口渇': { english: 'Thirst', abbreviation: 'Thirst' },
+    '多尿': { english: 'Polyuria', abbreviation: 'Polyuria' },
+    '脱水': { english: 'Dehydration', abbreviation: 'Dehydr.' },
+    '頻呼吸': { english: 'Tachypnea', abbreviation: 'Tachypnea' },
+    '呼吸困難': { english: 'Dyspnea', abbreviation: 'Dyspnea' },
+    // 治療薬カテゴリ
+    '抗てんかん薬': { english: 'Antiepileptics', abbreviation: 'AED' },
+    'ステロイド': { english: 'Steroids', abbreviation: 'Steroid' },
+    '免疫グロブリン': { english: 'Immunoglobulin', abbreviation: 'IVIG' },
+    '血漿交換': { english: 'Plasma Exchange', abbreviation: 'PE' },
+    '免疫抑制剤': { english: 'Immunosuppressants', abbreviation: 'Immunosup.' },
+    '抗ウイルス薬': { english: 'Antivirals', abbreviation: 'Antiviral' },
+    '抗菌薬': { english: 'Antibiotics', abbreviation: 'Abx' },
+    '抗浮腫薬': { english: 'Anti-edema', abbreviation: 'Anti-edema' },
+  };
+
+  // ラベル変換関数
+  const translateLabel = (label) => {
+    if (chartLabelStyle === 'japanese') return label;
+    const translation = labelTranslations[label];
+    if (translation) {
+      return chartLabelStyle === 'english' ? translation.english : translation.abbreviation;
+    }
+    return label; // 翻訳がない場合は元のラベルを返す
+  };
+
+  // 白黒カラーマッピング（治療薬カテゴリ用）
+  const monochromeColors = {
+    '抗てんかん薬': '#1f2937',
+    'ステロイド': '#374151',
+    '免疫グロブリン': '#4b5563',
+    '血漿交換': '#6b7280',
+    '免疫抑制剤': '#9ca3af',
+    '抗ウイルス薬': '#d1d5db',
+    '抗菌薬': '#1f2937',
+    '抗浮腫薬': '#374151',
+    'その他': '#6b7280'
+  };
+
+  // 白黒パターン（臨床イベント用）- 異なるグレースケール
+  const monochromeEventColors = {
+    '意識障害': '#111827',
+    'てんかん発作': '#1f2937',
+    '不随意運動': '#374151',
+    '麻痺': '#4b5563',
+    '感覚障害': '#6b7280',
+    '失語': '#9ca3af',
+    '認知機能障害': '#d1d5db',
+    '精神症状': '#111827',
+    '発熱': '#374151',
+    '頭痛': '#6b7280',
+    '髄膜刺激症状': '#9ca3af',
+    '人工呼吸器管理': '#1f2937',
+    'ICU入室': '#4b5563'
+  };
+
+  // カラー取得関数（カテゴリ用）
+  const getCategoryColor = (category, defaultColorMap) => {
+    if (chartColorStyle === 'monochrome') {
+      return monochromeColors[category] || '#6b7280';
+    }
+    return defaultColorMap[category] || '#6b7280';
+  };
+
+  // カラー取得関数（イベント用）
+  const getEventColor = (eventType, defaultColorMap) => {
+    if (chartColorStyle === 'monochrome') {
+      return monochromeEventColors[eventType] || '#6b7280';
+    }
+    return defaultColorMap[eventType] || '#6b7280';
+  };
 
   // 治療薬カテゴリと薬剤リスト
   // 治療薬の親カテゴリ（領域別）
@@ -7970,26 +8308,6 @@ function PatientDetailView({ patient, onBack }) {
             </button>
           )}
         </div>
-        <div style={{display: 'flex', gap: '10px'}}>
-          <button
-            onClick={() => setShowClinicalTimeline(true)}
-            style={{
-              padding: '8px 16px',
-              background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              cursor: 'pointer',
-              fontSize: '13px',
-              fontWeight: '500',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px'
-            }}
-          >
-            📊 臨床経過タイムライン
-          </button>
-        </div>
       </header>
 
       <main style={styles.detailContent}>
@@ -8103,11 +8421,48 @@ function PatientDetailView({ patient, onBack }) {
           </div>
         </section>
 
+        {/* セクションコンテナ（経過グラフを上、臨床経過と検査データを横並び） */}
+        <div style={{display: 'flex', flexWrap: 'wrap', gap: '20px'}}>
+
+        {/* 入力エリアヘッダー */}
+        <div style={{
+          flex: '1 1 100%',
+          order: 2,
+          background: 'linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%)',
+          borderRadius: '12px',
+          padding: '16px 20px',
+          marginBottom: '-10px',
+          border: '2px solid #86efac'
+        }}>
+          <h2 style={{
+            fontSize: '18px',
+            fontWeight: '700',
+            color: '#166534',
+            margin: 0,
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px'
+          }}>
+            📝 データ入力
+          </h2>
+          <p style={{fontSize: '12px', color: '#15803d', margin: '4px 0 0 0'}}>
+            治療薬・症状・検査データを入力してください
+          </p>
+        </div>
+
         {/* 臨床経過セクション（治療薬と臨床イベントを統合） */}
-        <section style={styles.section}>
-          <div style={styles.sectionHeader}>
-            <h2 style={styles.sectionTitle}>臨床経過</h2>
-            <div style={{display: 'flex', gap: '8px', flexWrap: 'wrap'}}>
+        <section style={{...styles.section, flex: '1 1 400px', minWidth: '400px', order: 3}}>
+          <h2 style={{
+            fontSize: '16px',
+            fontWeight: '700',
+            color: '#1f2937',
+            margin: '0 0 12px 0',
+            padding: '0 0 8px 0',
+            borderBottom: '2px solid #10b981'
+          }}>
+            💊 臨床経過（治療・症状）
+          </h2>
+          <div style={{display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '16px'}}>
               <button
                 onClick={openAddTreatmentModal}
                 style={{...styles.addLabButton, background: '#ecfdf5', color: '#047857'}}
@@ -8146,7 +8501,6 @@ function PatientDetailView({ patient, onBack }) {
               >
                 <span>📄</span> サンプルCSV
               </button>
-            </div>
           </div>
 
           {clinicalEvents.length === 0 && treatments.length === 0 ? (
@@ -8563,7 +8917,7 @@ function PatientDetailView({ patient, onBack }) {
         </section>
 
         {/* 経過グラフ作成セクション */}
-        <section style={styles.section}>
+        <section style={{...styles.section, flex: '1 1 100%', order: 1}}>
           <div style={styles.sectionHeader}>
             <h2 style={styles.sectionTitle}>経過グラフ作成</h2>
             <button
@@ -8588,7 +8942,7 @@ function PatientDetailView({ patient, onBack }) {
               border: '1px solid #bfdbfe'
             }}>
               <div style={{fontSize: '13px', color: '#1e40af', lineHeight: '1.6'}}>
-                検査値・治療薬・臨床経過を組み合わせた<strong>経過表</strong>を作成し、<strong>PNG画像</strong>や<strong>Excel</strong>で出力できます。
+                下の「データ入力」で入れたデータから、選択した<strong>検査値・治療薬・臨床経過</strong>を組み合わせた<strong>経過表</strong>を作成し、<strong>PNG画像</strong>や<strong>Excel</strong>で出力できます。
               </div>
               <div style={{fontSize: '12px', color: '#3b82f6', marginTop: '10px', display: 'flex', flexWrap: 'wrap', gap: '12px'}}>
                 <span>📊 検査値グラフ</span>
@@ -8680,10 +9034,14 @@ function PatientDetailView({ patient, onBack }) {
                   border: '1px solid #e2e8f0'
                 }}>
                   {(() => {
-                    // labResultsから全項目を抽出
+                    // labResultsから全項目を抽出（採取日を除外）
                     const allItems = new Set();
                     labResults.forEach(lab => {
-                      lab.data?.forEach(item => allItems.add(item.item));
+                      lab.data?.forEach(item => {
+                        if (!item.item?.match(/^採取日?$/)) {
+                          allItems.add(item.item);
+                        }
+                      });
                     });
                     return Array.from(allItems).sort().map(item => {
                       const isSelected = selectedLabItemsForChart.includes(item);
@@ -8979,6 +9337,32 @@ function PatientDetailView({ patient, onBack }) {
                         </label>
                       </div>
                     )}
+                  </div>
+                  {/* ラベル表記・カラー設定 */}
+                  <div style={{display: 'flex', flexWrap: 'wrap', gap: '20px', alignItems: 'center', marginTop: '12px', paddingTop: '12px', borderTop: '1px solid #bae6fd'}}>
+                    <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                      <span style={{fontSize: '13px', fontWeight: '500', color: '#0369a1'}}>ラベル表記:</span>
+                      <select
+                        value={chartLabelStyle}
+                        onChange={(e) => setChartLabelStyle(e.target.value)}
+                        style={{padding: '4px 8px', borderRadius: '4px', border: '1px solid #d1d5db', fontSize: '13px'}}
+                      >
+                        <option value="japanese">日本語</option>
+                        <option value="english">英語</option>
+                        <option value="abbreviation">略語</option>
+                      </select>
+                    </div>
+                    <div style={{display: 'flex', alignItems: 'center', gap: '8px'}}>
+                      <span style={{fontSize: '13px', fontWeight: '500', color: '#0369a1'}}>カラー:</span>
+                      <select
+                        value={chartColorStyle}
+                        onChange={(e) => setChartColorStyle(e.target.value)}
+                        style={{padding: '4px 8px', borderRadius: '4px', border: '1px solid #d1d5db', fontSize: '13px'}}
+                      >
+                        <option value="color">カラー</option>
+                        <option value="monochrome">白黒</option>
+                      </select>
+                    </div>
                   </div>
                 </div>
               )}
@@ -9477,11 +9861,16 @@ function PatientDetailView({ patient, onBack }) {
                                 Object.values(groups).forEach(g => g.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate)));
 
                                 return Object.values(groups).map((group, gIdx) => {
-                                  const color = categoryColors[group.category] || '#6b7280';
+                                  // 白黒モードの場合はグレースケールを使用
+                                  const color = chartColorStyle === 'monochrome'
+                                    ? (monochromeColors[group.category] || '#6b7280')
+                                    : (categoryColors[group.category] || '#6b7280');
                                   const maxBarHeight = 40;
                                   const maxDosage = Math.max(...group.entries.map(e => parseFloat(e.dosage) || 0), 1);
                                   // 短縮名を取得（括弧内を除去）
                                   const shortName = group.name.replace(/（.*）/g, '').replace(/\(.*\)/g, '');
+                                  // ラベル変換を適用
+                                  const displayName = translateLabel(shortName);
                                   const unitText = group.unit ? `[${group.unit.replace('/日', '')}]` : '';
 
                                   return (
@@ -9496,7 +9885,7 @@ function PatientDetailView({ patient, onBack }) {
                                         fontWeight: '500',
                                         paddingBottom: '4px'
                                       }} title={group.name}>
-                                        {shortName}{unitText}
+                                        {displayName}{unitText}
                                       </div>
                                       <div style={{
                                         flex: 1,
@@ -9596,7 +9985,11 @@ function PatientDetailView({ patient, onBack }) {
                                 Object.values(groups).forEach(g => g.entries.sort((a, b) => new Date(a.startDate) - new Date(b.startDate)));
 
                                 return Object.values(groups).map((group, gIdx) => {
-                                  const barStyle = eventBarColors[group.type] || { bg: '#F8F9FA', border: '#ADB5BD' };
+                                  const defaultBarStyle = eventBarColors[group.type] || { bg: '#F8F9FA', border: '#ADB5BD' };
+                                  // 白黒モードの場合はグレースケールを使用
+                                  const barStyle = chartColorStyle === 'monochrome'
+                                    ? { bg: monochromeEventColors[group.type] || '#6b7280', border: '#374151' }
+                                    : defaultBarStyle;
 
                                   // 頻度ベースのイベントかどうか判定
                                   const isFrequencyBased = group.entries.some(e => e.frequency);
@@ -9622,7 +10015,7 @@ function PatientDetailView({ patient, onBack }) {
                                         fontWeight: '500',
                                         paddingBottom: hasLevels ? '4px' : '0'
                                       }}>
-                                        {group.type}
+                                        {translateLabel(group.type)}
                                       </div>
                                       <div style={{
                                         flex: 1,
@@ -10319,10 +10712,18 @@ function PatientDetailView({ patient, onBack }) {
         </section>
 
         {/* 検査データセクション */}
-        <section style={styles.section}>
-          <div style={styles.sectionHeader}>
-            <h2 style={styles.sectionTitle}>検査データ</h2>
-            <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap'}}>
+        <section style={{...styles.section, flex: '1 1 400px', minWidth: '400px', order: 4}}>
+          <h2 style={{
+            fontSize: '16px',
+            fontWeight: '700',
+            color: '#1f2937',
+            margin: '0 0 12px 0',
+            padding: '0 0 8px 0',
+            borderBottom: '2px solid #3b82f6'
+          }}>
+            🔬 検査データ
+          </h2>
+          <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '16px'}}>
               <button onClick={() => setShowAddLabModal(true)} style={styles.addLabButton}>
                 <span>📷</span> 写真から追加
               </button>
@@ -10337,7 +10738,6 @@ function PatientDetailView({ patient, onBack }) {
                   <span>🗑️</span> 全削除
                 </button>
               )}
-            </div>
           </div>
 
           {labResults.length === 0 ? (
@@ -10354,7 +10754,7 @@ function PatientDetailView({ patient, onBack }) {
                   <div style={styles.labCardHeader}>
                     <span style={styles.labDate}>{lab.date}</span>
                     <div style={{display: 'flex', alignItems: 'center', gap: '12px'}}>
-                      <span style={styles.labItemCount}>{lab.data?.length || 0} 項目</span>
+                      <span style={styles.labItemCount}>{lab.data?.filter(item => !item.item?.match(/^採取日?$/)).length || 0} 項目</span>
                       <button
                         onClick={() => {
                           if (editingLabId === lab.id) {
@@ -10377,7 +10777,7 @@ function PatientDetailView({ patient, onBack }) {
                     </div>
                   </div>
                   <div style={styles.labDataGrid}>
-                    {lab.data?.map((item, idx) => (
+                    {lab.data?.filter(item => !item.item?.match(/^採取日?$/)).map((item, idx) => (
                       <div key={idx} style={{...styles.labDataItem, position: 'relative'}}>
                         <span style={styles.labItemName}>{item.item}</span>
                         <span style={styles.labItemValue}>
@@ -10472,6 +10872,7 @@ function PatientDetailView({ patient, onBack }) {
             </div>
           )}
         </section>
+        </div>{/* セクションコンテナ閉じ */}
       </main>
 
       {/* 臨床経過イベント追加モーダル */}
