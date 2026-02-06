@@ -1758,6 +1758,77 @@ function PatientsListView({ onSelectPatient }) {
   const [correlationRawData, setCorrelationRawData] = useState(null); // Rスクリプト用生データ
   const correlationChartRef = useRef(null);
 
+  // ============================================================
+  // 学術誌向けグラフスタイル設定
+  // ============================================================
+  const [chartColorPalette, setChartColorPalette] = useState('default'); // カラーパレット
+  const [chartFontFamily, setChartFontFamily] = useState('arial'); // フォント
+  const [chartExportDpi, setChartExportDpi] = useState(300); // 出力解像度
+
+  // 学術誌向けカラーパレット定義（ggsci準拠）
+  const journalColorPalettes = {
+    default: {
+      name: 'デフォルト',
+      colors: ['#3b82f6', '#ef4444', '#22c55e', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'],
+      description: '標準カラー'
+    },
+    nature: {
+      name: 'Nature風',
+      colors: ['#E64B35', '#4DBBD5', '#00A087', '#3C5488', '#F39B7F', '#8491B4', '#91D1C2', '#DC0000'],
+      description: 'Nature Publishing Group'
+    },
+    nejm: {
+      name: 'NEJM風',
+      colors: ['#BC3C29', '#0072B5', '#E18727', '#20854E', '#7876B1', '#6F99AD', '#FFDC91', '#EE4C97'],
+      description: 'New England Journal of Medicine'
+    },
+    lancet: {
+      name: 'Lancet風',
+      colors: ['#00468B', '#ED0000', '#42B540', '#0099B4', '#925E9F', '#FDAF91', '#AD002A', '#ADB6B6'],
+      description: 'The Lancet'
+    },
+    jama: {
+      name: 'JAMA風',
+      colors: ['#374E55', '#DF8F44', '#00A1D5', '#B24745', '#79AF97', '#6A6599', '#80796B', '#0073C2'],
+      description: 'Journal of the American Medical Association'
+    },
+    jco: {
+      name: 'JCO風',
+      colors: ['#0073C2', '#EFC000', '#868686', '#CD534C', '#7AA6DC', '#003C67', '#8F7700', '#3B3B3B'],
+      description: 'Journal of Clinical Oncology'
+    },
+    colorblind: {
+      name: '色覚対応',
+      colors: ['#0077BB', '#33BBEE', '#009988', '#EE7733', '#CC3311', '#EE3377', '#BBBBBB', '#000000'],
+      description: 'Colorblind-safe (Tol palette)'
+    },
+    grayscale: {
+      name: 'グレースケール',
+      colors: ['#000000', '#4d4d4d', '#7f7f7f', '#a6a6a6', '#c9c9c9', '#333333', '#666666', '#999999'],
+      description: '白黒印刷用'
+    }
+  };
+
+  // フォント設定
+  const chartFontOptions = {
+    arial: { name: 'Arial', css: 'Arial, Helvetica, sans-serif', description: 'Nature推奨' },
+    helvetica: { name: 'Helvetica', css: 'Helvetica, Arial, sans-serif', description: 'Nature推奨' },
+    times: { name: 'Times New Roman', css: '"Times New Roman", Times, serif', description: '伝統的' }
+  };
+
+  // 解像度設定
+  const chartDpiOptions = [
+    { value: 150, label: '150 DPI', description: 'プレビュー用' },
+    { value: 300, label: '300 DPI', description: '投稿用（標準）' },
+    { value: 600, label: '600 DPI', description: '高品質印刷用' }
+  ];
+
+  // 現在のパレットの色を取得するヘルパー関数
+  const getPaletteColor = (index) => {
+    const palette = journalColorPalettes[chartColorPalette] || journalColorPalettes.default;
+    return palette.colors[index % palette.colors.length];
+  };
+
   // 患者一括インポート用state
   const [showBulkImportModal, setShowBulkImportModal] = useState(false);
   const [bulkImportData, setBulkImportData] = useState([]);
@@ -3148,11 +3219,12 @@ function PatientsListView({ onSelectPatient }) {
     setIsCalculatingRoc(false);
   };
 
-  // ROC曲線のカラーパレット
-  const rocColors = [
-    '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6',
-    '#ec4899', '#06b6d4', '#84cc16', '#f97316', '#6366f1'
-  ];
+  // ROC曲線のカラーパレット（学術誌スタイル設定に連動）
+  const getRocColors = () => {
+    const palette = journalColorPalettes[chartColorPalette] || journalColorPalettes.default;
+    return palette.colors;
+  };
+  const rocColors = getRocColors();
 
   // ===== ROC曲線解析関数 ここまで =====
 
@@ -6459,6 +6531,106 @@ cat("\\n解析完了！\\n")
                                   ))}
                                 </div>
 
+                                {/* 学術誌スタイル設定 */}
+                                <div style={{
+                                  padding: '12px',
+                                  background: '#f0fdf4',
+                                  borderRadius: '8px',
+                                  border: '1px solid #bbf7d0',
+                                  marginBottom: '16px'
+                                }}>
+                                  <h5 style={{margin: '0 0 10px 0', fontSize: '13px', color: '#166534'}}>
+                                    📊 学術誌スタイル設定
+                                  </h5>
+
+                                  {/* カラーパレット */}
+                                  <div style={{display: 'flex', gap: '8px', marginBottom: '10px', flexWrap: 'wrap', alignItems: 'center'}}>
+                                    <label style={{fontSize: '12px', color: '#374151', minWidth: '80px'}}>カラー:</label>
+                                    <select
+                                      value={chartColorPalette}
+                                      onChange={(e) => setChartColorPalette(e.target.value)}
+                                      style={{
+                                        padding: '4px 8px',
+                                        fontSize: '12px',
+                                        borderRadius: '4px',
+                                        border: '1px solid #d1d5db',
+                                        background: 'white',
+                                        cursor: 'pointer'
+                                      }}
+                                    >
+                                      {Object.entries(journalColorPalettes).map(([key, palette]) => (
+                                        <option key={key} value={key}>
+                                          {palette.name} - {palette.description}
+                                        </option>
+                                      ))}
+                                    </select>
+                                    {/* カラープレビュー */}
+                                    <div style={{display: 'flex', gap: '2px'}}>
+                                      {journalColorPalettes[chartColorPalette]?.colors.slice(0, 4).map((color, i) => (
+                                        <div key={i} style={{
+                                          width: '16px',
+                                          height: '16px',
+                                          backgroundColor: color,
+                                          borderRadius: '2px',
+                                          border: '1px solid #e5e7eb'
+                                        }}/>
+                                      ))}
+                                    </div>
+                                  </div>
+
+                                  {/* フォント */}
+                                  <div style={{display: 'flex', gap: '8px', marginBottom: '10px', flexWrap: 'wrap', alignItems: 'center'}}>
+                                    <label style={{fontSize: '12px', color: '#374151', minWidth: '80px'}}>フォント:</label>
+                                    <select
+                                      value={chartFontFamily}
+                                      onChange={(e) => setChartFontFamily(e.target.value)}
+                                      style={{
+                                        padding: '4px 8px',
+                                        fontSize: '12px',
+                                        borderRadius: '4px',
+                                        border: '1px solid #d1d5db',
+                                        background: 'white',
+                                        cursor: 'pointer'
+                                      }}
+                                    >
+                                      {Object.entries(chartFontOptions).map(([key, font]) => (
+                                        <option key={key} value={key}>
+                                          {font.name} ({font.description})
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </div>
+
+                                  {/* 出力解像度 */}
+                                  <div style={{display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center'}}>
+                                    <label style={{fontSize: '12px', color: '#374151', minWidth: '80px'}}>解像度:</label>
+                                    {chartDpiOptions.map(opt => (
+                                      <label key={opt.value} style={{
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        gap: '4px',
+                                        padding: '4px 8px',
+                                        background: chartExportDpi === opt.value ? '#166534' : 'white',
+                                        color: chartExportDpi === opt.value ? 'white' : '#374151',
+                                        borderRadius: '4px',
+                                        cursor: 'pointer',
+                                        border: '1px solid #d1d5db',
+                                        fontSize: '11px'
+                                      }}>
+                                        <input
+                                          type="radio"
+                                          name="chartDpi"
+                                          value={opt.value}
+                                          checked={chartExportDpi === opt.value}
+                                          onChange={() => setChartExportDpi(opt.value)}
+                                          style={{display: 'none'}}
+                                        />
+                                        {opt.label}
+                                      </label>
+                                    ))}
+                                  </div>
+                                </div>
+
                                 <div style={{marginBottom: '16px'}}>
                                   <label style={{fontSize: '13px', color: '#374151', display: 'block', marginBottom: '6px'}}>
                                     表示する項目（複数選択可）:
@@ -6571,11 +6743,16 @@ cat("\\n解析完了！\\n")
                                     yTicks.push(yMin + tickStep * i);
                                   }
 
-                                  let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" style="font-family: Arial, sans-serif;">`;
+                                  // 学術誌スタイル設定を適用
+                                  const currentFont = chartFontOptions[chartFontFamily]?.css || 'Arial, sans-serif';
+                                  const color1 = getPaletteColor(0);
+                                  const color2 = getPaletteColor(1);
+
+                                  let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" style="font-family: ${currentFont};">`;
                                   svgContent += `<rect width="100%" height="100%" fill="white"/>`;
 
-                                  // タイトル
-                                    svgContent += `<text x="${svgWidth/2}" y="20" text-anchor="middle" font-size="14" font-weight="bold">${itemName}</text>`;
+                                  // タイトル（8pt bold - Nature style）
+                                  svgContent += `<text x="${svgWidth/2}" y="20" text-anchor="middle" font-size="14" font-weight="bold">${itemName}</text>`;
 
                                   // 有意差表示
                                   if (pValue < 0.05) {
@@ -6736,8 +6913,8 @@ cat("\\n解析完了！\\n")
                                     }
                                   };
 
-                                  drawBox(stats1, x1, '#3b82f6');
-                                  drawBox(stats2, x2, '#ef4444');
+                                  drawBox(stats1, x1, color1);
+                                  drawBox(stats2, x2, color2);
 
                                   // 統計情報
                                   const testName = bothNormal ? 't-test' : 'Mann-Whitney U';
@@ -6858,11 +7035,13 @@ cat("\\n解析完了！\\n")
                                             });
                                             combinedSvg += '</svg>';
 
+                                            // DPI設定に基づくスケール計算
+                                            const scale = chartExportDpi / 96; // 96 = 標準スクリーンDPI
                                             const canvas = document.createElement('canvas');
-                                            canvas.width = totalWidth * 2;
-                                            canvas.height = totalHeight * 2;
+                                            canvas.width = totalWidth * scale;
+                                            canvas.height = totalHeight * scale;
                                             const ctx = canvas.getContext('2d');
-                                            ctx.scale(2, 2);
+                                            ctx.scale(scale, scale);
                                             const img = new Image();
                                             img.onload = () => {
                                               ctx.fillStyle = 'white';
@@ -6871,14 +7050,14 @@ cat("\\n解析完了！\\n")
                                               const pngUrl = canvas.toDataURL('image/png');
                                               const a = document.createElement('a');
                                               a.href = pngUrl;
-                                              a.download = `統計グラフ_${statChartType}_${chartDataList.length}項目.png`;
+                                              a.download = `統計グラフ_${statChartType}_${chartDataList.length}項目_${chartExportDpi}dpi.png`;
                                               a.click();
                                             };
                                             img.src = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(combinedSvg);
                                           }}
                                           style={{...styles.addButton, backgroundColor: '#0ea5e9', padding: '10px 20px', fontSize: '13px'}}
                                         >
-                                          📷 全グラフPNG保存
+                                          📷 PNG保存 ({chartExportDpi}dpi)
                                         </button>
                                         <button
                                           onClick={() => {
@@ -7173,7 +7352,10 @@ cat("\\n解析完了！\\n")
                                   const chartWidth = svgWidth - margin.left - margin.right;
                                   const chartHeight = svgHeight - margin.top - margin.bottom;
 
-                                  let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" style="font-family: Arial, sans-serif;">`;
+                                  // 学術誌スタイル設定を適用
+                                  const currentFont = chartFontOptions[chartFontFamily]?.css || 'Arial, sans-serif';
+
+                                  let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" style="font-family: ${currentFont};">`;
                                   svgContent += `<rect width="100%" height="100%" fill="white"/>`;
 
                                   // タイトル
@@ -7278,11 +7460,13 @@ cat("\\n解析完了！\\n")
                                         </button>
                                         <button
                                           onClick={() => {
+                                            // DPI設定に基づくスケール計算
+                                            const scale = chartExportDpi / 96;
                                             const canvas = document.createElement('canvas');
-                                            canvas.width = svgWidth * 2;
-                                            canvas.height = svgHeight * 2;
+                                            canvas.width = svgWidth * scale;
+                                            canvas.height = svgHeight * scale;
                                             const ctx = canvas.getContext('2d');
-                                            ctx.scale(2, 2);
+                                            ctx.scale(scale, scale);
                                             const img = new Image();
                                             const svgBlob = new Blob([svgContent], {type: 'image/svg+xml;charset=utf-8'});
                                             const svgUrl = URL.createObjectURL(svgBlob);
@@ -7294,14 +7478,14 @@ cat("\\n解析完了！\\n")
                                               const pngUrl = canvas.toDataURL('image/png');
                                               const a = document.createElement('a');
                                               a.href = pngUrl;
-                                              a.download = `ROC曲線_${rocResults.length}マーカー.png`;
+                                              a.download = `ROC曲線_${rocResults.length}マーカー_${chartExportDpi}dpi.png`;
                                               a.click();
                                             };
                                             img.src = svgUrl;
                                           }}
                                           style={{...styles.addButton, backgroundColor: '#059669', padding: '8px 16px', fontSize: '12px'}}
                                         >
-                                          📷 PNG保存
+                                          📷 PNG ({chartExportDpi}dpi)
                                         </button>
                                         <button
                                           onClick={() => {
@@ -7574,7 +7758,10 @@ cat("\\n解析完了！\\n")
                               const svgWidth = margin.left + n * cellSize + margin.right;
                               const svgHeight = margin.top + n * cellSize + margin.bottom;
 
-                              let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" style="font-family: Arial, sans-serif;">`;
+                              // 学術誌スタイル設定を適用
+                              const currentFont = chartFontOptions[chartFontFamily]?.css || 'Arial, sans-serif';
+
+                              let svgContent = `<svg xmlns="http://www.w3.org/2000/svg" width="${svgWidth}" height="${svgHeight}" style="font-family: ${currentFont};">`;
                               svgContent += `<rect width="100%" height="100%" fill="white"/>`;
 
                               // タイトル
@@ -7668,11 +7855,13 @@ cat("\\n解析完了！\\n")
                                     </button>
                                     <button
                                       onClick={() => {
+                                        // DPI設定に基づくスケール計算
+                                        const scale = chartExportDpi / 96;
                                         const canvas = document.createElement('canvas');
-                                        canvas.width = svgWidth * 2;
-                                        canvas.height = svgHeight * 2;
+                                        canvas.width = svgWidth * scale;
+                                        canvas.height = svgHeight * scale;
                                         const ctx = canvas.getContext('2d');
-                                        ctx.scale(2, 2);
+                                        ctx.scale(scale, scale);
                                         const img = new Image();
                                         const svgBlob = new Blob([svgContent], {type: 'image/svg+xml;charset=utf-8'});
                                         const svgUrl = URL.createObjectURL(svgBlob);
@@ -7684,14 +7873,14 @@ cat("\\n解析完了！\\n")
                                           const pngUrl = canvas.toDataURL('image/png');
                                           const a = document.createElement('a');
                                           a.href = pngUrl;
-                                          a.download = `相関ヒートマップ_${correlationResults.type}_${n}項目.png`;
+                                          a.download = `相関ヒートマップ_${correlationResults.type}_${n}項目_${chartExportDpi}dpi.png`;
                                           a.click();
                                         };
                                         img.src = svgUrl;
                                       }}
                                       style={{...styles.addButton, backgroundColor: '#059669', padding: '8px 16px', fontSize: '12px'}}
                                     >
-                                      📷 PNG保存
+                                      📷 PNG ({chartExportDpi}dpi)
                                     </button>
                                     <button
                                       onClick={() => {
