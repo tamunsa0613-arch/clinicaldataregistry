@@ -1375,6 +1375,7 @@ function LoginView() {
   const [isRegistering, setIsRegistering] = useState(false);
   const [showPasswordReset, setShowPasswordReset] = useState(false);
   const [selectedInstitution, setSelectedInstitution] = useState('');
+  const [agreedToTerms, setAgreedToTerms] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
   const [loading, setLoading] = useState(false);
@@ -1421,6 +1422,10 @@ function LoginView() {
       setError('所属施設を選択してください');
       return;
     }
+    if (isRegistering && !agreedToTerms) {
+      setError('利用規約とプライバシーポリシーに同意してください');
+      return;
+    }
 
     setLoading(true);
     setError('');
@@ -1436,7 +1441,9 @@ function LoginView() {
           institution: selectedInstitution,
           institutionName: FREE_INSTITUTIONS.find(i => i.id === selectedInstitution)?.name || 'その他',
           createdAt: serverTimestamp(),
-          tier: selectedInstitution !== 'other' ? 'free' : 'external'
+          tier: selectedInstitution !== 'other' ? 'free' : 'external',
+          agreedToTermsAt: serverTimestamp(),
+          agreedToTermsVersion: '2026-02-06'
         });
 
         // 無料施設の場合、組織メンバーとして自動登録
@@ -1582,6 +1589,36 @@ function LoginView() {
                 )}
               </div>
             )}
+            {isRegistering && (
+              <div style={{marginTop: '16px'}}>
+                <label style={{
+                  display: 'flex',
+                  alignItems: 'flex-start',
+                  gap: '10px',
+                  cursor: 'pointer',
+                  fontSize: '13px',
+                  color: '#374151'
+                }}>
+                  <input
+                    type="checkbox"
+                    checked={agreedToTerms}
+                    onChange={(e) => setAgreedToTerms(e.target.checked)}
+                    style={{
+                      marginTop: '3px',
+                      width: '18px',
+                      height: '18px',
+                      cursor: 'pointer'
+                    }}
+                  />
+                  <span>
+                    <a href="/terms.html" target="_blank" rel="noopener noreferrer" style={{color: '#2563eb', textDecoration: 'underline'}}>利用規約</a>
+                    {' '}と{' '}
+                    <a href="/privacy.html" target="_blank" rel="noopener noreferrer" style={{color: '#2563eb', textDecoration: 'underline'}}>プライバシーポリシー</a>
+                    {' '}に同意する
+                  </span>
+                </label>
+              </div>
+            )}
             {error && <p style={styles.errorText}>{error}</p>}
             <button
               type="submit"
@@ -1614,9 +1651,17 @@ function LoginView() {
 
         <div style={styles.authFooter}>
           <p style={styles.footerText}>
-            🔒 データは暗号化されて保存されます<br/>
+            データは暗号化されて保存されます<br/>
             患者の個人情報（氏名等）は保存されません
           </p>
+          <div style={{marginTop: '12px', fontSize: '12px'}}>
+            <a href="/terms.html" target="_blank" rel="noopener noreferrer" style={{color: '#6b7280', textDecoration: 'none', marginRight: '12px'}}>
+              利用規約
+            </a>
+            <a href="/privacy.html" target="_blank" rel="noopener noreferrer" style={{color: '#6b7280', textDecoration: 'none'}}>
+              プライバシーポリシー
+            </a>
+          </div>
         </div>
       </div>
     </div>
@@ -8385,6 +8430,26 @@ cat("\\n解析完了！\\n")
           </div>
         </div>
       )}
+
+      {/* フッター */}
+      <footer style={{
+        marginTop: '40px',
+        paddingTop: '20px',
+        borderTop: '1px solid #e5e7eb',
+        textAlign: 'center',
+        fontSize: '13px',
+        color: '#6b7280'
+      }}>
+        <a href="/terms.html" target="_blank" rel="noopener noreferrer" style={{color: '#2563eb', textDecoration: 'none', marginRight: '16px'}}>
+          利用規約
+        </a>
+        <a href="/privacy.html" target="_blank" rel="noopener noreferrer" style={{color: '#2563eb', textDecoration: 'none', marginRight: '16px'}}>
+          プライバシーポリシー
+        </a>
+        <a href="/manual.html" target="_blank" rel="noopener noreferrer" style={{color: '#2563eb', textDecoration: 'none'}}>
+          操作マニュアル
+        </a>
+      </footer>
     </div>
   );
 }
@@ -14263,6 +14328,26 @@ function PatientDetailView({ patient, onBack }) {
           </div>
         </div>
       )}
+
+      {/* フッター */}
+      <footer style={{
+        marginTop: '40px',
+        paddingTop: '20px',
+        borderTop: '1px solid #e5e7eb',
+        textAlign: 'center',
+        fontSize: '13px',
+        color: '#6b7280'
+      }}>
+        <a href="/terms.html" target="_blank" rel="noopener noreferrer" style={{color: '#2563eb', textDecoration: 'none', marginRight: '16px'}}>
+          利用規約
+        </a>
+        <a href="/privacy.html" target="_blank" rel="noopener noreferrer" style={{color: '#2563eb', textDecoration: 'none', marginRight: '16px'}}>
+          プライバシーポリシー
+        </a>
+        <a href="/manual.html" target="_blank" rel="noopener noreferrer" style={{color: '#2563eb', textDecoration: 'none'}}>
+          操作マニュアル
+        </a>
+      </footer>
     </div>
   );
 }
