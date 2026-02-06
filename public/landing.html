@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Clinical Data Registry - 臨床研究データ管理システム</title>
+    <meta name="description" content="匿名設計・統計解析・Rスクリプト出力を備えた臨床研究データ管理システム。医局・研究チーム向け無料プランあり。">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Noto Sans JP', -apple-system, BlinkMacSystemFont, sans-serif;
+            line-height: 1.7;
+            color: #1f2937;
+            background: #fff;
+        }
+
+        /* ========== Header ========== */
+        header {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            background: rgba(255,255,255,0.95);
+            backdrop-filter: blur(10px);
+            z-index: 1000;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .header-inner {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 15px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .logo {
+            font-size: 1.3em;
+            font-weight: 700;
+            color: #1e40af;
+            text-decoration: none;
+        }
+        .logo span {
+            color: #3b82f6;
+        }
+        nav a {
+            margin-left: 30px;
+            text-decoration: none;
+            color: #4b5563;
+            font-weight: 500;
+            transition: color 0.2s;
+        }
+        nav a:hover {
+            color: #1e40af;
+        }
+        .btn-header {
+            margin-left: 30px;
+            padding: 10px 24px;
+            background: #3b82f6;
+            color: white;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+        .btn-header:hover {
+            background: #2563eb;
+        }
+
+        /* ========== Hero ========== */
+        .hero {
+            padding: 140px 20px 80px;
+            background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 50%, #c7d2fe 100%);
+            text-align: center;
+        }
+        .hero-badge {
+            display: inline-block;
+            background: #22c55e;
+            color: white;
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 500;
+            margin-bottom: 20px;
+        }
+        .hero h1 {
+            font-size: 2.8em;
+            font-weight: 700;
+            color: #1e3a8a;
+            margin-bottom: 20px;
+            line-height: 1.3;
+        }
+        .hero h1 span {
+            color: #3b82f6;
+        }
+        .hero p {
+            font-size: 1.2em;
+            color: #4b5563;
+            max-width: 700px;
+            margin: 0 auto 40px;
+        }
+        .hero-buttons {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .btn-primary {
+            padding: 16px 40px;
+            background: #3b82f6;
+            color: white;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1.1em;
+            transition: all 0.2s;
+            box-shadow: 0 4px 14px rgba(59, 130, 246, 0.4);
+        }
+        .btn-primary:hover {
+            background: #2563eb;
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(59, 130, 246, 0.5);
+        }
+        .btn-secondary {
+            padding: 16px 40px;
+            background: white;
+            color: #1e40af;
+            border: 2px solid #3b82f6;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1.1em;
+            transition: all 0.2s;
+        }
+        .btn-secondary:hover {
+            background: #eff6ff;
+        }
+        .hero-image {
+            max-width: 1000px;
+            margin: 60px auto 0;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.15);
+            overflow: hidden;
+        }
+        .hero-image img {
+            width: 100%;
+            display: block;
+        }
+        .hero-screenshot {
+            background: #f3f4f6;
+            padding: 40px;
+            border-radius: 16px;
+            text-align: center;
+            color: #6b7280;
+        }
+
+        /* ========== Problems ========== */
+        .problems {
+            padding: 80px 20px;
+            background: #f9fafb;
+        }
+        .section-inner {
+            max-width: 1100px;
+            margin: 0 auto;
+        }
+        .section-title {
+            text-align: center;
+            font-size: 2em;
+            font-weight: 700;
+            color: #1e3a8a;
+            margin-bottom: 50px;
+        }
+        .problems-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+        }
+        .problem-card {
+            background: white;
+            padding: 30px;
+            border-radius: 12px;
+            border-left: 4px solid #ef4444;
+        }
+        .problem-card h3 {
+            color: #dc2626;
+            font-size: 1.1em;
+            margin-bottom: 10px;
+        }
+        .problem-card p {
+            color: #6b7280;
+        }
+
+        /* ========== Features ========== */
+        .features {
+            padding: 100px 20px;
+        }
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 40px;
+        }
+        .feature-card {
+            text-align: center;
+            padding: 40px 30px;
+            border-radius: 16px;
+            background: #f8fafc;
+            transition: all 0.3s;
+        }
+        .feature-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+        }
+        .feature-icon {
+            width: 80px;
+            height: 80px;
+            margin: 0 auto 20px;
+            background: linear-gradient(135deg, #3b82f6, #8b5cf6);
+            border-radius: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 2em;
+        }
+        .feature-card h3 {
+            font-size: 1.3em;
+            color: #1e3a8a;
+            margin-bottom: 15px;
+        }
+        .feature-card p {
+            color: #6b7280;
+            font-size: 0.95em;
+        }
+        .feature-tag {
+            display: inline-block;
+            background: #dbeafe;
+            color: #1e40af;
+            padding: 4px 12px;
+            border-radius: 6px;
+            font-size: 0.8em;
+            font-weight: 500;
+            margin-top: 15px;
+        }
+
+        /* ========== Comparison ========== */
+        .comparison {
+            padding: 100px 20px;
+            background: linear-gradient(180deg, #f8fafc 0%, #fff 100%);
+        }
+        .comparison-table {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.08);
+        }
+        .comparison-table table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .comparison-table th,
+        .comparison-table td {
+            padding: 20px;
+            text-align: center;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .comparison-table th {
+            background: #1e3a8a;
+            color: white;
+            font-weight: 600;
+        }
+        .comparison-table th:first-child {
+            text-align: left;
+        }
+        .comparison-table td:first-child {
+            text-align: left;
+            font-weight: 500;
+        }
+        .comparison-table tr:last-child td {
+            border-bottom: none;
+        }
+        .comparison-table .highlight {
+            background: #eff6ff;
+        }
+        .check {
+            color: #22c55e;
+            font-size: 1.3em;
+        }
+        .cross {
+            color: #d1d5db;
+            font-size: 1.3em;
+        }
+        .ours {
+            background: #3b82f6 !important;
+        }
+
+        /* ========== Security ========== */
+        .security {
+            padding: 100px 20px;
+            background: #1e3a8a;
+            color: white;
+        }
+        .security .section-title {
+            color: white;
+        }
+        .security-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 30px;
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        .security-item {
+            text-align: center;
+            padding: 30px;
+        }
+        .security-item .icon {
+            font-size: 2.5em;
+            margin-bottom: 15px;
+        }
+        .security-item h3 {
+            font-size: 1.1em;
+            margin-bottom: 10px;
+        }
+        .security-item p {
+            color: #93c5fd;
+            font-size: 0.9em;
+        }
+
+        /* ========== Pricing ========== */
+        .pricing {
+            padding: 100px 20px;
+        }
+        .pricing-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 30px;
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .pricing-card {
+            background: white;
+            border-radius: 16px;
+            padding: 40px;
+            border: 2px solid #e5e7eb;
+            text-align: center;
+            transition: all 0.3s;
+        }
+        .pricing-card.popular {
+            border-color: #3b82f6;
+            transform: scale(1.02);
+            box-shadow: 0 10px 40px rgba(59, 130, 246, 0.2);
+        }
+        .pricing-card h3 {
+            font-size: 1.5em;
+            color: #1e3a8a;
+            margin-bottom: 10px;
+        }
+        .pricing-card .price {
+            font-size: 3em;
+            font-weight: 700;
+            color: #1e40af;
+            margin: 20px 0;
+        }
+        .pricing-card .price span {
+            font-size: 0.4em;
+            color: #6b7280;
+            font-weight: 400;
+        }
+        .pricing-card ul {
+            list-style: none;
+            text-align: left;
+            margin: 30px 0;
+        }
+        .pricing-card li {
+            padding: 10px 0;
+            border-bottom: 1px solid #f3f4f6;
+            color: #4b5563;
+        }
+        .pricing-card li::before {
+            content: "✓";
+            color: #22c55e;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        .pricing-card .btn-primary {
+            display: block;
+            width: 100%;
+        }
+        .popular-badge {
+            background: #3b82f6;
+            color: white;
+            padding: 6px 16px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: 500;
+            margin-bottom: 20px;
+            display: inline-block;
+        }
+
+        /* ========== CTA ========== */
+        .cta {
+            padding: 100px 20px;
+            background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
+            text-align: center;
+            color: white;
+        }
+        .cta h2 {
+            font-size: 2.2em;
+            margin-bottom: 20px;
+        }
+        .cta p {
+            font-size: 1.2em;
+            opacity: 0.9;
+            margin-bottom: 40px;
+        }
+        .cta .btn-primary {
+            background: white;
+            color: #3b82f6;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.2);
+        }
+        .cta .btn-primary:hover {
+            background: #f8fafc;
+        }
+
+        /* ========== Footer ========== */
+        footer {
+            background: #1f2937;
+            color: #9ca3af;
+            padding: 60px 20px 30px;
+        }
+        .footer-inner {
+            max-width: 1100px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 40px;
+        }
+        .footer-col h4 {
+            color: white;
+            margin-bottom: 20px;
+            font-size: 1em;
+        }
+        .footer-col a {
+            display: block;
+            color: #9ca3af;
+            text-decoration: none;
+            padding: 8px 0;
+            transition: color 0.2s;
+        }
+        .footer-col a:hover {
+            color: white;
+        }
+        .footer-bottom {
+            max-width: 1100px;
+            margin: 40px auto 0;
+            padding-top: 30px;
+            border-top: 1px solid #374151;
+            text-align: center;
+            font-size: 0.9em;
+        }
+
+        /* ========== Responsive ========== */
+        @media (max-width: 768px) {
+            .header-inner nav {
+                display: none;
+            }
+            .hero h1 {
+                font-size: 2em;
+            }
+            .hero p {
+                font-size: 1em;
+            }
+            .section-title {
+                font-size: 1.6em;
+            }
+            .pricing-card.popular {
+                transform: none;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <header>
+        <div class="header-inner">
+            <a href="/" class="logo">Clinical<span>Data</span>Registry</a>
+            <nav>
+                <a href="#features">機能</a>
+                <a href="#comparison">比較</a>
+                <a href="#pricing">料金</a>
+                <a href="/manual.html">マニュアル</a>
+            </nav>
+            <a href="/" class="btn-header">無料で始める</a>
+        </div>
+    </header>
+
+    <!-- Hero -->
+    <section class="hero">
+        <div class="hero-badge">🎉 v1.6 ROC曲線解析・相関ヒートマップ追加</div>
+        <h1>臨床研究データ管理を<br><span>シンプル</span>に、<span>安全</span>に</h1>
+        <p>匿名ID設計・統計解析・Rスクリプト出力を備えた臨床研究データ管理システム。<br>医局・研究チームでの共同研究にも対応。</p>
+        <div class="hero-buttons">
+            <a href="/" class="btn-primary">無料で始める →</a>
+            <a href="/manual.html" class="btn-secondary">操作マニュアル</a>
+        </div>
+        <div class="hero-screenshot">
+            <p>📊 経過グラフ・Box Plot・ROC曲線・相関ヒートマップを自動生成</p>
+            <p style="margin-top: 10px; font-size: 0.9em;">スクリーンショットはアプリ内でご確認ください</p>
+        </div>
+    </section>
+
+    <!-- Problems -->
+    <section class="problems">
+        <div class="section-inner">
+            <h2 class="section-title">こんな課題はありませんか？</h2>
+            <div class="problems-grid">
+                <div class="problem-card">
+                    <h3>📋 Excelでのデータ管理が限界</h3>
+                    <p>複数ファイルに分散、バージョン管理が困難、共同編集でコンフリクト発生...</p>
+                </div>
+                <div class="problem-card">
+                    <h3>🔒 個人情報保護が不安</h3>
+                    <p>患者名が入ったファイルがメール添付で飛び交い、情報漏洩リスクが心配...</p>
+                </div>
+                <div class="problem-card">
+                    <h3>📈 統計解析のたびにR/SPSSを起動</h3>
+                    <p>データ整形→統計ソフト→グラフ作成の往復で時間を浪費...</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features -->
+    <section class="features" id="features">
+        <div class="section-inner">
+            <h2 class="section-title">主な機能</h2>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon">🔐</div>
+                    <h3>匿名ID設計</h3>
+                    <p>患者氏名フィールドなし。P-001形式の匿名IDで自動管理。個人情報漏洩リスクを設計レベルで排除。</p>
+                    <span class="feature-tag">Privacy by Design</span>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📊</div>
+                    <h3>組み込み統計解析</h3>
+                    <p>群間比較（t検定、Mann-Whitney）、ROC曲線（AUC、カットオフ）、相関解析をワンクリックで。</p>
+                    <span class="feature-tag">統計ソフト不要</span>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📜</div>
+                    <h3>Rスクリプト出力</h3>
+                    <p>生データCSVと再現可能なRスクリプトを自動生成。論文投稿時の統計手法説明にも活用可能。</p>
+                    <span class="feature-tag">再現性確保</span>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">🤖</div>
+                    <h3>AI解析（Claude連携）</h3>
+                    <p>カルテサマリー画像をアップロードすると、AIが検査値・治療薬・症状を自動抽出。</p>
+                    <span class="feature-tag">オプション</span>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">👥</div>
+                    <h3>組織・チーム管理</h3>
+                    <p>医局やプロジェクト単位でデータを完全分離。メンバー招待、役割管理も簡単。</p>
+                    <span class="feature-tag">マルチテナント</span>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon">📱</div>
+                    <h3>Webベース</h3>
+                    <p>インストール不要。ブラウザから即利用。Windows/Mac/タブレット対応。</p>
+                    <span class="feature-tag">クラウド</span>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Comparison -->
+    <section class="comparison" id="comparison">
+        <div class="section-inner">
+            <h2 class="section-title">他サービスとの比較</h2>
+            <div class="comparison-table">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>機能</th>
+                            <th class="ours">Clinical Data Registry</th>
+                            <th>Excel</th>
+                            <th>競合A</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr class="highlight">
+                            <td>医局向け無料プラン</td>
+                            <td><span class="check">✓</span></td>
+                            <td><span class="check">✓</span></td>
+                            <td><span class="cross">✗</span></td>
+                        </tr>
+                        <tr>
+                            <td>匿名ID自動生成</td>
+                            <td><span class="check">✓</span></td>
+                            <td><span class="cross">✗</span></td>
+                            <td><span class="cross">✗</span></td>
+                        </tr>
+                        <tr class="highlight">
+                            <td>組み込み統計解析</td>
+                            <td><span class="check">✓</span></td>
+                            <td><span class="cross">✗</span></td>
+                            <td>△</td>
+                        </tr>
+                        <tr>
+                            <td>ROC曲線・相関解析</td>
+                            <td><span class="check">✓</span></td>
+                            <td><span class="cross">✗</span></td>
+                            <td><span class="cross">✗</span></td>
+                        </tr>
+                        <tr class="highlight">
+                            <td>Rスクリプト出力</td>
+                            <td><span class="check">✓</span></td>
+                            <td><span class="cross">✗</span></td>
+                            <td><span class="cross">✗</span></td>
+                        </tr>
+                        <tr>
+                            <td>AI自動抽出</td>
+                            <td><span class="check">✓</span></td>
+                            <td><span class="cross">✗</span></td>
+                            <td><span class="cross">✗</span></td>
+                        </tr>
+                        <tr class="highlight">
+                            <td>チーム共有</td>
+                            <td><span class="check">✓</span></td>
+                            <td>△</td>
+                            <td><span class="check">✓</span></td>
+                        </tr>
+                        <tr>
+                            <td>国内データ保存</td>
+                            <td><span class="check">✓</span></td>
+                            <td>-</td>
+                            <td>△</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <!-- Security -->
+    <section class="security">
+        <div class="section-inner">
+            <h2 class="section-title">🔒 セキュリティ</h2>
+            <div class="security-grid">
+                <div class="security-item">
+                    <div class="icon">🇯🇵</div>
+                    <h3>国内データ保存</h3>
+                    <p>Google Cloud 東京リージョン（asia-northeast1）に保存</p>
+                </div>
+                <div class="security-item">
+                    <div class="icon">🔐</div>
+                    <h3>通信暗号化</h3>
+                    <p>TLS 1.2以上でエンドツーエンド暗号化</p>
+                </div>
+                <div class="security-item">
+                    <div class="icon">👤</div>
+                    <h3>アクセス制御</h3>
+                    <p>ユーザー/組織単位でデータを完全分離</p>
+                </div>
+                <div class="security-item">
+                    <div class="icon">📋</div>
+                    <h3>監査ログ</h3>
+                    <p>Firebase監査ログで操作履歴を記録</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Pricing -->
+    <section class="pricing" id="pricing">
+        <div class="section-inner">
+            <h2 class="section-title">料金プラン</h2>
+            <div class="pricing-grid">
+                <div class="pricing-card popular">
+                    <span class="popular-badge">おすすめ</span>
+                    <h3>Free</h3>
+                    <div class="price">¥0<span>/月</span></div>
+                    <ul>
+                        <li>患者登録 無制限</li>
+                        <li>検査データ入力・可視化</li>
+                        <li>群間統計比較</li>
+                        <li>ROC曲線・相関解析</li>
+                        <li>Rスクリプト出力</li>
+                        <li>CSV/Excelエクスポート</li>
+                        <li>組織メンバー 5名まで</li>
+                    </ul>
+                    <a href="/" class="btn-primary">無料で始める</a>
+                </div>
+                <div class="pricing-card">
+                    <h3>Pro</h3>
+                    <div class="price">お問い合わせ</div>
+                    <ul>
+                        <li>Freeプランの全機能</li>
+                        <li>組織メンバー 無制限</li>
+                        <li>AI解析（Claude連携）</li>
+                        <li>優先サポート</li>
+                        <li>カスタム機能開発</li>
+                        <li>オンプレミス対応</li>
+                    </ul>
+                    <a href="mailto:contact@example.com" class="btn-primary" style="background: #6b7280;">お問い合わせ</a>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="cta">
+        <h2>今すぐ始めましょう</h2>
+        <p>アカウント作成は30秒。クレジットカード不要。</p>
+        <a href="/" class="btn-primary">無料で始める →</a>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <div class="footer-inner">
+            <div class="footer-col">
+                <h4>Clinical Data Registry</h4>
+                <p style="font-size: 0.9em; line-height: 1.6;">臨床研究データ管理を<br>シンプルに、安全に。</p>
+            </div>
+            <div class="footer-col">
+                <h4>プロダクト</h4>
+                <a href="#features">機能</a>
+                <a href="#pricing">料金</a>
+                <a href="/manual.html">操作マニュアル</a>
+            </div>
+            <div class="footer-col">
+                <h4>サポート</h4>
+                <a href="/manual.html#trouble">トラブルシューティング</a>
+                <a href="/manual.html#research">研究利用ガイド</a>
+            </div>
+            <div class="footer-col">
+                <h4>法的情報</h4>
+                <a href="/terms.html">利用規約</a>
+                <a href="/privacy.html">プライバシーポリシー</a>
+            </div>
+        </div>
+        <div class="footer-bottom">
+            <p>© 2026 Clinical Data Registry. All rights reserved.</p>
+        </div>
+    </footer>
+</body>
+</html>
