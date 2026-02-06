@@ -41,8 +41,8 @@ service cloud.firestore {
 
     // 組織
     match /organizations/{orgId} {
-      // メンバーは読み取り可能
-      allow read: if request.auth != null;
+      // メンバーまたはシステム管理者のみ読み取り可能
+      allow read: if isMemberOfOrg(orgId) || isSystemAdmin();
       // システム管理者のみ作成可能
       allow create: if isSystemAdmin();
       // オーナー/管理者またはシステム管理者のみ更新可能
@@ -70,13 +70,19 @@ service cloud.firestore {
 
     // 組織メンバーシップ
     match /organizationMembers/{memberId} {
-      // 自分のメンバーシップは読み取り可能
+      // 自分のメンバーシップ、または組織管理者、またはシステム管理者は読み取り可能
       allow read: if request.auth != null && (
         resource.data.uid == request.auth.uid ||
-        resource.data.email == request.auth.token.email
+        resource.data.email == request.auth.token.email ||
+        isSystemAdmin() ||
+        isOrgAdminOrOwner(resource.data.orgId)
       );
-      // システム管理者または組織管理者のみ作成・更新・削除可能
-      allow create: if request.auth != null;
+      // システム管理者または組織管理者のみ作成可能
+      allow create: if isSystemAdmin() || (
+        request.auth != null &&
+        isOrgAdminOrOwner(request.resource.data.orgId)
+      );
+      // システム管理者または組織管理者のみ更新・削除可能
       allow update, delete: if isSystemAdmin() || (
         request.auth != null &&
         isOrgAdminOrOwner(resource.data.orgId)
@@ -118,16 +124,16 @@ service cloud.firestore {
     match /config/{configId} {
       // 認証済みユーザーは読み取り可能
       allow read: if request.auth != null;
-      // 書き込みは認証済みユーザーのみ（アプリ側で管理者チェック）
-      allow write: if request.auth != null;
+      // システム管理者のみ書き込み可能
+      allow write: if isSystemAdmin();
     }
 
     // メールアドレス許可リスト
     match /allowedEmails/{emailId} {
       // 認証済みユーザーは読み取り可能
       allow read: if request.auth != null;
-      // 書き込みは認証済みユーザーのみ（アプリ側で管理者チェック）
-      allow write: if request.auth != null;
+      // システム管理者のみ書き込み可能
+      allow write: if isSystemAdmin();
     }
   }
 }
