@@ -43,6 +43,17 @@ Firebase版の臨床データ管理Webアプリケーションです。神経疾
 | **PNG出力** | グラフ画像をダウンロード |
 | **Excel出力** | データ編集用にエクスポート |
 
+### 統計解析・可視化 v1.8.0
+| 機能 | 説明 |
+|------|------|
+| **群間比較** | t検定/Mann-Whitney U検定（自動選択）、Box Plot/Violin Plot |
+| **ROC曲線解析** | AUC算出、95%CI、最適カットオフ値（Youden Index） |
+| **相関解析** | Pearson/Spearman相関、ヒートマップ表示 |
+| **スパゲッティプロット** | 個別患者の検査値推移を重ね描き表示 |
+| **検査値ヒートマップ** | 患者×検査項目の値を色で可視化 |
+| **Kaplan-Meier曲線** | 2群間の生存時間解析、Log-rank検定 |
+| **学術誌スタイル** | Nature/NEJM/Lancet等のカラーパレット対応 |
+
 ### マルチテナント（組織分離）v1.4.0
 | 機能 | 説明 |
 |------|------|
@@ -248,11 +259,12 @@ clinical-data-firebase/
 
 | カテゴリ | 技術 |
 |---------|------|
-| フロントエンド | React 18, Vite 5 |
-| バックエンド | Firebase (Auth, Firestore, Hosting) |
-| グラフ描画 | Chart.js, react-chartjs-2 |
-| OCR | Tesseract.js |
+| フロントエンド | React 19, Vite 5 |
+| バックエンド | Firebase (Auth, Firestore, Hosting, Cloud Functions) |
+| グラフ描画 | Chart.js, react-chartjs-2, SVG (カスタム) |
+| OCR | Tesseract.js, Cloud Vision API |
 | Excel処理 | SheetJS (xlsx) |
+| 統計解析 | ブラウザ内実装（t検定、Mann-Whitney、Log-rank等） |
 
 ## 倫理審査対応のポイント
 
@@ -268,8 +280,9 @@ clinical-data-firebase/
 
 - [x] Cloud Vision APIによる高精度OCR（v1.1.0で実装済み）
 - [x] 複数ユーザー間でのデータ共有（v1.4.0 マルチテナント機能で実装済み）
+- [x] 統計解析機能・生存分析（v1.8.0で実装済み：群間比較、ROC、相関、KM曲線）
 - [ ] PDFレポート自動生成
-- [ ] 統計解析機能（生存分析等）
+- [ ] ANOVA（3群以上の比較）
 - [ ] モバイル対応（PWA）
 
 ## ライセンス

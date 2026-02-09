@@ -24,7 +24,8 @@ import {
   getDocs,
   getDoc,
   setDoc,
-  where
+  where,
+  limit
 } from 'firebase/firestore';
 // Tesseract.jsは不要になりました（Cloud Vision APIに移行）
 import * as XLSX from 'xlsx';
@@ -1759,6 +1760,64 @@ function PatientsListView({ onSelectPatient }) {
   const correlationChartRef = useRef(null);
 
   // ============================================================
+  // Swimmer Plot（患者別タイムライン）
+  // ============================================================
+  const [showSwimmerPlot, setShowSwimmerPlot] = useState(false);
+  const [swimmerData, setSwimmerData] = useState(null);
+  const [swimmerSortBy, setSwimmerSortBy] = useState('duration'); // 'duration', 'onset', 'id'
+  const [swimmerShowTreatments, setSwimmerShowTreatments] = useState(true);
+  const [swimmerShowEvents, setSwimmerShowEvents] = useState(true);
+  const [swimmerFilterHasData, setSwimmerFilterHasData] = useState(true); // データのある患者のみ表示
+  const swimmerChartRef = useRef(null);
+
+  // ============================================================
+  // スパゲッティプロット（個別患者の検査値推移）
+  // ============================================================
+  const [showSpaghettiPlot, setShowSpaghettiPlot] = useState(false);
+  const [spaghettiData, setSpaghettiData] = useState(null);
+  const [spaghettiSelectedItem, setSpaghettiSelectedItem] = useState('');
+  const [spaghettiColorByGroup, setSpaghettiColorByGroup] = useState(true);
+  const [spaghettiShowPoints, setSpaghettiShowPoints] = useState(true);
+  const [spaghettiSelectedPatients, setSpaghettiSelectedPatients] = useState([]);
+  const spaghettiChartRef = useRef(null);
+
+  // ============================================================
+  // ヒートマップ（検査値の患者間比較）
+  // ============================================================
+  const [showHeatmap, setShowHeatmap] = useState(false);
+  const [heatmapData, setHeatmapData] = useState(null);
+  const [heatmapSelectedItems, setHeatmapSelectedItems] = useState([]);
+  const [heatmapSelectedPatients, setHeatmapSelectedPatients] = useState([]);
+  const [heatmapSortBy, setHeatmapSortBy] = useState('group'); // 'group', 'id', 'value'
+  const [heatmapTimepoint, setHeatmapTimepoint] = useState('first'); // 'first', 'last', 'peak'
+  const [heatmapColorScale, setHeatmapColorScale] = useState('bluered'); // 'bluered', 'viridis', 'grayscale'
+  const heatmapChartRef = useRef(null);
+
+  // ============================================================
+  // Kaplan-Meier用Tidy Dataエクスポート
+  // ============================================================
+  const [showKMExportModal, setShowKMExportModal] = useState(false);
+  const [kmEventType, setKmEventType] = useState(''); // イベントタイプ（臨床イベントから選択）
+  const [kmTimeUnit, setKmTimeUnit] = useState('days'); // 時間単位: days, weeks, months
+  const [kmCensorDate, setKmCensorDate] = useState(''); // 打ち切り日（観察終了日）
+  const [kmSelectedGroups, setKmSelectedGroups] = useState([]); // 比較する群
+  const [kmAvailableEventTypes, setKmAvailableEventTypes] = useState([]); // 実際に登録されているイベントタイプ
+  const [kmLoadingEventTypes, setKmLoadingEventTypes] = useState(false);
+
+  // ============================================================
+  // Kaplan-Meier曲線（アプリ内描画）
+  // ============================================================
+  const [showKMChart, setShowKMChart] = useState(false);
+  const [kmChartData, setKmChartData] = useState(null);
+  const [kmChartEventType, setKmChartEventType] = useState('');
+  const [kmChartGroup1, setKmChartGroup1] = useState('');
+  const [kmChartGroup2, setKmChartGroup2] = useState('');
+  const [kmChartTimeUnit, setKmChartTimeUnit] = useState('days');
+  const [kmChartCensorDate, setKmChartCensorDate] = useState('');
+  const [kmChartLoading, setKmChartLoading] = useState(false);
+  const kmChartRef = useRef(null);
+
+  // ============================================================
   // 学術誌向けグラフスタイル設定
   // ============================================================
   const [chartColorPalette, setChartColorPalette] = useState('default'); // カラーパレット
@@ -3432,6 +3491,498 @@ function PatientsListView({ onSelectPatient }) {
 
   // ===== 相関解析関数 ここまで =====
 
+  // ===== Swimmer Plot関数 =====
+
+  // Swimmer Plot用データを生成
+  const generateSwimmerData = async () => {
+    if (!patients || patients.length === 0) return null;
+
+    const swimmerPatients = [];
+
+    for (const patient of patients) {
+      // 発症日を基準日として計算
+      const onsetDate = patient.onsetDate ? new Date(patient.onsetDate) : null;
+
+      // 治療データを取得
+      let treatments = [];
+      let events = [];
+      let labResults = [];
+
+      try {
+        // 治療薬データ
+        const treatmentQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+          orderBy('startDate', 'asc')
+        );
+        const treatmentSnapshot = await getDocs(treatmentQuery);
+        treatments = treatmentSnapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+
+        // 臨床イベントデータ
+        const eventQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          orderBy('startDate', 'asc')
+        );
+        const eventSnapshot = await getDocs(eventQuery);
+        events = eventSnapshot.docs.map(doc => ({
+          id: doc.id,
+          ...doc.data()
+        }));
+
+        // 検査データ（最終フォローアップ日を取得するため）
+        const labQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          orderBy('date', 'desc'),
+          limit(1)
+        );
+        const labSnapshot = await getDocs(labQuery);
+        labResults = labSnapshot.docs.map(doc => doc.data());
+      } catch (err) {
+        console.error('Error fetching swimmer data:', err);
+      }
+
+      // 観察期間の計算
+      let startDay = 0;
+      let endDay = 0;
+
+      if (onsetDate) {
+        // 最終フォローアップ日を計算
+        const allDates = [
+          ...treatments.flatMap(t => [t.startDate, t.endDate].filter(Boolean)),
+          ...events.flatMap(e => [e.startDate, e.endDate].filter(Boolean)),
+          ...labResults.map(l => l.date).filter(Boolean)
+        ].map(d => new Date(d));
+
+        if (allDates.length > 0) {
+          const lastDate = new Date(Math.max(...allDates));
+          endDay = Math.floor((lastDate - onsetDate) / (1000 * 60 * 60 * 24));
+        }
+      }
+
+      // 治療をDay形式に変換
+      const treatmentBars = treatments.map(t => {
+        const startDate = t.startDate ? new Date(t.startDate) : null;
+        const endDate = t.endDate ? new Date(t.endDate) : null;
+
+        let dayStart = 0;
+        let dayEnd = endDay;
+
+        if (onsetDate && startDate) {
+          dayStart = Math.floor((startDate - onsetDate) / (1000 * 60 * 60 * 24));
+        }
+        if (onsetDate && endDate) {
+          dayEnd = Math.floor((endDate - onsetDate) / (1000 * 60 * 60 * 24));
+        }
+
+        return {
+          name: t.name,
+          category: t.category,
+          dayStart,
+          dayEnd,
+          ongoing: !t.endDate
+        };
+      });
+
+      // イベントをDay形式に変換
+      const eventMarkers = events.map(e => {
+        const eventDate = e.startDate ? new Date(e.startDate) : null;
+        let day = 0;
+
+        if (onsetDate && eventDate) {
+          day = Math.floor((eventDate - onsetDate) / (1000 * 60 * 60 * 24));
+        }
+
+        return {
+          type: e.eventType || e.type || 'その他',
+          day,
+          isOngoing: e.isOngoing || !e.endDate
+        };
+      });
+
+      swimmerPatients.push({
+        id: patient.id,
+        displayId: patient.displayId,
+        group: patient.group || '',
+        diagnosis: patient.diagnosis || '',
+        onsetDate: patient.onsetDate,
+        startDay,
+        endDay: Math.max(endDay, 30), // 最低30日
+        treatments: treatmentBars,
+        events: eventMarkers
+      });
+    }
+
+    // ソート
+    swimmerPatients.sort((a, b) => {
+      if (swimmerSortBy === 'duration') {
+        return b.endDay - a.endDay;
+      } else if (swimmerSortBy === 'onset') {
+        return new Date(a.onsetDate || '9999') - new Date(b.onsetDate || '9999');
+      } else {
+        return a.displayId.localeCompare(b.displayId);
+      }
+    });
+
+    return swimmerPatients;
+  };
+
+  // Swimmer Plotを実行
+  const runSwimmerPlot = async () => {
+    const data = await generateSwimmerData();
+    setSwimmerData(data);
+  };
+
+  // ============================================================
+  // スパゲッティプロット データ生成
+  // ============================================================
+  const generateSpaghettiData = async () => {
+    if (!patients || patients.length === 0) return null;
+
+
+    const allLabItems = new Set();
+    const patientLabData = [];
+
+    for (const patient of patients) {
+      const onsetDate = patient.onsetDate ? new Date(patient.onsetDate) : null;
+
+      try {
+        const labQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          orderBy('date', 'asc')
+        );
+        const labSnapshot = await getDocs(labQuery);
+        const labResults = labSnapshot.docs.map(doc => doc.data());
+
+
+        // 患者ごとのデータポイントを収集
+        const dataPoints = [];
+
+        labResults.forEach(lab => {
+          const labDate = lab.date ? new Date(lab.date) : null;
+          let day = null;
+          if (onsetDate && labDate) {
+            day = Math.floor((labDate - onsetDate) / (1000 * 60 * 60 * 24));
+          }
+
+          // data配列形式の場合
+          if (lab.data && Array.isArray(lab.data)) {
+            lab.data.forEach(item => {
+              // 日付形式の項目名を除外
+              const isDateItem = /^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(item.item);
+              if (isDateItem) return;
+
+              if (item.item && item.value !== undefined && item.value !== null && item.value !== '') {
+                allLabItems.add(item.item);
+                const value = parseFloat(item.value);
+                if (!isNaN(value)) {
+                  dataPoints.push({
+                    item: item.item,
+                    value,
+                    day,
+                    date: lab.date,
+                    unit: item.unit || ''
+                  });
+                }
+              }
+            });
+          }
+
+          // itemsオブジェクト形式の場合
+          if (lab.items && typeof lab.items === 'object') {
+            Object.entries(lab.items).forEach(([itemName, itemData]) => {
+              // 日付形式のキーを除外（YYYY-MM-DD, YYYY/MM/DD など）
+              const isDateKey = /^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(itemName);
+              if (isDateKey) return;
+
+              if (itemName && itemData?.value !== undefined && itemData?.value !== null && itemData?.value !== '') {
+                allLabItems.add(itemName);
+                const value = parseFloat(itemData.value);
+                if (!isNaN(value)) {
+                  dataPoints.push({
+                    item: itemName,
+                    value,
+                    day,
+                    date: lab.date,
+                    unit: itemData.unit || ''
+                  });
+                }
+              }
+            });
+          }
+
+          // 従来のフラット形式の場合（item, value直接）
+          if (lab.item && lab.value !== undefined) {
+            allLabItems.add(lab.item);
+            const value = parseFloat(lab.value);
+            if (!isNaN(value)) {
+              dataPoints.push({
+                item: lab.item,
+                value,
+                day,
+                date: lab.date,
+                unit: lab.unit || ''
+              });
+            }
+          }
+        });
+
+
+        patientLabData.push({
+          id: patient.id,
+          displayId: patient.displayId,
+          group: patient.group || 'その他',
+          diagnosis: patient.diagnosis,
+          dataPoints
+        });
+      } catch (err) {
+        console.error('Error fetching lab data for spaghetti plot:', err);
+      }
+    }
+
+    // 全患者を選択状態に
+    setSpaghettiSelectedPatients(patients.map(p => p.id));
+
+    // 検査項目リストを作成
+    const itemsArray = Array.from(allLabItems).sort();
+
+    // データをセット
+    const newData = {
+      patients: patientLabData,
+      labItems: itemsArray,
+      groups: [...new Set(patients.map(p => p.group || 'その他'))]
+    };
+
+    setSpaghettiData(newData);
+
+    // 最初の検査項目を選択（データセット後に行う）
+    if (itemsArray.length > 0) {
+      setSpaghettiSelectedItem(itemsArray[0]);
+    }
+
+    return newData;
+  };
+
+  // スパゲッティプロット用カラーパレット（群別）
+  const spaghettiGroupColors = {
+    'default': ['#2563eb', '#dc2626', '#16a34a', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#84cc16'],
+  };
+
+  // 群に基づく色を取得
+  const getGroupColor = (group, groups) => {
+    const colors = spaghettiGroupColors.default;
+    const index = groups.indexOf(group);
+    return colors[index % colors.length];
+  };
+
+  // ヒートマップデータ生成関数
+  const generateHeatmapData = async () => {
+    if (!patients || patients.length === 0) return null;
+
+    const allLabItems = new Map(); // item -> { min, max, unit }
+    const patientData = [];
+
+    for (const patient of patients) {
+      const onsetDate = patient.onsetDate ? new Date(patient.onsetDate) : null;
+
+      try {
+        const labQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          orderBy('date', 'asc')
+        );
+        const labSnapshot = await getDocs(labQuery);
+        const labResults = labSnapshot.docs.map(doc => doc.data());
+
+        // 患者ごとの各検査項目のデータを収集
+        const itemValues = new Map(); // item -> [{value, day, date}]
+
+        labResults.forEach(lab => {
+          const labDate = lab.date ? new Date(lab.date) : null;
+          let day = null;
+          if (onsetDate && labDate) {
+            day = Math.floor((labDate - onsetDate) / (1000 * 60 * 60 * 24));
+          }
+
+          // data配列形式の場合
+          if (lab.data && Array.isArray(lab.data)) {
+            lab.data.forEach(item => {
+              const isDateItem = /^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(item.item);
+              if (isDateItem) return;
+
+              if (item.item && item.value !== undefined && item.value !== null && item.value !== '') {
+                const value = parseFloat(item.value);
+                if (!isNaN(value)) {
+                  if (!itemValues.has(item.item)) itemValues.set(item.item, []);
+                  itemValues.get(item.item).push({ value, day, date: lab.date });
+
+                  // min/max追跡
+                  if (!allLabItems.has(item.item)) {
+                    allLabItems.set(item.item, { min: value, max: value, unit: item.unit || '' });
+                  } else {
+                    const info = allLabItems.get(item.item);
+                    info.min = Math.min(info.min, value);
+                    info.max = Math.max(info.max, value);
+                  }
+                }
+              }
+            });
+          }
+
+          // itemsオブジェクト形式の場合
+          if (lab.items && typeof lab.items === 'object') {
+            Object.entries(lab.items).forEach(([itemName, itemData]) => {
+              const isDateKey = /^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(itemName);
+              if (isDateKey) return;
+
+              if (itemName && itemData?.value !== undefined && itemData?.value !== null && itemData?.value !== '') {
+                const value = parseFloat(itemData.value);
+                if (!isNaN(value)) {
+                  if (!itemValues.has(itemName)) itemValues.set(itemName, []);
+                  itemValues.get(itemName).push({ value, day, date: lab.date });
+
+                  if (!allLabItems.has(itemName)) {
+                    allLabItems.set(itemName, { min: value, max: value, unit: itemData.unit || '' });
+                  } else {
+                    const info = allLabItems.get(itemName);
+                    info.min = Math.min(info.min, value);
+                    info.max = Math.max(info.max, value);
+                  }
+                }
+              }
+            });
+          }
+
+          // 従来のフラット形式の場合
+          if (lab.item && lab.value !== undefined) {
+            const value = parseFloat(lab.value);
+            if (!isNaN(value)) {
+              if (!itemValues.has(lab.item)) itemValues.set(lab.item, []);
+              itemValues.get(lab.item).push({ value, day, date: lab.date });
+
+              if (!allLabItems.has(lab.item)) {
+                allLabItems.set(lab.item, { min: value, max: value, unit: lab.unit || '' });
+              } else {
+                const info = allLabItems.get(lab.item);
+                info.min = Math.min(info.min, value);
+                info.max = Math.max(info.max, value);
+              }
+            }
+          }
+        });
+
+        patientData.push({
+          id: patient.id,
+          displayId: patient.displayId,
+          group: patient.group || 'その他',
+          diagnosis: patient.diagnosis,
+          itemValues: Object.fromEntries(itemValues)
+        });
+      } catch (err) {
+        console.error('Error fetching lab data for heatmap:', err);
+      }
+    }
+
+    // 全検査項目リスト（データ数でソート）
+    const itemsArray = Array.from(allLabItems.keys()).sort((a, b) => {
+      const countA = patientData.filter(p => p.itemValues[a]?.length > 0).length;
+      const countB = patientData.filter(p => p.itemValues[b]?.length > 0).length;
+      return countB - countA; // データ数の多い順
+    });
+
+    // データをセット
+    const newData = {
+      patients: patientData,
+      labItems: itemsArray,
+      itemInfo: Object.fromEntries(allLabItems),
+      groups: [...new Set(patients.map(p => p.group || 'その他'))]
+    };
+
+    setHeatmapData(newData);
+
+    // 上位10項目を自動選択
+    setHeatmapSelectedItems(itemsArray.slice(0, Math.min(10, itemsArray.length)));
+
+    // 全患者を選択状態に
+    setHeatmapSelectedPatients(patients.map(p => p.id));
+
+    return newData;
+  };
+
+  // ヒートマップ用のカラースケール取得
+  const getHeatmapColor = (normalizedValue, colorScale) => {
+    if (normalizedValue === null || normalizedValue === undefined) {
+      return '#f3f4f6'; // データなし
+    }
+
+    const v = Math.max(0, Math.min(1, normalizedValue));
+
+    switch (colorScale) {
+      case 'bluered':
+        // 青（低）→ 白（中）→ 赤（高）
+        if (v < 0.5) {
+          const t = v * 2;
+          const r = Math.round(59 + (255 - 59) * t);
+          const g = Math.round(130 + (255 - 130) * t);
+          const b = Math.round(246 + (255 - 246) * t);
+          return `rgb(${r}, ${g}, ${b})`;
+        } else {
+          const t = (v - 0.5) * 2;
+          const r = 255;
+          const g = Math.round(255 - (255 - 68) * t);
+          const b = Math.round(255 - (255 - 68) * t);
+          return `rgb(${r}, ${g}, ${b})`;
+        }
+      case 'viridis':
+        // Viridis-likeカラースケール
+        const viridisColors = [
+          [68, 1, 84], [72, 40, 120], [62, 74, 137], [49, 104, 142],
+          [38, 130, 142], [31, 158, 137], [53, 183, 121], [109, 205, 89],
+          [180, 222, 44], [253, 231, 37]
+        ];
+        const idx = Math.min(Math.floor(v * (viridisColors.length - 1)), viridisColors.length - 2);
+        const t = (v * (viridisColors.length - 1)) - idx;
+        const c1 = viridisColors[idx];
+        const c2 = viridisColors[idx + 1];
+        const r = Math.round(c1[0] + (c2[0] - c1[0]) * t);
+        const g = Math.round(c1[1] + (c2[1] - c1[1]) * t);
+        const b = Math.round(c1[2] + (c2[2] - c1[2]) * t);
+        return `rgb(${r}, ${g}, ${b})`;
+      case 'grayscale':
+        const gray = Math.round(240 - v * 200);
+        return `rgb(${gray}, ${gray}, ${gray})`;
+      default:
+        return '#3b82f6';
+    }
+  };
+
+  // 治療カテゴリのカラーマップ
+  const treatmentColorMap = {
+    '抗てんかん薬': '#3b82f6',
+    'ステロイド': '#ef4444',
+    '免疫グロブリン': '#22c55e',
+    '血漿交換': '#f59e0b',
+    '免疫抑制剤': '#8b5cf6',
+    '抗ウイルス薬': '#ec4899',
+    '抗菌薬': '#06b6d4',
+    '抗浮腫薬': '#84cc16',
+    'その他': '#6b7280'
+  };
+
+  // イベントタイプのシンボルマップ
+  const eventSymbolMap = {
+    '意識障害': { symbol: '●', color: '#dc2626' },
+    'てんかん発作': { symbol: '◆', color: '#ea580c' },
+    '不随意運動': { symbol: '▲', color: '#ca8a04' },
+    '麻痺': { symbol: '■', color: '#16a34a' },
+    '発熱': { symbol: '★', color: '#dc2626' },
+    '人工呼吸器管理': { symbol: '✚', color: '#7c3aed' },
+    'ICU入室': { symbol: '◎', color: '#be185d' },
+    'default': { symbol: '●', color: '#6b7280' }
+  };
+
+  // ===== Swimmer Plot関数 ここまで =====
+
   // ===== Rスクリプト・生データエクスポート関数 =====
 
   // 群間比較用の生データCSVを生成
@@ -4531,6 +5082,510 @@ cat("\\n解析完了！\\n")
     setShowExportModal(true);
   };
 
+  // 全検査データCSVエクスポート
+  const exportAllLabDataCSV = async () => {
+    if (!patients || patients.length === 0) {
+      alert('エクスポートする患者データがありません');
+      return;
+    }
+
+    setIsExporting(true);
+
+    try {
+      // CSVヘッダー
+      let csv = 'patient_id,group,diagnosis,onset_date,lab_date,days_from_onset,specimen,item,value,unit\n';
+
+      for (const patient of patients) {
+        const onsetDate = patient.onsetDate ? new Date(patient.onsetDate) : null;
+
+        const labQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          orderBy('date', 'asc')
+        );
+        const labSnapshot = await getDocs(labQuery);
+
+        labSnapshot.docs.forEach(labDoc => {
+          const lab = labDoc.data();
+          const labDate = lab.date ? new Date(lab.date) : null;
+          let daysFromOnset = '';
+          if (onsetDate && labDate) {
+            daysFromOnset = Math.floor((labDate - onsetDate) / (1000 * 60 * 60 * 24));
+          }
+
+          // data配列形式
+          if (lab.data && Array.isArray(lab.data)) {
+            lab.data.forEach(item => {
+              if (item.item && item.value !== undefined && item.value !== null && item.value !== '') {
+                // 日付形式の項目名を除外
+                if (/^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(item.item)) return;
+                csv += `"${patient.displayId}","${patient.group || ''}","${patient.diagnosis || ''}","${patient.onsetDate || ''}","${lab.date || ''}","${daysFromOnset}","${lab.specimen || ''}","${item.item}","${item.value}","${item.unit || ''}"\n`;
+              }
+            });
+          }
+
+          // itemsオブジェクト形式
+          if (lab.items && typeof lab.items === 'object') {
+            Object.entries(lab.items).forEach(([itemName, itemData]) => {
+              if (/^\d{4}[-\/]\d{2}[-\/]\d{2}$/.test(itemName)) return;
+              if (itemName && itemData?.value !== undefined && itemData?.value !== null && itemData?.value !== '') {
+                csv += `"${patient.displayId}","${patient.group || ''}","${patient.diagnosis || ''}","${patient.onsetDate || ''}","${lab.date || ''}","${daysFromOnset}","${lab.specimen || ''}","${itemName}","${itemData.value}","${itemData.unit || ''}"\n`;
+              }
+            });
+          }
+        });
+      }
+
+      // BOM付きでダウンロード
+      const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+      const blob = new Blob([bom, csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `all_lab_data_${new Date().toISOString().split('T')[0]}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      alert(`検査データCSVをエクスポートしました（${patients.length}患者）`);
+    } catch (err) {
+      console.error('Error exporting lab data:', err);
+      alert('エクスポート中にエラーが発生しました');
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // 全臨床データCSVエクスポート（治療薬＋臨床イベント）
+  const exportAllClinicalDataCSV = async () => {
+    if (!patients || patients.length === 0) {
+      alert('エクスポートする患者データがありません');
+      return;
+    }
+
+    setIsExporting(true);
+
+    try {
+      // 治療薬CSV
+      let treatmentCsv = 'patient_id,group,diagnosis,onset_date,treatment_name,category,start_date,end_date,start_day,end_day,dose,unit\n';
+
+      // 臨床イベントCSV
+      let eventCsv = 'patient_id,group,diagnosis,onset_date,event_type,start_date,end_date,start_day,end_day,input_type,jcs,frequency,severity,presence,note\n';
+
+      for (const patient of patients) {
+        const onsetDate = patient.onsetDate ? new Date(patient.onsetDate) : null;
+
+        // 治療薬データ
+        const treatmentQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+          orderBy('startDate', 'asc')
+        );
+        const treatmentSnapshot = await getDocs(treatmentQuery);
+
+        treatmentSnapshot.docs.forEach(doc => {
+          const t = doc.data();
+          let startDay = '', endDay = '';
+          if (onsetDate) {
+            if (t.startDate) {
+              startDay = Math.floor((new Date(t.startDate) - onsetDate) / (1000 * 60 * 60 * 24));
+            }
+            if (t.endDate) {
+              endDay = Math.floor((new Date(t.endDate) - onsetDate) / (1000 * 60 * 60 * 24));
+            }
+          }
+          treatmentCsv += `"${patient.displayId}","${patient.group || ''}","${patient.diagnosis || ''}","${patient.onsetDate || ''}","${t.name || ''}","${t.category || ''}","${t.startDate || ''}","${t.endDate || ''}","${startDay}","${endDay}","${t.dose || ''}","${t.unit || ''}"\n`;
+        });
+
+        // 臨床イベントデータ
+        const eventQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          orderBy('startDate', 'asc')
+        );
+        const eventSnapshot = await getDocs(eventQuery);
+
+        eventSnapshot.docs.forEach(doc => {
+          const e = doc.data();
+          let startDay = '', endDay = '';
+          if (onsetDate) {
+            if (e.startDate) {
+              startDay = Math.floor((new Date(e.startDate) - onsetDate) / (1000 * 60 * 60 * 24));
+            }
+            if (e.endDate) {
+              endDay = Math.floor((new Date(e.endDate) - onsetDate) / (1000 * 60 * 60 * 24));
+            }
+          }
+          eventCsv += `"${patient.displayId}","${patient.group || ''}","${patient.diagnosis || ''}","${patient.onsetDate || ''}","${e.eventType || ''}","${e.startDate || ''}","${e.endDate || ''}","${startDay}","${endDay}","${e.inputType || ''}","${e.jcs || ''}","${e.frequency || ''}","${e.severity || ''}","${e.presence || ''}","${(e.note || '').replace(/"/g, '""')}"\n`;
+        });
+      }
+
+      // 治療薬CSVダウンロード
+      const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+      const treatmentBlob = new Blob([bom, treatmentCsv], { type: 'text/csv;charset=utf-8' });
+      const treatmentUrl = URL.createObjectURL(treatmentBlob);
+      const a1 = document.createElement('a');
+      a1.href = treatmentUrl;
+      a1.download = `all_treatments_${new Date().toISOString().split('T')[0]}.csv`;
+      a1.click();
+      URL.revokeObjectURL(treatmentUrl);
+
+      // 少し待ってから臨床イベントCSVダウンロード
+      setTimeout(() => {
+        const eventBlob = new Blob([bom, eventCsv], { type: 'text/csv;charset=utf-8' });
+        const eventUrl = URL.createObjectURL(eventBlob);
+        const a2 = document.createElement('a');
+        a2.href = eventUrl;
+        a2.download = `all_clinical_events_${new Date().toISOString().split('T')[0]}.csv`;
+        a2.click();
+        URL.revokeObjectURL(eventUrl);
+      }, 500);
+
+      alert(`臨床データCSVをエクスポートしました（${patients.length}患者）\n・治療薬データ\n・臨床イベントデータ`);
+    } catch (err) {
+      console.error('Error exporting clinical data:', err);
+      alert('エクスポート中にエラーが発生しました');
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // Kaplan-Meier用Tidy Dataエクスポート
+  const exportKMData = async () => {
+    if (!patients || patients.length === 0) {
+      alert('エクスポートする患者データがありません');
+      return;
+    }
+
+    if (!kmEventType) {
+      alert('イベントタイプを選択してください');
+      return;
+    }
+
+    if (kmSelectedGroups.length === 0) {
+      alert('少なくとも1つの群を選択してください');
+      return;
+    }
+
+    setIsExporting(true);
+
+    try {
+      // 打ち切り日（デフォルトは今日）
+      const censorDate = kmCensorDate ? new Date(kmCensorDate) : new Date();
+
+      // 対象患者をフィルタ
+      const targetPatients = patients.filter(p => kmSelectedGroups.includes(p.group));
+
+      // 各患者のイベントデータを取得
+      const kmData = [];
+
+      for (const patient of targetPatients) {
+        const onsetDate = patient.onsetDate ? new Date(patient.onsetDate) : null;
+        if (!onsetDate) continue; // 発症日がない患者はスキップ
+
+        // 臨床イベントを取得
+        const eventQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          orderBy('startDate', 'asc')
+        );
+        const eventSnapshot = await getDocs(eventQuery);
+        const events = eventSnapshot.docs.map(doc => doc.data());
+
+        // 指定されたイベントタイプを検索
+        const targetEvent = events.find(e => e.eventType === kmEventType);
+
+        let time = 0;
+        let status = 0; // 0 = censored, 1 = event
+
+        if (targetEvent && targetEvent.startDate) {
+          // イベントが発生した場合
+          const eventDate = new Date(targetEvent.startDate);
+          time = (eventDate - onsetDate) / (1000 * 60 * 60 * 24); // 日数
+          status = 1;
+        } else {
+          // イベントが発生していない場合（打ち切り）
+          time = (censorDate - onsetDate) / (1000 * 60 * 60 * 24);
+          status = 0;
+        }
+
+        // 時間単位の変換
+        if (kmTimeUnit === 'weeks') {
+          time = time / 7;
+        } else if (kmTimeUnit === 'months') {
+          time = time / 30.44; // 平均月数
+        }
+
+        // 負の値は0に
+        if (time < 0) time = 0;
+
+        kmData.push({
+          patient_id: patient.displayId,
+          group: patient.group || '',
+          diagnosis: patient.diagnosis || '',
+          onset_date: patient.onsetDate || '',
+          time: Math.round(time * 100) / 100, // 小数点2桁
+          status: status,
+          event_type: kmEventType,
+          event_date: targetEvent?.startDate || '',
+          censor_date: status === 0 ? kmCensorDate || new Date().toISOString().split('T')[0] : ''
+        });
+      }
+
+      if (kmData.length === 0) {
+        alert('対象となる患者データがありません（発症日が設定されている患者が必要です）');
+        setIsExporting(false);
+        return;
+      }
+
+      // CSVヘッダー
+      let csv = 'patient_id,group,diagnosis,onset_date,time,status,event_type,event_date,censor_date\n';
+
+      // データ行
+      kmData.forEach(row => {
+        csv += `"${row.patient_id}","${row.group}","${row.diagnosis}","${row.onset_date}",${row.time},${row.status},"${row.event_type}","${row.event_date}","${row.censor_date}"\n`;
+      });
+
+      // ダウンロード
+      const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+      const blob = new Blob([bom, csv], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `km_survival_data_${kmEventType}_${new Date().toISOString().split('T')[0]}.csv`;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      // Rスクリプトも同時に生成
+      const timeUnitLabel = kmTimeUnit === 'days' ? '日' : kmTimeUnit === 'weeks' ? '週' : '月';
+      const rScript = `# Kaplan-Meier Survival Analysis R Script
+# Generated from Clinical Data Registry
+# Event: ${kmEventType}
+# Time unit: ${timeUnitLabel}
+# Date: ${new Date().toISOString().split('T')[0]}
+
+# Required packages
+if (!require("survival")) install.packages("survival")
+if (!require("survminer")) install.packages("survminer")
+if (!require("ggplot2")) install.packages("ggplot2")
+
+library(survival)
+library(survminer)
+library(ggplot2)
+
+# Load data (Note: using 'surv_data' to avoid conflict with R's data() function)
+surv_data <- read.csv("km_survival_data_${kmEventType}_${new Date().toISOString().split('T')[0]}.csv",
+                      fileEncoding = "UTF-8-BOM")
+
+# Check data structure
+str(surv_data)
+summary(surv_data)
+table(surv_data$group, surv_data$status)  # Event counts by group
+
+# Create survival object
+surv_obj <- Surv(time = surv_data$time, event = surv_data$status)
+
+# Fit Kaplan-Meier model
+km_fit <- survfit(surv_obj ~ group, data = surv_data)
+
+# Summary statistics
+print(km_fit)
+summary(km_fit)
+
+# Kaplan-Meier Plot
+km_plot <- ggsurvplot(
+  km_fit,
+  data = surv_data,
+  pval = TRUE,                    # Show p-value (log-rank test)
+  conf.int = TRUE,                # Show confidence intervals
+  risk.table = TRUE,              # Show risk table
+  risk.table.col = "strata",
+  linetype = "strata",
+  surv.median.line = "hv",        # Show median survival
+  ggtheme = theme_bw(),
+  palette = c("#E64B35", "#4DBBD5", "#00A087", "#3C5488", "#F39B7F"),  # Nature palette
+  xlab = "Time (${timeUnitLabel})",
+  ylab = "Survival Probability",
+  title = "Kaplan-Meier Survival Curve: ${kmEventType}",
+  legend.title = "Group",
+  legend.labs = unique(surv_data$group),
+  font.main = c(14, "bold"),
+  font.x = c(12, "plain"),
+  font.y = c(12, "plain"),
+  font.tickslab = c(10, "plain")
+)
+
+# Display plot
+print(km_plot)
+
+# Save plot
+ggsave("km_curve_${kmEventType}.png",
+       plot = print(km_plot),
+       width = 10,
+       height = 8,
+       dpi = 300)
+
+# Log-rank test (detailed)
+log_rank <- survdiff(surv_obj ~ group, data = surv_data)
+print(log_rank)
+
+# Cox proportional hazards model (optional)
+cox_model <- coxph(surv_obj ~ group, data = surv_data)
+summary(cox_model)
+
+# Hazard ratios with confidence intervals
+exp(confint(cox_model))
+`;
+
+      setTimeout(() => {
+        const rBlob = new Blob([rScript], { type: 'text/plain;charset=utf-8' });
+        const rUrl = URL.createObjectURL(rBlob);
+        const a2 = document.createElement('a');
+        a2.href = rUrl;
+        a2.download = `km_analysis_${kmEventType}_${new Date().toISOString().split('T')[0]}.R`;
+        a2.click();
+        URL.revokeObjectURL(rUrl);
+      }, 500);
+
+      const eventCount = kmData.filter(d => d.status === 1).length;
+      const censoredCount = kmData.filter(d => d.status === 0).length;
+      alert(`KM解析用データをエクスポートしました\n\n患者数: ${kmData.length}\nイベント発生: ${eventCount}\n打ち切り: ${censoredCount}\n\n・CSVデータファイル\n・R解析スクリプト`);
+
+      setShowKMExportModal(false);
+    } catch (err) {
+      console.error('Error exporting KM data:', err);
+      alert('エクスポート中にエラーが発生しました');
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
+  // Kaplan-Meier曲線データ生成（アプリ内描画用）
+  const generateKMChartData = async () => {
+    if (!kmChartEventType || !kmChartGroup1 || !kmChartGroup2) {
+      alert('イベントタイプと2つの群を選択してください');
+      return;
+    }
+
+    setKmChartLoading(true);
+
+    try {
+      const censorDate = kmChartCensorDate ? new Date(kmChartCensorDate) : new Date();
+      const targetPatients = patients.filter(p => p.group === kmChartGroup1 || p.group === kmChartGroup2);
+
+      const survivalData = [];
+
+      for (const patient of targetPatients) {
+        const onsetDate = patient.onsetDate ? new Date(patient.onsetDate) : null;
+        if (!onsetDate) continue;
+
+        const eventQuery = query(
+          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          orderBy('startDate', 'asc')
+        );
+        const eventSnapshot = await getDocs(eventQuery);
+        const events = eventSnapshot.docs.map(doc => doc.data());
+        const targetEvent = events.find(e => e.eventType === kmChartEventType);
+
+        let time = 0;
+        let status = 0;
+
+        if (targetEvent && targetEvent.startDate) {
+          const eventDate = new Date(targetEvent.startDate);
+          time = (eventDate - onsetDate) / (1000 * 60 * 60 * 24);
+          status = 1;
+        } else {
+          time = (censorDate - onsetDate) / (1000 * 60 * 60 * 24);
+          status = 0;
+        }
+
+        if (kmChartTimeUnit === 'weeks') time = time / 7;
+        else if (kmChartTimeUnit === 'months') time = time / 30.44;
+
+        if (time < 0) time = 0;
+
+        survivalData.push({
+          patientId: patient.displayId,
+          group: patient.group,
+          time: Math.round(time * 100) / 100,
+          status
+        });
+      }
+
+      // Kaplan-Meier推定値を計算
+      const calculateKM = (data) => {
+        const sorted = [...data].sort((a, b) => a.time - b.time);
+        const n = sorted.length;
+        let atRisk = n;
+        let survival = 1;
+        const curve = [{ time: 0, survival: 1, atRisk: n }];
+
+        sorted.forEach((d, i) => {
+          if (d.status === 1) {
+            survival = survival * ((atRisk - 1) / atRisk);
+            curve.push({ time: d.time, survival, atRisk, event: true });
+          } else {
+            curve.push({ time: d.time, survival, atRisk, censored: true });
+          }
+          atRisk--;
+        });
+
+        return curve;
+      };
+
+      const group1Data = survivalData.filter(d => d.group === kmChartGroup1);
+      const group2Data = survivalData.filter(d => d.group === kmChartGroup2);
+
+      const curve1 = calculateKM(group1Data);
+      const curve2 = calculateKM(group2Data);
+
+      // Log-rank検定（簡易版）
+      const logRankTest = () => {
+        const allTimes = [...new Set(survivalData.filter(d => d.status === 1).map(d => d.time))].sort((a, b) => a - b);
+
+        let O1 = 0, E1 = 0, V = 0;
+
+        allTimes.forEach(t => {
+          const n1 = group1Data.filter(d => d.time >= t).length;
+          const n2 = group2Data.filter(d => d.time >= t).length;
+          const n = n1 + n2;
+          if (n === 0) return;
+
+          const d1 = group1Data.filter(d => d.time === t && d.status === 1).length;
+          const d2 = group2Data.filter(d => d.time === t && d.status === 1).length;
+          const d = d1 + d2;
+
+          const e1 = (n1 * d) / n;
+          O1 += d1;
+          E1 += e1;
+
+          if (n > 1) {
+            V += (n1 * n2 * d * (n - d)) / (n * n * (n - 1));
+          }
+        });
+
+        if (V === 0) return { chi2: null, pValue: null };
+
+        const chi2 = Math.pow(O1 - E1, 2) / V;
+        // 近似p値（カイ二乗分布、自由度1）
+        const pValue = 1 - (1 - Math.exp(-chi2 / 2));
+
+        return { chi2, pValue: Math.max(0.001, Math.min(1, pValue)) };
+      };
+
+      const logRank = logRankTest();
+
+      setKmChartData({
+        group1: { name: kmChartGroup1, data: group1Data, curve: curve1 },
+        group2: { name: kmChartGroup2, data: group2Data, curve: curve2 },
+        logRank,
+        maxTime: Math.max(...survivalData.map(d => d.time)),
+        eventType: kmChartEventType
+      });
+
+    } catch (err) {
+      console.error('Error generating KM chart:', err);
+      alert('KM曲線の生成中にエラーが発生しました');
+    } finally {
+      setKmChartLoading(false);
+    }
+  };
+
   // 分析モーダルを開く際にデータを読み込む
   const openAnalysisModal = async () => {
     setShowAnalysisModal(true);
@@ -5146,62 +6201,353 @@ cat("\\n解析完了！\\n")
       </header>
 
       <main style={styles.content}>
-        <div style={{ display: 'flex', gap: '10px', marginBottom: '20px' }}>
-          <button onClick={() => setShowAddModal(true)} style={styles.addButton}>
-            <span style={styles.addIcon}>+</span>
-            新規患者登録
-          </button>
-          <button
-            onClick={exportAllData}
-            disabled={isExporting || patients.length === 0}
-            style={{
-              ...styles.addButton,
-              backgroundColor: patients.length === 0 ? '#ccc' : '#28a745',
-              opacity: isExporting ? 0.7 : 1,
-              cursor: isExporting || patients.length === 0 ? 'not-allowed' : 'pointer'
-            }}
-          >
-            {isExporting ? 'エクスポート中...' : '📊 CSVエクスポート'}
-          </button>
-          <button
-            onClick={openAnalysisModal}
-            disabled={patients.length === 0}
-            style={{
-              ...styles.addButton,
-              backgroundColor: patients.length === 0 ? '#ccc' : '#8b5cf6',
-              cursor: patients.length === 0 ? 'not-allowed' : 'pointer'
-            }}
-          >
-            📈 経時データ分析
-          </button>
-          <button
-            onClick={() => setShowBulkImportModal(true)}
-            style={{
-              ...styles.addButton,
-              backgroundColor: '#f59e0b'
-            }}
-          >
-            📥 患者一括登録
-          </button>
-          <button
-            onClick={() => setShowBulkLabImportModal(true)}
-            style={{
-              ...styles.addButton,
-              backgroundColor: '#8b5cf6'
-            }}
-          >
-            📊 データ一括登録
-          </button>
+        {/* 機能セクション */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: 'repeat(3, 1fr)',
+          gap: '16px',
+          marginBottom: '24px'
+        }}>
+          {/* データ登録セクション - 水色 */}
+          <div style={{
+            background: '#e0f2fe',
+            borderRadius: '8px',
+            padding: '16px',
+            border: '1px solid #7dd3fc',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.08)'
+          }}>
+            <h3 style={{
+              fontSize: '13px',
+              fontWeight: '600',
+              color: '#0369a1',
+              marginBottom: '12px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              borderBottom: '2px solid #0369a1',
+              paddingBottom: '8px'
+            }}>
+              データ登録
+            </h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <button onClick={() => setShowAddModal(true)} style={{
+                ...styles.addButton,
+                backgroundColor: '#0284c7',
+                width: '100%',
+                justifyContent: 'center'
+              }}>
+                <span style={styles.addIcon}>+</span>
+                新規患者登録
+              </button>
+              <button
+                onClick={() => setShowBulkImportModal(true)}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: '#0369a1',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                患者一括登録（CSV）
+              </button>
+              <button
+                onClick={() => setShowBulkLabImportModal(true)}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: '#075985',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                データ一括登録
+              </button>
+            </div>
+          </div>
+
+          {/* 統計・可視化セクション - 白 */}
+          <div style={{
+            background: '#ffffff',
+            borderRadius: '8px',
+            padding: '16px',
+            border: '1px solid #d1d5db',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.08)'
+          }}>
+            <h3 style={{
+              fontSize: '13px',
+              fontWeight: '600',
+              color: '#1f2937',
+              marginBottom: '12px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              borderBottom: '2px solid #1f2937',
+              paddingBottom: '8px'
+            }}>
+              統計・可視化
+            </h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <button
+                onClick={openAnalysisModal}
+                disabled={patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#1f2937',
+                  cursor: patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                経時データ分析
+              </button>
+              <button
+                onClick={() => {
+                  setShowSwimmerPlot(true);
+                  runSwimmerPlot();
+                }}
+                disabled={patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#374151',
+                  cursor: patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                Swimmer Plot
+              </button>
+              <button
+                onClick={openAnalysisModal}
+                disabled={patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#4b5563',
+                  cursor: patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                群間比較
+              </button>
+              <button
+                onClick={() => {
+                  setShowSpaghettiPlot(true);
+                  generateSpaghettiData();
+                }}
+                disabled={patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#52525b',
+                  cursor: patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                スパゲッティプロット
+              </button>
+              <button
+                onClick={() => {
+                  setShowHeatmap(true);
+                  generateHeatmapData();
+                }}
+                disabled={patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#44403c',
+                  cursor: patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                ヒートマップ
+              </button>
+              <button
+                onClick={async () => {
+                  setKmChartData(null);
+                  setKmChartEventType('');
+                  setKmChartGroup1('');
+                  setKmChartGroup2('');
+                  setShowKMChart(true);
+
+                  // イベントタイプを取得
+                  setKmLoadingEventTypes(true);
+                  try {
+                    const eventTypesSet = new Set();
+                    for (const patient of patients) {
+                      const eventQuery = query(
+                        collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents')
+                      );
+                      const eventSnapshot = await getDocs(eventQuery);
+                      eventSnapshot.docs.forEach(doc => {
+                        const eventType = doc.data().eventType;
+                        if (eventType) eventTypesSet.add(eventType);
+                      });
+                    }
+                    setKmAvailableEventTypes(Array.from(eventTypesSet).sort());
+                  } catch (err) {
+                    console.error('Error fetching event types:', err);
+                  } finally {
+                    setKmLoadingEventTypes(false);
+                  }
+                }}
+                disabled={patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#1e3a5f',
+                  cursor: patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                Kaplan-Meier曲線
+              </button>
+            </div>
+          </div>
+
+          {/* データエクスポートセクション - 灰色 */}
+          <div style={{
+            background: '#f3f4f6',
+            borderRadius: '8px',
+            padding: '16px',
+            border: '1px solid #9ca3af',
+            boxShadow: '0 1px 3px rgba(0,0,0,0.08)'
+          }}>
+            <h3 style={{
+              fontSize: '13px',
+              fontWeight: '600',
+              color: '#4b5563',
+              marginBottom: '12px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '6px',
+              borderBottom: '2px solid #4b5563',
+              paddingBottom: '8px'
+            }}>
+              データエクスポート
+            </h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              <button
+                onClick={exportAllData}
+                disabled={isExporting || patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#6b7280',
+                  opacity: isExporting ? 0.7 : 1,
+                  cursor: isExporting || patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                {isExporting ? 'エクスポート中...' : '患者一覧CSV'}
+              </button>
+              <button
+                onClick={exportAllLabDataCSV}
+                disabled={isExporting || patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#4b5563',
+                  opacity: isExporting ? 0.7 : 1,
+                  cursor: isExporting || patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                全検査データCSV
+              </button>
+              <button
+                onClick={exportAllClinicalDataCSV}
+                disabled={isExporting || patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#374151',
+                  opacity: isExporting ? 0.7 : 1,
+                  cursor: isExporting || patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                全臨床データCSV
+              </button>
+              <button
+                onClick={async () => {
+                  // 群のリストを取得
+                  const groups = [...new Set(patients.map(p => p.group).filter(g => g))];
+                  setKmSelectedGroups(groups);
+                  setKmEventType('');
+                  setShowKMExportModal(true);
+
+                  // 実際に登録されているイベントタイプを取得
+                  setKmLoadingEventTypes(true);
+                  try {
+                    const eventTypesSet = new Set();
+                    for (const patient of patients) {
+                      const eventQuery = query(
+                        collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents')
+                      );
+                      const eventSnapshot = await getDocs(eventQuery);
+                      eventSnapshot.docs.forEach(doc => {
+                        const eventType = doc.data().eventType;
+                        if (eventType) eventTypesSet.add(eventType);
+                      });
+                    }
+                    setKmAvailableEventTypes(Array.from(eventTypesSet).sort());
+                  } catch (err) {
+                    console.error('Error fetching event types:', err);
+                  } finally {
+                    setKmLoadingEventTypes(false);
+                  }
+                }}
+                disabled={patients.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: patients.length === 0 ? '#d1d5db' : '#1e3a5f',
+                  cursor: patients.length === 0 ? 'not-allowed' : 'pointer',
+                  width: '100%',
+                  justifyContent: 'center'
+                }}
+              >
+                KM曲線用データ
+              </button>
+            </div>
+          </div>
         </div>
 
-        {patients.length === 0 ? (
-          <div style={styles.emptyState}>
-            <div style={styles.emptyIcon}>📋</div>
-            <p>登録された患者はまだいません</p>
-            <p style={styles.emptyHint}>「新規患者登録」から始めましょう</p>
-          </div>
-        ) : (
-          <div style={styles.patientGrid}>
+        {/* 患者データセクション */}
+        <div style={{
+          background: '#ffffff',
+          borderRadius: '8px',
+          padding: '20px',
+          border: '1px solid #e5e7eb',
+          boxShadow: '0 1px 3px rgba(0,0,0,0.08)'
+        }}>
+          <h3 style={{
+            fontSize: '14px',
+            fontWeight: '600',
+            color: '#1f2937',
+            marginBottom: '16px',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            borderBottom: '2px solid #1f2937',
+            paddingBottom: '10px'
+          }}>
+            <span>患者データ</span>
+            <span style={{
+              fontSize: '12px',
+              fontWeight: '400',
+              color: '#6b7280'
+            }}>
+              {patients.length} 件登録
+            </span>
+          </h3>
+
+          {patients.length === 0 ? (
+            <div style={styles.emptyState}>
+              <div style={styles.emptyIcon}>📋</div>
+              <p>登録された患者はまだいません</p>
+              <p style={styles.emptyHint}>「新規患者登録」から始めましょう</p>
+            </div>
+          ) : (
+            <div style={styles.patientGrid}>
             {patients.map((patient) => (
               <div
                 key={patient.id}
@@ -5232,7 +6578,8 @@ cat("\\n解析完了！\\n")
               </div>
             ))}
           </div>
-        )}
+          )}
+        </div>
       </main>
 
       {/* 新規患者登録モーダル */}
@@ -8613,6 +9960,1819 @@ cat("\\n解析完了！\\n")
                 onClick={() => setShowSystemAdminPanel(false)}
                 style={styles.cancelButton}
               >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Swimmer Plotモーダル */}
+      {showSwimmerPlot && (
+        <div style={styles.modalOverlay}>
+          <div style={{ ...styles.modalContent, maxWidth: '1200px', width: '95%', maxHeight: '95vh', overflow: 'auto' }}>
+            <h2 style={styles.modalTitle}>🏊 Swimmer Plot（患者別タイムライン）</h2>
+
+            {/* コントロールパネル */}
+            <div style={{ display: 'flex', gap: '16px', marginBottom: '16px', flexWrap: 'wrap', alignItems: 'center' }}>
+              <div>
+                <label style={{ fontSize: '13px', marginRight: '8px' }}>ソート順:</label>
+                <select
+                  value={swimmerSortBy}
+                  onChange={(e) => {
+                    setSwimmerSortBy(e.target.value);
+                    runSwimmerPlot();
+                  }}
+                  style={{ padding: '6px 10px', borderRadius: '6px', border: '1px solid #d1d5db' }}
+                >
+                  <option value="duration">観察期間（長い順）</option>
+                  <option value="onset">発症日順</option>
+                  <option value="id">患者ID順</option>
+                </select>
+              </div>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', cursor: 'pointer', background: '#dbeafe', padding: '4px 8px', borderRadius: '4px' }}>
+                <input
+                  type="checkbox"
+                  checked={swimmerFilterHasData}
+                  onChange={(e) => setSwimmerFilterHasData(e.target.checked)}
+                />
+                データのある患者のみ
+              </label>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={swimmerShowTreatments}
+                  onChange={(e) => setSwimmerShowTreatments(e.target.checked)}
+                />
+                治療薬を表示
+              </label>
+
+              <label style={{ display: 'flex', alignItems: 'center', gap: '4px', fontSize: '13px', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={swimmerShowEvents}
+                  onChange={(e) => setSwimmerShowEvents(e.target.checked)}
+                />
+                臨床イベントを表示
+              </label>
+
+              <div style={{ marginLeft: 'auto', display: 'flex', gap: '8px' }}>
+                <button
+                  onClick={() => {
+                    // SVGエクスポート
+                    const svgElement = document.getElementById('swimmer-plot-svg');
+                    if (!svgElement) return;
+                    const svgData = new XMLSerializer().serializeToString(svgElement);
+                    const blob = new Blob([svgData], { type: 'image/svg+xml' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'swimmer_plot.svg';
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{ padding: '6px 12px', background: '#2563eb', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '12px' }}
+                >
+                  SVG出力
+                </button>
+                <button
+                  onClick={() => {
+                    // PNGエクスポート
+                    const svgElement = document.getElementById('swimmer-plot-svg');
+                    if (!svgElement) return;
+                    const svgData = new XMLSerializer().serializeToString(svgElement);
+                    const canvas = document.createElement('canvas');
+                    const scale = chartExportDpi / 96;
+                    canvas.width = svgElement.width.baseVal.value * scale;
+                    canvas.height = svgElement.height.baseVal.value * scale;
+                    const ctx = canvas.getContext('2d');
+                    ctx.scale(scale, scale);
+                    const img = new Image();
+                    img.onload = () => {
+                      ctx.fillStyle = 'white';
+                      ctx.fillRect(0, 0, canvas.width, canvas.height);
+                      ctx.drawImage(img, 0, 0);
+                      canvas.toBlob((blob) => {
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `swimmer_plot_${chartExportDpi}dpi.png`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                      }, 'image/png');
+                    };
+                    img.src = 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(svgData)));
+                  }}
+                  style={{ padding: '6px 12px', background: '#059669', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '12px' }}
+                >
+                  PNG出力 ({chartExportDpi}DPI)
+                </button>
+              </div>
+            </div>
+
+            {/* Swimmer Plot SVG */}
+            {swimmerData && swimmerData.length > 0 ? (
+              <div style={{ overflowX: 'auto', background: '#fff', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '16px' }}>
+                {(() => {
+                  // フィルタリング：データのある患者のみ
+                  const filteredData = swimmerFilterHasData
+                    ? swimmerData.filter(p => p.treatments.length > 0 || p.events.length > 0 || p.endDay > 30)
+                    : swimmerData;
+
+                  if (filteredData.length === 0) {
+                    return <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>フィルタ条件に一致する患者がいません</div>;
+                  }
+
+                  // 使用されている治療カテゴリとイベントタイプを先に収集
+                  const usedCategoriesForHeight = new Set();
+                  const usedEventTypesForHeight = new Set();
+                  filteredData.forEach(p => {
+                    p.treatments.forEach(t => usedCategoriesForHeight.add(t.category || 'その他'));
+                    (p.events || []).forEach(e => {
+                      const eventType = e.type || e.eventType || 'その他';
+                      if (eventType && eventType !== 'undefined') {
+                        usedEventTypesForHeight.add(eventType);
+                      }
+                    });
+                  });
+
+                  // 凡例を下部に配置するためのサイズ計算（両方の凡例のスペースを確保）
+                  const treatmentLegendRows = Math.ceil(usedCategoriesForHeight.size / 6);
+                  const eventLegendRows = Math.ceil(usedEventTypesForHeight.size / 5);
+                  const bottomLegendHeight =
+                    (swimmerShowTreatments && usedCategoriesForHeight.size > 0 ? 30 + treatmentLegendRows * 18 : 0) +
+                    (swimmerShowEvents && usedEventTypesForHeight.size > 0 ? 30 + eventLegendRows * 18 : 0) + 20;
+
+                  const margin = { top: 40, right: 40, bottom: 50 + bottomLegendHeight, left: 100 };
+                  const rowHeight = 32;
+                  const width = 1100;
+                  const height = margin.top + margin.bottom + filteredData.length * rowHeight;
+
+                  // 最大日数を計算（適切なスケールに調整）
+                  const rawMaxDay = Math.max(...filteredData.map(p => p.endDay));
+                  // きりの良い日数に切り上げ
+                  const maxDay = rawMaxDay <= 30 ? 30 : rawMaxDay <= 60 ? 60 : rawMaxDay <= 90 ? 90 :
+                                 rawMaxDay <= 120 ? 120 : rawMaxDay <= 180 ? 180 : rawMaxDay <= 365 ? 365 :
+                                 Math.ceil(rawMaxDay / 100) * 100;
+
+                  const xScale = (day) => margin.left + (day / maxDay) * (width - margin.left - margin.right);
+                  const yPos = (index) => margin.top + index * rowHeight + rowHeight / 2;
+
+                  // X軸の目盛りを動的に計算
+                  const xTicks = maxDay <= 30 ? [0, 7, 14, 21, 30] :
+                                 maxDay <= 60 ? [0, 15, 30, 45, 60] :
+                                 maxDay <= 90 ? [0, 30, 60, 90] :
+                                 maxDay <= 180 ? [0, 30, 60, 90, 120, 150, 180] :
+                                 maxDay <= 365 ? [0, 30, 60, 90, 180, 270, 365] :
+                                 [0, 100, 200, 300, 400, 500].filter(d => d <= maxDay);
+
+                  // 上で計算済みの変数を参照
+                  const usedCategories = usedCategoriesForHeight;
+                  const usedEventTypes = usedEventTypesForHeight;
+
+                  // イベントシェイプの定義（SVGシンボル）
+                  const eventShapes = {
+                    '意識障害': (x, y, color) => <circle cx={x} cy={y} r="6" fill={color} stroke="#fff" strokeWidth="1" />,
+                    'てんかん発作': (x, y, color) => <polygon points={`${x},${y-7} ${x+6},${y+4} ${x-6},${y+4}`} fill={color} stroke="#fff" strokeWidth="1" />,
+                    '不随意運動': (x, y, color) => <rect x={x-5} y={y-5} width="10" height="10" fill={color} stroke="#fff" strokeWidth="1" transform={`rotate(45 ${x} ${y})`} />,
+                    '麻痺': (x, y, color) => <rect x={x-5} y={y-5} width="10" height="10" fill={color} stroke="#fff" strokeWidth="1" />,
+                    '発熱': (x, y, color) => <polygon points={`${x},${y-7} ${x+3},${y-2} ${x+7},${y-2} ${x+4},${y+2} ${x+5},${y+7} ${x},${y+4} ${x-5},${y+7} ${x-4},${y+2} ${x-7},${y-2} ${x-3},${y-2}`} fill={color} stroke="#fff" strokeWidth="0.5" />,
+                    '人工呼吸器管理': (x, y, color) => <><line x1={x-5} y1={y} x2={x+5} y2={y} stroke={color} strokeWidth="3" /><line x1={x} y1={y-5} x2={x} y2={y+5} stroke={color} strokeWidth="3" /></>,
+                    'ICU入室': (x, y, color) => <><circle cx={x} cy={y} r="7" fill="none" stroke={color} strokeWidth="2" /><circle cx={x} cy={y} r="3" fill={color} /></>,
+                    'default': (x, y, color) => <circle cx={x} cy={y} r="5" fill={color} stroke="#fff" strokeWidth="1" />
+                  };
+
+                  return (
+                    <svg id="swimmer-plot-svg" width={width} height={height} style={{ fontFamily: chartFontFamily === 'times' ? '"Times New Roman", serif' : 'Arial, Helvetica, sans-serif' }}>
+                      {/* 背景 */}
+                      <rect x="0" y="0" width={width} height={height} fill="white" />
+
+                      {/* タイトル */}
+                      <text x={width / 2} y="20" textAnchor="middle" fontSize="16" fontWeight="bold" fill="#1f2937">
+                        Swimmer Plot - 患者別治療経過タイムライン
+                      </text>
+
+                      {/* X軸 */}
+                      <line x1={margin.left} y1={height - margin.bottom} x2={width - margin.right} y2={height - margin.bottom} stroke="#374151" strokeWidth="1" />
+                      {xTicks.map(day => (
+                        <g key={day}>
+                          <line x1={xScale(day)} y1={height - margin.bottom} x2={xScale(day)} y2={height - margin.bottom + 5} stroke="#374151" />
+                          <text x={xScale(day)} y={height - margin.bottom + 20} textAnchor="middle" fontSize="11" fill="#6b7280">
+                            Day {day}
+                          </text>
+                        </g>
+                      ))}
+                      <text x={(margin.left + width - margin.right) / 2} y={height - margin.bottom + 40} textAnchor="middle" fontSize="12" fill="#374151">
+                        発症からの日数
+                      </text>
+
+                      {/* Y軸（患者ID） */}
+                      <line x1={margin.left} y1={margin.top} x2={margin.left} y2={height - margin.bottom} stroke="#374151" strokeWidth="1" />
+
+                      {/* グリッド線 */}
+                      {xTicks.filter(d => d > 0).map(day => (
+                        <line key={`grid-${day}`} x1={xScale(day)} y1={margin.top} x2={xScale(day)} y2={height - margin.bottom} stroke="#e5e7eb" strokeDasharray="4,4" />
+                      ))}
+
+                      {/* 各患者のデータ */}
+                      {filteredData.map((patient, index) => (
+                        <g key={patient.id}>
+                          {/* 患者ID */}
+                          <text x={margin.left - 10} y={yPos(index) + 4} textAnchor="end" fontSize="11" fill="#374151" fontWeight="500">
+                            {patient.displayId}
+                          </text>
+
+                          {/* ベースライン（観察期間） */}
+                          <line
+                            x1={xScale(patient.startDay)}
+                            y1={yPos(index)}
+                            x2={xScale(patient.endDay)}
+                            y2={yPos(index)}
+                            stroke="#9ca3af"
+                            strokeWidth="4"
+                            strokeLinecap="round"
+                          />
+
+                          {/* 治療バー */}
+                          {swimmerShowTreatments && patient.treatments.map((treatment, tIdx) => {
+                            const color = treatmentColorMap[treatment.category] || treatmentColorMap['その他'];
+                            const yOffset = (tIdx % 3 - 1) * 5;
+                            return (
+                              <g key={`${patient.id}-t-${tIdx}`}>
+                                <rect
+                                  x={xScale(treatment.dayStart)}
+                                  y={yPos(index) - 5 + yOffset}
+                                  width={Math.max(xScale(treatment.dayEnd) - xScale(treatment.dayStart), 4)}
+                                  height="10"
+                                  fill={color}
+                                  rx="2"
+                                  opacity="0.85"
+                                >
+                                  <title>{treatment.name}: Day {treatment.dayStart} - Day {treatment.dayEnd}{treatment.ongoing ? ' (継続中)' : ''}</title>
+                                </rect>
+                                {treatment.ongoing && (
+                                  <polygon
+                                    points={`${xScale(treatment.dayEnd)},${yPos(index) + yOffset} ${xScale(treatment.dayEnd) + 10},${yPos(index) + yOffset} ${xScale(treatment.dayEnd)},${yPos(index) - 5 + yOffset}`}
+                                    fill={color}
+                                    opacity="0.85"
+                                  />
+                                )}
+                              </g>
+                            );
+                          })}
+
+                          {/* イベントマーカー（SVGシェイプ） */}
+                          {swimmerShowEvents && patient.events.map((event, eIdx) => {
+                            const eventStyle = eventSymbolMap[event.type] || eventSymbolMap['default'];
+                            const shapeRenderer = eventShapes[event.type] || eventShapes['default'];
+                            // イベントが重なる場合、Y方向に少しオフセット
+                            const yOffset = (eIdx % 2) * 12 - 6;
+                            return (
+                              <g key={`${patient.id}-e-${eIdx}`}>
+                                <title>{event.type}: Day {event.day}</title>
+                                {shapeRenderer(xScale(event.day), yPos(index) + yOffset, eventStyle.color)}
+                              </g>
+                            );
+                          })}
+                        </g>
+                      ))}
+
+                      {/* 凡例 - 下部に横並び配置 */}
+                      {/* 臨床イベント凡例（先に表示） */}
+                      {swimmerShowEvents && (
+                        <g transform={`translate(${margin.left}, ${height - bottomLegendHeight + 10})`}>
+                          <text x="0" y="0" fontSize="11" fontWeight="bold" fill="#1f2937">【臨床イベント】({usedEventTypes.size}種類)</text>
+                          {Array.from(usedEventTypes).map((eventType, idx) => {
+                            const style = eventSymbolMap[eventType] || eventSymbolMap['default'];
+                            const shapeRenderer = eventShapes[eventType] || eventShapes['default'];
+                            const col = idx % 5;
+                            const row = Math.floor(idx / 5);
+                            return (
+                              <g key={eventType} transform={`translate(${col * 160}, ${18 + row * 20})`}>
+                                <g transform="translate(8, -2)">
+                                  {shapeRenderer(0, 0, style.color)}
+                                </g>
+                                <text x="22" y="2" fontSize="10" fill="#374151">{eventType}</text>
+                              </g>
+                            );
+                          })}
+                        </g>
+                      )}
+
+                      {/* 治療薬凡例（後に表示） */}
+                      {swimmerShowTreatments && usedCategories.size > 0 && (
+                        <g transform={`translate(${margin.left}, ${height - bottomLegendHeight + 10 + (swimmerShowEvents && usedEventTypes.size > 0 ? Math.ceil(usedEventTypes.size / 5) * 20 + 35 : 0)})`}>
+                          <text x="0" y="0" fontSize="11" fontWeight="bold" fill="#1f2937">【治療薬】</text>
+                          {Array.from(usedCategories).map((category, idx) => {
+                            const col = idx % 6;
+                            const row = Math.floor(idx / 6);
+                            return (
+                              <g key={category} transform={`translate(${col * 130}, ${18 + row * 18})`}>
+                                <rect x="0" y="-7" width="14" height="9" fill={treatmentColorMap[category] || treatmentColorMap['その他']} rx="2" />
+                                <text x="18" y="1" fontSize="9" fill="#374151">{category}</text>
+                              </g>
+                            );
+                          })}
+                        </g>
+                      )}
+                    </svg>
+                  );
+                })()}
+              </div>
+            ) : (
+              <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>
+                {swimmerData === null ? 'データを読み込み中...' : '表示可能なデータがありません。患者に発症日・治療薬・臨床イベントを登録してください。'}
+              </div>
+            )}
+
+            {/* Rスクリプト出力 */}
+            {swimmerData && swimmerData.length > 0 && (
+              <div style={{ marginTop: '16px' }}>
+                <button
+                  onClick={() => {
+                    // Rスクリプト生成
+                    let rScript = `# Swimmer Plot R Script
+# Generated from Clinical Data Registry
+
+library(ggplot2)
+library(dplyr)
+
+# 患者データ
+patients <- data.frame(
+  patient_id = c(${swimmerData.map(p => `"${p.displayId}"`).join(', ')}),
+  start_day = c(${swimmerData.map(p => p.startDay).join(', ')}),
+  end_day = c(${swimmerData.map(p => p.endDay).join(', ')}),
+  group = c(${swimmerData.map(p => `"${p.group}"`).join(', ')})
+)
+
+# 治療データ
+treatments <- data.frame(
+  patient_id = character(),
+  treatment = character(),
+  category = character(),
+  day_start = numeric(),
+  day_end = numeric(),
+  ongoing = logical()
+)
+
+${swimmerData.filter(p => p.treatments.length > 0).map(p =>
+  p.treatments.map(t =>
+    `treatments <- rbind(treatments, data.frame(patient_id="${p.displayId}", treatment="${t.name}", category="${t.category}", day_start=${t.dayStart}, day_end=${t.dayEnd}, ongoing=${t.ongoing ? 'TRUE' : 'FALSE'}))`
+  ).join('\n')
+).join('\n')}
+
+# イベントデータ
+events <- data.frame(
+  patient_id = character(),
+  event_type = character(),
+  day = numeric()
+)
+
+${swimmerData.filter(p => p.events.length > 0).map(p =>
+  p.events.map(e =>
+    `events <- rbind(events, data.frame(patient_id="${p.displayId}", event_type="${e.type}", day=${e.day}))`
+  ).join('\n')
+).join('\n')}
+
+# 患者IDの順序を設定
+patients$patient_id <- factor(patients$patient_id, levels = rev(patients$patient_id))
+
+# Swimmer Plot
+ggplot() +
+  # ベースライン
+  geom_segment(data = patients, aes(x = start_day, xend = end_day, y = patient_id, yend = patient_id),
+               color = "gray80", linewidth = 2) +
+  # 治療バー
+  geom_segment(data = treatments, aes(x = day_start, xend = day_end, y = patient_id, yend = patient_id, color = category),
+               linewidth = 4, alpha = 0.7) +
+  # イベントマーカー
+  geom_point(data = events, aes(x = day, y = patient_id, shape = event_type), size = 3) +
+  # ラベル
+  labs(x = "Days from Onset", y = "Patient", title = "Swimmer Plot", color = "Treatment", shape = "Event") +
+  theme_minimal() +
+  theme(
+    axis.text.y = element_text(size = 9),
+    legend.position = "right"
+  )
+
+ggsave("swimmer_plot.pdf", width = 12, height = ${Math.max(6, swimmerData.length * 0.4)}, units = "in")
+`;
+                    const blob = new Blob([rScript], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'swimmer_plot.R';
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{ padding: '6px 12px', background: '#7c3aed', color: 'white', border: 'none', borderRadius: '6px', cursor: 'pointer', fontSize: '12px' }}
+                >
+                  📊 Rスクリプト出力
+                </button>
+              </div>
+            )}
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => setShowSwimmerPlot(false)}
+                style={styles.cancelButton}
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* スパゲッティプロットモーダル */}
+      {showSpaghettiPlot && (
+        <div style={styles.modalOverlay}>
+          <div style={{ ...styles.modal, maxWidth: '1200px', width: '95%', maxHeight: '95vh', overflow: 'auto' }}>
+            <h2 style={styles.modalTitle}>スパゲッティプロット（個別患者の検査値推移）</h2>
+
+            {/* コントロールパネル */}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+              gap: '16px',
+              marginBottom: '20px',
+              padding: '16px',
+              background: '#f9fafb',
+              borderRadius: '8px'
+            }}>
+              {/* 検査項目選択 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                  検査項目 {spaghettiData?.labItems ? `(${spaghettiData.labItems.length}項目)` : '(読み込み中...)'}
+                </label>
+                {spaghettiData?.labItems && spaghettiData.labItems.length > 0 ? (
+                  <select
+                    value={spaghettiSelectedItem}
+                    onChange={(e) => setSpaghettiSelectedItem(e.target.value)}
+                    style={{
+                      ...styles.input,
+                      width: '100%',
+                      padding: '8px 12px',
+                      fontSize: '14px',
+                      border: '1px solid #d1d5db',
+                      borderRadius: '6px',
+                      backgroundColor: '#fff',
+                      cursor: 'pointer'
+                    }}
+                  >
+                    {spaghettiData.labItems.map(item => (
+                      <option key={item} value={item}>{item}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <div style={{ padding: '8px', color: '#6b7280', fontSize: '13px' }}>
+                    {spaghettiData === null ? '読み込み中...' : '検査データがありません'}
+                  </div>
+                )}
+              </div>
+
+              {/* 表示オプション */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>表示オプション</label>
+                <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' }}>
+                    <input
+                      type="checkbox"
+                      checked={spaghettiColorByGroup}
+                      onChange={(e) => setSpaghettiColorByGroup(e.target.checked)}
+                    />
+                    群ごとに色分け
+                  </label>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' }}>
+                    <input
+                      type="checkbox"
+                      checked={spaghettiShowPoints}
+                      onChange={(e) => setSpaghettiShowPoints(e.target.checked)}
+                    />
+                    データポイントを表示
+                  </label>
+                </div>
+              </div>
+
+              {/* 患者選択 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                  患者選択 ({spaghettiSelectedPatients.length}/{patients.length})
+                </label>
+                <div style={{ display: 'flex', gap: '8px' }}>
+                  <button
+                    onClick={() => setSpaghettiSelectedPatients(patients.map(p => p.id))}
+                    style={{ ...styles.addButton, padding: '4px 8px', fontSize: '11px', backgroundColor: '#3b82f6' }}
+                  >
+                    全選択
+                  </button>
+                  <button
+                    onClick={() => setSpaghettiSelectedPatients([])}
+                    style={{ ...styles.addButton, padding: '4px 8px', fontSize: '11px', backgroundColor: '#6b7280' }}
+                  >
+                    全解除
+                  </button>
+                </div>
+              </div>
+
+              {/* エクスポート */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>エクスポート</label>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  <button
+                    onClick={() => {
+                      const svgElement = spaghettiChartRef.current?.querySelector('svg');
+                      if (!svgElement) return;
+                      const svgData = new XMLSerializer().serializeToString(svgElement);
+                      const blob = new Blob([svgData], { type: 'image/svg+xml' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `spaghetti_plot_${spaghettiSelectedItem}_${new Date().toISOString().split('T')[0]}.svg`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    style={{ ...styles.addButton, padding: '4px 8px', fontSize: '11px', backgroundColor: '#059669' }}
+                  >
+                    SVG
+                  </button>
+                  <button
+                    onClick={() => {
+                      const svgElement = spaghettiChartRef.current?.querySelector('svg');
+                      if (!svgElement) return;
+                      const canvas = document.createElement('canvas');
+                      const ctx = canvas.getContext('2d');
+                      const svgData = new XMLSerializer().serializeToString(svgElement);
+                      const img = new Image();
+                      const svgBlob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
+                      const url = URL.createObjectURL(svgBlob);
+                      img.onload = () => {
+                        canvas.width = img.width * 2;
+                        canvas.height = img.height * 2;
+                        ctx.scale(2, 2);
+                        ctx.fillStyle = 'white';
+                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        ctx.drawImage(img, 0, 0);
+                        canvas.toBlob((blob) => {
+                          const a = document.createElement('a');
+                          a.href = URL.createObjectURL(blob);
+                          a.download = `spaghetti_plot_${spaghettiSelectedItem}_300dpi.png`;
+                          a.click();
+                        }, 'image/png');
+                        URL.revokeObjectURL(url);
+                      };
+                      img.src = url;
+                    }}
+                    style={{ ...styles.addButton, padding: '4px 8px', fontSize: '11px', backgroundColor: '#7c3aed' }}
+                  >
+                    PNG
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* 群別凡例 */}
+            {spaghettiColorByGroup && spaghettiData?.groups && (
+              <div style={{
+                display: 'flex',
+                gap: '16px',
+                flexWrap: 'wrap',
+                marginBottom: '16px',
+                padding: '12px',
+                background: '#f3f4f6',
+                borderRadius: '6px'
+              }}>
+                <span style={{ fontWeight: '600', fontSize: '13px', color: '#374151' }}>【群】</span>
+                {spaghettiData.groups.map((group, idx) => (
+                  <span key={group} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' }}>
+                    <span style={{
+                      width: '20px',
+                      height: '3px',
+                      backgroundColor: getGroupColor(group, spaghettiData.groups),
+                      display: 'inline-block'
+                    }}></span>
+                    {group}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* グラフ表示エリア */}
+            <div ref={spaghettiChartRef} style={{ background: '#fff', padding: '20px', borderRadius: '8px', border: '1px solid #e5e7eb' }}>
+              {spaghettiData && spaghettiSelectedItem ? (() => {
+                // 選択された検査項目のデータをフィルタリング
+                const filteredPatients = spaghettiData.patients
+                  .filter(p => spaghettiSelectedPatients.includes(p.id))
+                  .map(p => ({
+                    ...p,
+                    dataPoints: p.dataPoints.filter(d => d.item === spaghettiSelectedItem && d.day !== null)
+                  }))
+                  .filter(p => p.dataPoints.length > 0);
+
+                if (filteredPatients.length === 0) {
+                  return <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>選択した検査項目のデータがありません</div>;
+                }
+
+                // スケール計算
+                const allDays = filteredPatients.flatMap(p => p.dataPoints.map(d => d.day));
+                const allValues = filteredPatients.flatMap(p => p.dataPoints.map(d => d.value));
+                const minDay = Math.min(...allDays);
+                const maxDay = Math.max(...allDays);
+                const minValue = Math.min(...allValues);
+                const maxValue = Math.max(...allValues);
+                const valueRange = maxValue - minValue || 1;
+                const dayRange = maxDay - minDay || 1;
+
+                const margin = { top: 40, right: 120, bottom: 60, left: 80 };
+                const width = 900;
+                const height = 500;
+                const chartWidth = width - margin.left - margin.right;
+                const chartHeight = height - margin.top - margin.bottom;
+
+                const xScale = (day) => margin.left + ((day - minDay) / dayRange) * chartWidth;
+                const yScale = (value) => height - margin.bottom - ((value - minValue) / valueRange) * chartHeight;
+
+                // Y軸の目盛り
+                const yTickCount = 6;
+                const yTicks = Array.from({ length: yTickCount }, (_, i) => minValue + (valueRange * i) / (yTickCount - 1));
+
+                // X軸の目盛り
+                const xTickCount = Math.min(10, dayRange + 1);
+                const xTicks = Array.from({ length: xTickCount }, (_, i) => Math.round(minDay + (dayRange * i) / (xTickCount - 1)));
+
+                // 単位を取得
+                const unit = filteredPatients[0]?.dataPoints[0]?.unit || '';
+
+                return (
+                  <svg width={width} height={height} style={{ fontFamily: 'Arial, sans-serif' }}>
+                    {/* 背景 */}
+                    <rect x="0" y="0" width={width} height={height} fill="white" />
+
+                    {/* タイトル */}
+                    <text x={width / 2} y="25" textAnchor="middle" fontSize="16" fontWeight="bold" fill="#1f2937">
+                      {spaghettiSelectedItem} の経時変化
+                    </text>
+
+                    {/* グリッド線 */}
+                    {yTicks.map(tick => (
+                      <line key={`y-grid-${tick}`} x1={margin.left} y1={yScale(tick)} x2={width - margin.right} y2={yScale(tick)} stroke="#e5e7eb" strokeDasharray="4,4" />
+                    ))}
+                    {xTicks.map(tick => (
+                      <line key={`x-grid-${tick}`} x1={xScale(tick)} y1={margin.top} x2={xScale(tick)} y2={height - margin.bottom} stroke="#e5e7eb" strokeDasharray="4,4" />
+                    ))}
+
+                    {/* 軸 */}
+                    <line x1={margin.left} y1={height - margin.bottom} x2={width - margin.right} y2={height - margin.bottom} stroke="#374151" strokeWidth="1" />
+                    <line x1={margin.left} y1={margin.top} x2={margin.left} y2={height - margin.bottom} stroke="#374151" strokeWidth="1" />
+
+                    {/* X軸ラベル */}
+                    {xTicks.map(tick => (
+                      <g key={`x-tick-${tick}`}>
+                        <line x1={xScale(tick)} y1={height - margin.bottom} x2={xScale(tick)} y2={height - margin.bottom + 5} stroke="#374151" />
+                        <text x={xScale(tick)} y={height - margin.bottom + 18} textAnchor="middle" fontSize="11" fill="#6b7280">
+                          {tick}
+                        </text>
+                      </g>
+                    ))}
+                    <text x={(margin.left + width - margin.right) / 2} y={height - 15} textAnchor="middle" fontSize="12" fill="#374151">
+                      発症からの日数
+                    </text>
+
+                    {/* Y軸ラベル */}
+                    {yTicks.map(tick => (
+                      <g key={`y-tick-${tick}`}>
+                        <line x1={margin.left - 5} y1={yScale(tick)} x2={margin.left} y2={yScale(tick)} stroke="#374151" />
+                        <text x={margin.left - 10} y={yScale(tick) + 4} textAnchor="end" fontSize="11" fill="#6b7280">
+                          {tick.toFixed(1)}
+                        </text>
+                      </g>
+                    ))}
+                    <text x={25} y={height / 2} textAnchor="middle" fontSize="12" fill="#374151" transform={`rotate(-90, 25, ${height / 2})`}>
+                      {spaghettiSelectedItem} {unit ? `(${unit})` : ''}
+                    </text>
+
+                    {/* データライン */}
+                    {filteredPatients.map((patient, pIdx) => {
+                      const sortedPoints = [...patient.dataPoints].sort((a, b) => a.day - b.day);
+                      if (sortedPoints.length < 1) return null;
+
+                      const color = spaghettiColorByGroup
+                        ? getGroupColor(patient.group, spaghettiData.groups)
+                        : `hsl(${(pIdx * 360) / filteredPatients.length}, 70%, 50%)`;
+
+                      const pathD = sortedPoints
+                        .map((d, i) => `${i === 0 ? 'M' : 'L'} ${xScale(d.day)} ${yScale(d.value)}`)
+                        .join(' ');
+
+                      return (
+                        <g key={patient.id}>
+                          <path d={pathD} fill="none" stroke={color} strokeWidth="1.5" opacity="0.7" />
+                          {spaghettiShowPoints && sortedPoints.map((d, i) => (
+                            <circle key={i} cx={xScale(d.day)} cy={yScale(d.value)} r="3" fill={color} opacity="0.8">
+                              <title>{patient.displayId}: Day {d.day}, {d.value} {unit}</title>
+                            </circle>
+                          ))}
+                          {/* 最後のポイントに患者IDラベル */}
+                          {sortedPoints.length > 0 && (
+                            <text
+                              x={xScale(sortedPoints[sortedPoints.length - 1].day) + 5}
+                              y={yScale(sortedPoints[sortedPoints.length - 1].value) + 4}
+                              fontSize="9"
+                              fill={color}
+                            >
+                              {patient.displayId}
+                            </text>
+                          )}
+                        </g>
+                      );
+                    })}
+                  </svg>
+                );
+              })() : (
+                <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>
+                  {spaghettiData === null ? 'データを読み込み中...' : '検査項目を選択してください'}
+                </div>
+              )}
+            </div>
+
+            {/* Rスクリプト・CSVエクスポート */}
+            {spaghettiData && spaghettiSelectedItem && (
+              <div style={{ marginTop: '16px', display: 'flex', gap: '8px' }}>
+                <button
+                  onClick={() => {
+                    // CSVエクスポート
+                    const filteredPatients = spaghettiData.patients
+                      .filter(p => spaghettiSelectedPatients.includes(p.id))
+                      .map(p => ({
+                        ...p,
+                        dataPoints: p.dataPoints.filter(d => d.item === spaghettiSelectedItem && d.day !== null)
+                      }))
+                      .filter(p => p.dataPoints.length > 0);
+
+                    let csv = 'patient_id,group,day,value,date\n';
+                    filteredPatients.forEach(p => {
+                      p.dataPoints.forEach(d => {
+                        csv += `${p.displayId},${p.group},${d.day},${d.value},${d.date || ''}\n`;
+                      });
+                    });
+
+                    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+                    const blob = new Blob([bom, csv], { type: 'text/csv;charset=utf-8' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `spaghetti_data_${spaghettiSelectedItem}_${new Date().toISOString().split('T')[0]}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{ ...styles.addButton, backgroundColor: '#059669' }}
+                >
+                  CSVエクスポート
+                </button>
+                <button
+                  onClick={() => {
+                    // Rスクリプト生成
+                    const filteredPatients = spaghettiData.patients
+                      .filter(p => spaghettiSelectedPatients.includes(p.id))
+                      .map(p => ({
+                        ...p,
+                        dataPoints: p.dataPoints.filter(d => d.item === spaghettiSelectedItem && d.day !== null)
+                      }))
+                      .filter(p => p.dataPoints.length > 0);
+
+                    const rScript = `# Spaghetti Plot R Script
+# Generated from Clinical Data Registry
+# Item: ${spaghettiSelectedItem}
+
+library(ggplot2)
+library(dplyr)
+
+# データ読み込み（CSVファイルから）
+# data <- read.csv("spaghetti_data_${spaghettiSelectedItem}.csv")
+
+# または直接データを定義
+data <- data.frame(
+  patient_id = c(${filteredPatients.flatMap(p => p.dataPoints.map(() => `"${p.displayId}"`)).join(', ')}),
+  group = c(${filteredPatients.flatMap(p => p.dataPoints.map(() => `"${p.group}"`)).join(', ')}),
+  day = c(${filteredPatients.flatMap(p => p.dataPoints.map(d => d.day)).join(', ')}),
+  value = c(${filteredPatients.flatMap(p => p.dataPoints.map(d => d.value)).join(', ')})
+)
+
+# スパゲッティプロット
+p <- ggplot(data, aes(x = day, y = value, group = patient_id, color = group)) +
+  geom_line(alpha = 0.7) +
+  geom_point(alpha = 0.8, size = 2) +
+  labs(
+    title = "${spaghettiSelectedItem} の経時変化",
+    x = "発症からの日数",
+    y = "${spaghettiSelectedItem}",
+    color = "群"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    legend.position = "right"
+  )
+
+print(p)
+
+# 保存
+ggsave("spaghetti_plot_${spaghettiSelectedItem}.pdf", p, width = 10, height = 6)
+ggsave("spaghetti_plot_${spaghettiSelectedItem}.png", p, width = 10, height = 6, dpi = 300)
+`;
+
+                    const blob = new Blob([rScript], { type: 'text/plain;charset=utf-8' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `spaghetti_plot_${spaghettiSelectedItem}_${new Date().toISOString().split('T')[0]}.R`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{ ...styles.addButton, backgroundColor: '#2563eb' }}
+                >
+                  Rスクリプト
+                </button>
+              </div>
+            )}
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => setShowSpaghettiPlot(false)}
+                style={styles.cancelButton}
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ヒートマップモーダル */}
+      {showHeatmap && (
+        <div style={styles.modalOverlay}>
+          <div style={{ ...styles.modal, maxWidth: '1400px', width: '95%', maxHeight: '95vh', overflow: 'auto' }}>
+            <h2 style={styles.modalTitle}>ヒートマップ（検査値の患者間比較）</h2>
+
+            {/* コントロールパネル */}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))',
+              gap: '16px',
+              marginBottom: '20px',
+              padding: '16px',
+              background: '#f9fafb',
+              borderRadius: '8px'
+            }}>
+              {/* 検査項目選択 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                  検査項目 {heatmapData?.labItems ? `(${heatmapSelectedItems.length}/${heatmapData.labItems.length}選択)` : '(読み込み中...)'}
+                </label>
+                {heatmapData?.labItems && heatmapData.labItems.length > 0 ? (
+                  <div style={{ maxHeight: '150px', overflowY: 'auto', border: '1px solid #e5e7eb', borderRadius: '6px', padding: '8px', backgroundColor: '#fff' }}>
+                    <div style={{ marginBottom: '8px', display: 'flex', gap: '8px' }}>
+                      <button
+                        onClick={() => setHeatmapSelectedItems(heatmapData.labItems.slice(0, 10))}
+                        style={{ ...styles.addButton, padding: '2px 6px', fontSize: '10px', backgroundColor: '#3b82f6' }}
+                      >
+                        上位10項目
+                      </button>
+                      <button
+                        onClick={() => setHeatmapSelectedItems([])}
+                        style={{ ...styles.addButton, padding: '2px 6px', fontSize: '10px', backgroundColor: '#6b7280' }}
+                      >
+                        全解除
+                      </button>
+                    </div>
+                    {heatmapData.labItems.map(item => (
+                      <label key={item} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', padding: '2px 0' }}>
+                        <input
+                          type="checkbox"
+                          checked={heatmapSelectedItems.includes(item)}
+                          onChange={(e) => {
+                            if (e.target.checked) {
+                              setHeatmapSelectedItems([...heatmapSelectedItems, item]);
+                            } else {
+                              setHeatmapSelectedItems(heatmapSelectedItems.filter(i => i !== item));
+                            }
+                          }}
+                        />
+                        {item}
+                      </label>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ padding: '8px', color: '#6b7280', fontSize: '13px' }}>
+                    {heatmapData === null ? '読み込み中...' : '検査データがありません'}
+                  </div>
+                )}
+              </div>
+
+              {/* 患者選択 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                  患者選択 {heatmapData?.patients ? `(${heatmapSelectedPatients.length}/${heatmapData.patients.length}名)` : ''}
+                </label>
+                {heatmapData?.patients && heatmapData.patients.length > 0 ? (
+                  <div style={{ maxHeight: '150px', overflowY: 'auto', border: '1px solid #e5e7eb', borderRadius: '6px', padding: '8px', backgroundColor: '#fff' }}>
+                    <div style={{ marginBottom: '8px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                      <button
+                        onClick={() => setHeatmapSelectedPatients(heatmapData.patients.map(p => p.id))}
+                        style={{ ...styles.addButton, padding: '2px 6px', fontSize: '10px', backgroundColor: '#3b82f6' }}
+                      >
+                        全選択
+                      </button>
+                      <button
+                        onClick={() => setHeatmapSelectedPatients([])}
+                        style={{ ...styles.addButton, padding: '2px 6px', fontSize: '10px', backgroundColor: '#6b7280' }}
+                      >
+                        全解除
+                      </button>
+                      {/* 群ごとの選択ボタン */}
+                      {heatmapData.groups.map(group => (
+                        <button
+                          key={group}
+                          onClick={() => {
+                            const groupPatientIds = heatmapData.patients.filter(p => p.group === group).map(p => p.id);
+                            const currentlySelected = heatmapSelectedPatients.filter(id => groupPatientIds.includes(id));
+                            if (currentlySelected.length === groupPatientIds.length) {
+                              // 全て選択済みなら解除
+                              setHeatmapSelectedPatients(heatmapSelectedPatients.filter(id => !groupPatientIds.includes(id)));
+                            } else {
+                              // そうでなければ追加
+                              const newSelection = [...new Set([...heatmapSelectedPatients, ...groupPatientIds])];
+                              setHeatmapSelectedPatients(newSelection);
+                            }
+                          }}
+                          style={{
+                            ...styles.addButton,
+                            padding: '2px 6px',
+                            fontSize: '10px',
+                            backgroundColor: getGroupColor(group, heatmapData.groups),
+                            opacity: heatmapSelectedPatients.filter(id => heatmapData.patients.find(p => p.id === id)?.group === group).length > 0 ? 1 : 0.5
+                          }}
+                        >
+                          {group}
+                        </button>
+                      ))}
+                    </div>
+                    {heatmapData.patients
+                      .sort((a, b) => {
+                        const groupCompare = (a.group || '').localeCompare(b.group || '');
+                        if (groupCompare !== 0) return groupCompare;
+                        return (a.displayId || '').localeCompare(b.displayId || '');
+                      })
+                      .map(patient => (
+                        <label key={patient.id} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', padding: '2px 0' }}>
+                          <input
+                            type="checkbox"
+                            checked={heatmapSelectedPatients.includes(patient.id)}
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setHeatmapSelectedPatients([...heatmapSelectedPatients, patient.id]);
+                              } else {
+                                setHeatmapSelectedPatients(heatmapSelectedPatients.filter(id => id !== patient.id));
+                              }
+                            }}
+                          />
+                          <span style={{
+                            width: '8px',
+                            height: '8px',
+                            backgroundColor: getGroupColor(patient.group, heatmapData.groups),
+                            borderRadius: '2px',
+                            display: 'inline-block'
+                          }}></span>
+                          {patient.displayId} ({patient.group})
+                        </label>
+                      ))}
+                  </div>
+                ) : null}
+              </div>
+
+              {/* 時点選択 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>値の選択</label>
+                <select
+                  value={heatmapTimepoint}
+                  onChange={(e) => setHeatmapTimepoint(e.target.value)}
+                  style={{ ...styles.input, width: '100%', padding: '8px', fontSize: '13px' }}
+                >
+                  <option value="first">最初の値</option>
+                  <option value="last">最後の値</option>
+                  <option value="peak">ピーク値（最大）</option>
+                  <option value="mean">平均値</option>
+                </select>
+              </div>
+
+              {/* ソート順 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>並び順</label>
+                <select
+                  value={heatmapSortBy}
+                  onChange={(e) => setHeatmapSortBy(e.target.value)}
+                  style={{ ...styles.input, width: '100%', padding: '8px', fontSize: '13px' }}
+                >
+                  <option value="group">群順</option>
+                  <option value="id">患者ID順</option>
+                </select>
+              </div>
+
+              {/* カラースケール */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>カラースケール</label>
+                <select
+                  value={heatmapColorScale}
+                  onChange={(e) => setHeatmapColorScale(e.target.value)}
+                  style={{ ...styles.input, width: '100%', padding: '8px', fontSize: '13px' }}
+                >
+                  <option value="bluered">青→白→赤</option>
+                  <option value="viridis">Viridis</option>
+                  <option value="grayscale">グレースケール</option>
+                </select>
+              </div>
+
+              {/* エクスポート */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>エクスポート</label>
+                <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                  <button
+                    onClick={() => {
+                      const svgElement = heatmapChartRef.current?.querySelector('svg');
+                      if (!svgElement) return;
+                      const svgData = new XMLSerializer().serializeToString(svgElement);
+                      const blob = new Blob([svgData], { type: 'image/svg+xml' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = `heatmap_${new Date().toISOString().split('T')[0]}.svg`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    style={{ ...styles.addButton, padding: '4px 8px', fontSize: '11px', backgroundColor: '#059669' }}
+                  >
+                    SVG
+                  </button>
+                  <button
+                    onClick={() => {
+                      const svgElement = heatmapChartRef.current?.querySelector('svg');
+                      if (!svgElement) return;
+                      const canvas = document.createElement('canvas');
+                      const ctx = canvas.getContext('2d');
+                      const svgData = new XMLSerializer().serializeToString(svgElement);
+                      const img = new Image();
+                      const svgBlob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
+                      const url = URL.createObjectURL(svgBlob);
+                      img.onload = () => {
+                        const scale = chartExportDpi / 96;
+                        canvas.width = img.width * scale;
+                        canvas.height = img.height * scale;
+                        ctx.scale(scale, scale);
+                        ctx.fillStyle = 'white';
+                        ctx.fillRect(0, 0, canvas.width, canvas.height);
+                        ctx.drawImage(img, 0, 0);
+                        canvas.toBlob((blob) => {
+                          const a = document.createElement('a');
+                          a.href = URL.createObjectURL(blob);
+                          a.download = `heatmap_${chartExportDpi}dpi.png`;
+                          a.click();
+                        }, 'image/png');
+                        URL.revokeObjectURL(url);
+                      };
+                      img.src = url;
+                    }}
+                    style={{ ...styles.addButton, padding: '4px 8px', fontSize: '11px', backgroundColor: '#7c3aed' }}
+                  >
+                    PNG
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* 群別凡例 */}
+            {heatmapData?.groups && (
+              <div style={{
+                display: 'flex',
+                gap: '16px',
+                flexWrap: 'wrap',
+                marginBottom: '16px',
+                padding: '12px',
+                background: '#f3f4f6',
+                borderRadius: '6px'
+              }}>
+                <span style={{ fontWeight: '600', fontSize: '13px', color: '#374151' }}>【群】</span>
+                {heatmapData.groups.map((group, idx) => (
+                  <span key={group} style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '13px' }}>
+                    <span style={{
+                      width: '12px',
+                      height: '12px',
+                      backgroundColor: getGroupColor(group, heatmapData.groups),
+                      display: 'inline-block',
+                      borderRadius: '2px'
+                    }}></span>
+                    {group}
+                  </span>
+                ))}
+              </div>
+            )}
+
+            {/* ヒートマップ表示エリア */}
+            <div ref={heatmapChartRef} style={{ background: '#fff', padding: '20px', borderRadius: '8px', border: '1px solid #e5e7eb', overflowX: 'auto' }}>
+              {heatmapData && heatmapSelectedItems.length > 0 && heatmapSelectedPatients.length > 0 ? (() => {
+                // 選択された検査項目のデータを取得
+                const selectedItems = heatmapSelectedItems;
+
+                // 選択された患者をフィルタしてソート
+                const sortedPatients = [...heatmapData.patients]
+                  .filter(p => heatmapSelectedPatients.includes(p.id))
+                  .sort((a, b) => {
+                    if (heatmapSortBy === 'group') {
+                      const groupCompare = (a.group || '').localeCompare(b.group || '');
+                      if (groupCompare !== 0) return groupCompare;
+                      return (a.displayId || '').localeCompare(b.displayId || '');
+                    }
+                    return (a.displayId || '').localeCompare(b.displayId || '');
+                  });
+
+                // 各患者・検査項目の値を計算
+                const getDisplayValue = (patient, item) => {
+                  const values = patient.itemValues[item];
+                  if (!values || values.length === 0) return null;
+
+                  switch (heatmapTimepoint) {
+                    case 'first':
+                      return values[0].value;
+                    case 'last':
+                      return values[values.length - 1].value;
+                    case 'peak':
+                      return Math.max(...values.map(v => v.value));
+                    case 'mean':
+                      return values.reduce((sum, v) => sum + v.value, 0) / values.length;
+                    default:
+                      return values[0].value;
+                  }
+                };
+
+                // 正規化
+                const normalizeValue = (value, item) => {
+                  if (value === null) return null;
+                  const info = heatmapData.itemInfo[item];
+                  if (!info || info.max === info.min) return 0.5;
+                  return (value - info.min) / (info.max - info.min);
+                };
+
+                // サイズ計算
+                const cellWidth = 60;
+                const cellHeight = 24;
+                const labelWidth = 100;
+                const headerHeight = 120;
+                const colorBarHeight = 20;
+                const margin = { top: headerHeight + 20, right: 100, bottom: 60, left: labelWidth + 10 };
+
+                const chartWidth = margin.left + selectedItems.length * cellWidth + margin.right;
+                const chartHeight = margin.top + sortedPatients.length * cellHeight + margin.bottom;
+
+                return (
+                  <svg width={chartWidth} height={chartHeight} style={{ fontFamily: 'Arial, sans-serif' }}>
+                    {/* 背景 */}
+                    <rect x="0" y="0" width={chartWidth} height={chartHeight} fill="white" />
+
+                    {/* タイトル */}
+                    <text x={chartWidth / 2} y="20" textAnchor="middle" fontSize="14" fontWeight="bold" fill="#1f2937">
+                      検査値ヒートマップ（{heatmapTimepoint === 'first' ? '最初の値' : heatmapTimepoint === 'last' ? '最後の値' : heatmapTimepoint === 'peak' ? 'ピーク値' : '平均値'}）
+                    </text>
+
+                    {/* カラースケールバー */}
+                    <defs>
+                      <linearGradient id="heatmapGradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                        <stop offset="0%" stopColor={getHeatmapColor(0, heatmapColorScale)} />
+                        <stop offset="50%" stopColor={getHeatmapColor(0.5, heatmapColorScale)} />
+                        <stop offset="100%" stopColor={getHeatmapColor(1, heatmapColorScale)} />
+                      </linearGradient>
+                    </defs>
+                    <rect x={chartWidth - 180} y="10" width="120" height={colorBarHeight} fill="url(#heatmapGradient)" stroke="#e5e7eb" />
+                    <text x={chartWidth - 185} y="24" textAnchor="end" fontSize="10" fill="#6b7280">低</text>
+                    <text x={chartWidth - 55} y="24" textAnchor="start" fontSize="10" fill="#6b7280">高</text>
+
+                    {/* 検査項目ラベル（X軸） */}
+                    {selectedItems.map((item, idx) => (
+                      <text
+                        key={`header-${item}`}
+                        x={margin.left + idx * cellWidth + cellWidth / 2}
+                        y={margin.top - 10}
+                        textAnchor="end"
+                        fontSize="10"
+                        fill="#374151"
+                        transform={`rotate(-45, ${margin.left + idx * cellWidth + cellWidth / 2}, ${margin.top - 10})`}
+                      >
+                        {item.length > 12 ? item.substring(0, 12) + '...' : item}
+                      </text>
+                    ))}
+
+                    {/* ヒートマップセル */}
+                    {sortedPatients.map((patient, rowIdx) => (
+                      <g key={patient.id}>
+                        {/* 患者ラベル */}
+                        <text
+                          x={margin.left - 8}
+                          y={margin.top + rowIdx * cellHeight + cellHeight / 2 + 4}
+                          textAnchor="end"
+                          fontSize="10"
+                          fill="#374151"
+                        >
+                          {patient.displayId}
+                        </text>
+
+                        {/* 群カラーインジケータ */}
+                        <rect
+                          x={margin.left - 6}
+                          y={margin.top + rowIdx * cellHeight + 2}
+                          width="4"
+                          height={cellHeight - 4}
+                          fill={getGroupColor(patient.group, heatmapData.groups)}
+                        />
+
+                        {/* 各検査項目のセル */}
+                        {selectedItems.map((item, colIdx) => {
+                          const value = getDisplayValue(patient, item);
+                          const normalizedValue = normalizeValue(value, item);
+                          const color = getHeatmapColor(normalizedValue, heatmapColorScale);
+
+                          return (
+                            <g key={`cell-${patient.id}-${item}`}>
+                              <rect
+                                x={margin.left + colIdx * cellWidth}
+                                y={margin.top + rowIdx * cellHeight}
+                                width={cellWidth - 2}
+                                height={cellHeight - 2}
+                                fill={color}
+                                stroke="#fff"
+                                strokeWidth="1"
+                              >
+                                <title>{patient.displayId} - {item}: {value !== null ? value.toFixed(2) : 'N/A'} {heatmapData.itemInfo[item]?.unit || ''}</title>
+                              </rect>
+                              {/* 値を表示（セルが大きい場合） */}
+                              {value !== null && cellWidth >= 50 && (
+                                <text
+                                  x={margin.left + colIdx * cellWidth + (cellWidth - 2) / 2}
+                                  y={margin.top + rowIdx * cellHeight + cellHeight / 2 + 3}
+                                  textAnchor="middle"
+                                  fontSize="8"
+                                  fill={normalizedValue > 0.5 ? '#fff' : '#374151'}
+                                >
+                                  {value.toFixed(1)}
+                                </text>
+                              )}
+                            </g>
+                          );
+                        })}
+                      </g>
+                    ))}
+
+                    {/* 群ごとの区切り線 */}
+                    {heatmapSortBy === 'group' && (() => {
+                      let prevGroup = null;
+                      const lines = [];
+                      sortedPatients.forEach((patient, idx) => {
+                        if (prevGroup !== null && patient.group !== prevGroup) {
+                          lines.push(
+                            <line
+                              key={`divider-${idx}`}
+                              x1={margin.left}
+                              y1={margin.top + idx * cellHeight}
+                              x2={margin.left + selectedItems.length * cellWidth}
+                              y2={margin.top + idx * cellHeight}
+                              stroke="#374151"
+                              strokeWidth="1.5"
+                            />
+                          );
+                        }
+                        prevGroup = patient.group;
+                      });
+                      return lines;
+                    })()}
+                  </svg>
+                );
+              })() : (
+                <div style={{ textAlign: 'center', padding: '40px', color: '#6b7280' }}>
+                  {heatmapData === null ? 'データを読み込み中...' :
+                   heatmapSelectedItems.length === 0 ? '検査項目を選択してください' :
+                   heatmapSelectedPatients.length === 0 ? '患者を選択してください' : ''}
+                </div>
+              )}
+            </div>
+
+            {/* CSVエクスポート */}
+            {heatmapData && heatmapSelectedItems.length > 0 && heatmapSelectedPatients.length > 0 && (
+              <div style={{ marginTop: '16px', display: 'flex', gap: '8px' }}>
+                <button
+                  onClick={() => {
+                    const selectedItems = heatmapSelectedItems;
+                    const sortedPatients = [...heatmapData.patients]
+                      .filter(p => heatmapSelectedPatients.includes(p.id))
+                      .sort((a, b) => {
+                        if (heatmapSortBy === 'group') {
+                          const groupCompare = (a.group || '').localeCompare(b.group || '');
+                          if (groupCompare !== 0) return groupCompare;
+                          return (a.displayId || '').localeCompare(b.displayId || '');
+                        }
+                        return (a.displayId || '').localeCompare(b.displayId || '');
+                      });
+
+                    const getDisplayValue = (patient, item) => {
+                      const values = patient.itemValues[item];
+                      if (!values || values.length === 0) return '';
+                      switch (heatmapTimepoint) {
+                        case 'first': return values[0].value;
+                        case 'last': return values[values.length - 1].value;
+                        case 'peak': return Math.max(...values.map(v => v.value));
+                        case 'mean': return (values.reduce((sum, v) => sum + v.value, 0) / values.length).toFixed(2);
+                        default: return values[0].value;
+                      }
+                    };
+
+                    let csv = 'patient_id,group,diagnosis,' + selectedItems.join(',') + '\n';
+                    sortedPatients.forEach(p => {
+                      const values = selectedItems.map(item => getDisplayValue(p, item));
+                      csv += `${p.displayId},${p.group},${p.diagnosis || ''},${values.join(',')}\n`;
+                    });
+
+                    const bom = new Uint8Array([0xEF, 0xBB, 0xBF]);
+                    const blob = new Blob([bom, csv], { type: 'text/csv;charset=utf-8' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `heatmap_data_${new Date().toISOString().split('T')[0]}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{ ...styles.addButton, backgroundColor: '#059669' }}
+                >
+                  CSVエクスポート
+                </button>
+              </div>
+            )}
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => setShowHeatmap(false)}
+                style={styles.cancelButton}
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Kaplan-Meier用データエクスポートモーダル */}
+      {showKMExportModal && (
+        <div style={styles.modalOverlay}>
+          <div style={{ ...styles.modal, maxWidth: '600px', width: '90%' }}>
+            <h2 style={styles.modalTitle}>Kaplan-Meier解析用データエクスポート</h2>
+
+            <div style={{ marginBottom: '20px', padding: '12px', background: '#f0f9ff', borderRadius: '8px', fontSize: '13px', color: '#0369a1' }}>
+              生存時間解析（Kaplan-Meier曲線）に使用するTidy形式のCSVデータと、Rの解析スクリプトをエクスポートします。
+            </div>
+
+            {/* イベントタイプ選択 */}
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                イベントタイプ（エンドポイント）<span style={{ color: '#ef4444' }}>*</span>
+              </label>
+              {kmLoadingEventTypes ? (
+                <div style={{ padding: '10px', color: '#6b7280', fontSize: '13px' }}>
+                  イベントタイプを読み込み中...
+                </div>
+              ) : kmAvailableEventTypes.length > 0 ? (
+                <select
+                  value={kmEventType}
+                  onChange={(e) => setKmEventType(e.target.value)}
+                  style={{ ...styles.input, width: '100%', padding: '10px' }}
+                >
+                  <option value="">選択してください</option>
+                  {kmAvailableEventTypes.map(eventType => (
+                    <option key={eventType} value={eventType}>{eventType}</option>
+                  ))}
+                </select>
+              ) : (
+                <div style={{ padding: '10px', color: '#ef4444', fontSize: '13px', background: '#fef2f2', borderRadius: '6px' }}>
+                  臨床イベントが登録されていません。患者の詳細画面から臨床イベントを追加してください。
+                </div>
+              )}
+              <p style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>
+                登録済みの臨床イベントから選択（{kmAvailableEventTypes.length}種類）
+              </p>
+            </div>
+
+            {/* 時間単位 */}
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                時間単位
+              </label>
+              <div style={{ display: 'flex', gap: '16px' }}>
+                {[
+                  { value: 'days', label: '日' },
+                  { value: 'weeks', label: '週' },
+                  { value: 'months', label: '月' }
+                ].map(option => (
+                  <label key={option.value} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                    <input
+                      type="radio"
+                      name="kmTimeUnit"
+                      value={option.value}
+                      checked={kmTimeUnit === option.value}
+                      onChange={(e) => setKmTimeUnit(e.target.value)}
+                    />
+                    {option.label}
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* 打ち切り日 */}
+            <div style={{ marginBottom: '16px' }}>
+              <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                打ち切り日（観察終了日）
+              </label>
+              <input
+                type="date"
+                value={kmCensorDate}
+                onChange={(e) => setKmCensorDate(e.target.value)}
+                style={{ ...styles.input, width: '200px', padding: '8px' }}
+              />
+              <p style={{ fontSize: '11px', color: '#6b7280', marginTop: '4px' }}>
+                イベントが発生していない患者の観察終了日。未指定の場合は今日の日付を使用します。
+              </p>
+            </div>
+
+            {/* 群選択 */}
+            <div style={{ marginBottom: '20px' }}>
+              <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                比較する群 <span style={{ color: '#ef4444' }}>*</span>
+              </label>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '12px' }}>
+                {[...new Set(patients.map(p => p.group).filter(g => g))].map(group => (
+                  <label key={group} style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+                    <input
+                      type="checkbox"
+                      checked={kmSelectedGroups.includes(group)}
+                      onChange={(e) => {
+                        if (e.target.checked) {
+                          setKmSelectedGroups([...kmSelectedGroups, group]);
+                        } else {
+                          setKmSelectedGroups(kmSelectedGroups.filter(g => g !== group));
+                        }
+                      }}
+                    />
+                    {group} ({patients.filter(p => p.group === group).length}名)
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            {/* プレビュー情報 */}
+            {kmSelectedGroups.length > 0 && (
+              <div style={{ marginBottom: '20px', padding: '12px', background: '#f9fafb', borderRadius: '8px' }}>
+                <div style={{ fontSize: '13px', fontWeight: '600', marginBottom: '8px' }}>エクスポート対象</div>
+                <div style={{ fontSize: '12px', color: '#4b5563' }}>
+                  対象患者数: {patients.filter(p => kmSelectedGroups.includes(p.group)).length}名
+                  （発症日あり: {patients.filter(p => kmSelectedGroups.includes(p.group) && p.onsetDate).length}名）
+                </div>
+                <div style={{ fontSize: '12px', color: '#4b5563', marginTop: '4px' }}>
+                  群: {kmSelectedGroups.join(', ')}
+                </div>
+              </div>
+            )}
+
+            {/* 出力ファイル説明 */}
+            <div style={{ marginBottom: '20px', padding: '12px', background: '#fef3c7', borderRadius: '8px', fontSize: '12px' }}>
+              <div style={{ fontWeight: '600', marginBottom: '6px', color: '#92400e' }}>出力ファイル</div>
+              <ul style={{ margin: 0, paddingLeft: '20px', color: '#78350f' }}>
+                <li><strong>CSVデータ</strong>: patient_id, group, time, status (0=打ち切り, 1=イベント)</li>
+                <li><strong>Rスクリプト</strong>: survival + survminer パッケージを使用した解析コード</li>
+              </ul>
+            </div>
+
+            <div style={styles.modalActions}>
+              <button
+                onClick={() => setShowKMExportModal(false)}
+                style={styles.cancelButton}
+              >
+                キャンセル
+              </button>
+              <button
+                onClick={exportKMData}
+                disabled={isExporting || !kmEventType || kmSelectedGroups.length === 0}
+                style={{
+                  ...styles.addButton,
+                  backgroundColor: (!kmEventType || kmSelectedGroups.length === 0) ? '#d1d5db' : '#1e3a5f',
+                  opacity: isExporting ? 0.7 : 1
+                }}
+              >
+                {isExporting ? 'エクスポート中...' : 'エクスポート'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Kaplan-Meier曲線モーダル（アプリ内描画） */}
+      {showKMChart && (
+        <div style={styles.modalOverlay}>
+          <div style={{ ...styles.modal, maxWidth: '1000px', width: '95%', maxHeight: '95vh', overflow: 'auto' }}>
+            <h2 style={styles.modalTitle}>Kaplan-Meier曲線（生存時間解析）</h2>
+
+            {/* 設定パネル */}
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))',
+              gap: '16px',
+              marginBottom: '20px',
+              padding: '16px',
+              background: '#f9fafb',
+              borderRadius: '8px'
+            }}>
+              {/* イベントタイプ */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                  イベント（エンドポイント）
+                </label>
+                {kmLoadingEventTypes ? (
+                  <div style={{ fontSize: '12px', color: '#6b7280' }}>読み込み中...</div>
+                ) : (
+                  <select
+                    value={kmChartEventType}
+                    onChange={(e) => { setKmChartEventType(e.target.value); setKmChartData(null); }}
+                    style={{ ...styles.input, width: '100%', padding: '8px', fontSize: '13px' }}
+                  >
+                    <option value="">選択してください</option>
+                    {kmAvailableEventTypes.map(et => (
+                      <option key={et} value={et}>{et}</option>
+                    ))}
+                  </select>
+                )}
+              </div>
+
+              {/* 群1 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                  群1
+                </label>
+                <select
+                  value={kmChartGroup1}
+                  onChange={(e) => { setKmChartGroup1(e.target.value); setKmChartData(null); }}
+                  style={{ ...styles.input, width: '100%', padding: '8px', fontSize: '13px' }}
+                >
+                  <option value="">選択してください</option>
+                  {[...new Set(patients.map(p => p.group).filter(g => g && g !== kmChartGroup2))].map(g => (
+                    <option key={g} value={g}>{g} ({patients.filter(p => p.group === g).length}名)</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* 群2 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>
+                  群2
+                </label>
+                <select
+                  value={kmChartGroup2}
+                  onChange={(e) => { setKmChartGroup2(e.target.value); setKmChartData(null); }}
+                  style={{ ...styles.input, width: '100%', padding: '8px', fontSize: '13px' }}
+                >
+                  <option value="">選択してください</option>
+                  {[...new Set(patients.map(p => p.group).filter(g => g && g !== kmChartGroup1))].map(g => (
+                    <option key={g} value={g}>{g} ({patients.filter(p => p.group === g).length}名)</option>
+                  ))}
+                </select>
+              </div>
+
+              {/* 時間単位 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>時間単位</label>
+                <select
+                  value={kmChartTimeUnit}
+                  onChange={(e) => { setKmChartTimeUnit(e.target.value); setKmChartData(null); }}
+                  style={{ ...styles.input, width: '100%', padding: '8px', fontSize: '13px' }}
+                >
+                  <option value="days">日</option>
+                  <option value="weeks">週</option>
+                  <option value="months">月</option>
+                </select>
+              </div>
+
+              {/* 打ち切り日 */}
+              <div>
+                <label style={{ ...styles.inputLabel, marginBottom: '6px', display: 'block' }}>打ち切り日</label>
+                <input
+                  type="date"
+                  value={kmChartCensorDate}
+                  onChange={(e) => { setKmChartCensorDate(e.target.value); setKmChartData(null); }}
+                  style={{ ...styles.input, width: '100%', padding: '8px', fontSize: '13px' }}
+                />
+              </div>
+
+              {/* 描画ボタン */}
+              <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+                <button
+                  onClick={generateKMChartData}
+                  disabled={kmChartLoading || !kmChartEventType || !kmChartGroup1 || !kmChartGroup2}
+                  style={{
+                    ...styles.addButton,
+                    backgroundColor: (!kmChartEventType || !kmChartGroup1 || !kmChartGroup2) ? '#d1d5db' : '#2563eb',
+                    width: '100%',
+                    justifyContent: 'center',
+                    opacity: kmChartLoading ? 0.7 : 1
+                  }}
+                >
+                  {kmChartLoading ? '計算中...' : '曲線を描画'}
+                </button>
+              </div>
+            </div>
+
+            {/* グラフ表示 */}
+            <div ref={kmChartRef} style={{ background: '#fff', padding: '20px', borderRadius: '8px', border: '1px solid #e5e7eb' }}>
+              {kmChartData ? (() => {
+                const { group1, group2, logRank, maxTime, eventType } = kmChartData;
+                const timeUnit = kmChartTimeUnit === 'days' ? '日' : kmChartTimeUnit === 'weeks' ? '週' : '月';
+
+                const margin = { top: 50, right: 30, bottom: 80, left: 70 };
+                const width = 700;
+                const height = 450;
+                const chartWidth = width - margin.left - margin.right;
+                const chartHeight = height - margin.top - margin.bottom;
+
+                const xMax = Math.ceil(maxTime * 1.1);
+                const xScale = (t) => margin.left + (t / xMax) * chartWidth;
+                const yScale = (s) => margin.top + (1 - s) * chartHeight;
+
+                // 階段状のパスを生成
+                const generateStepPath = (curve) => {
+                  let path = `M ${xScale(0)} ${yScale(1)}`;
+                  let lastY = yScale(1);
+
+                  curve.forEach((point, i) => {
+                    if (i === 0) return;
+                    const x = xScale(point.time);
+                    const y = yScale(point.survival);
+                    // 水平線を引いてから垂直線
+                    path += ` L ${x} ${lastY} L ${x} ${y}`;
+                    lastY = y;
+                  });
+
+                  // 最後まで延長
+                  path += ` L ${xScale(xMax)} ${lastY}`;
+                  return path;
+                };
+
+                const path1 = generateStepPath(group1.curve);
+                const path2 = generateStepPath(group2.curve);
+
+                // Y軸目盛り
+                const yTicks = [0, 0.2, 0.4, 0.6, 0.8, 1.0];
+                // X軸目盛り
+                const xTickCount = 6;
+                const xTicks = Array.from({ length: xTickCount }, (_, i) => Math.round((xMax * i) / (xTickCount - 1)));
+
+                return (
+                  <svg width={width} height={height} style={{ fontFamily: 'Arial, sans-serif' }}>
+                    <rect x="0" y="0" width={width} height={height} fill="white" />
+
+                    {/* タイトル */}
+                    <text x={width / 2} y="25" textAnchor="middle" fontSize="14" fontWeight="bold" fill="#1f2937">
+                      Kaplan-Meier Curve: {eventType}
+                    </text>
+
+                    {/* グリッド */}
+                    {yTicks.map(tick => (
+                      <line key={`y-grid-${tick}`} x1={margin.left} y1={yScale(tick)} x2={width - margin.right} y2={yScale(tick)} stroke="#e5e7eb" strokeDasharray="2,2" />
+                    ))}
+
+                    {/* 軸 */}
+                    <line x1={margin.left} y1={yScale(0)} x2={width - margin.right} y2={yScale(0)} stroke="#374151" />
+                    <line x1={margin.left} y1={yScale(0)} x2={margin.left} y2={yScale(1)} stroke="#374151" />
+
+                    {/* X軸ラベル */}
+                    {xTicks.map(tick => (
+                      <g key={`x-tick-${tick}`}>
+                        <line x1={xScale(tick)} y1={yScale(0)} x2={xScale(tick)} y2={yScale(0) + 5} stroke="#374151" />
+                        <text x={xScale(tick)} y={yScale(0) + 18} textAnchor="middle" fontSize="11" fill="#6b7280">{tick}</text>
+                      </g>
+                    ))}
+                    <text x={(margin.left + width - margin.right) / 2} y={height - 45} textAnchor="middle" fontSize="12" fill="#374151">
+                      Time ({timeUnit})
+                    </text>
+
+                    {/* Y軸ラベル */}
+                    {yTicks.map(tick => (
+                      <g key={`y-tick-${tick}`}>
+                        <line x1={margin.left - 5} y1={yScale(tick)} x2={margin.left} y2={yScale(tick)} stroke="#374151" />
+                        <text x={margin.left - 10} y={yScale(tick) + 4} textAnchor="end" fontSize="11" fill="#6b7280">{(tick * 100).toFixed(0)}%</text>
+                      </g>
+                    ))}
+                    <text x={20} y={height / 2} textAnchor="middle" fontSize="12" fill="#374151" transform={`rotate(-90, 20, ${height / 2})`}>
+                      Event-free Probability
+                    </text>
+
+                    {/* 曲線 */}
+                    <path d={path1} fill="none" stroke="#E64B35" strokeWidth="2" />
+                    <path d={path2} fill="none" stroke="#4DBBD5" strokeWidth="2" />
+
+                    {/* 打ち切りマーク */}
+                    {group1.curve.filter(p => p.censored).map((p, i) => (
+                      <line key={`c1-${i}`} x1={xScale(p.time)} y1={yScale(p.survival) - 5} x2={xScale(p.time)} y2={yScale(p.survival) + 5} stroke="#E64B35" strokeWidth="1.5" />
+                    ))}
+                    {group2.curve.filter(p => p.censored).map((p, i) => (
+                      <line key={`c2-${i}`} x1={xScale(p.time)} y1={yScale(p.survival) - 5} x2={xScale(p.time)} y2={yScale(p.survival) + 5} stroke="#4DBBD5" strokeWidth="1.5" />
+                    ))}
+
+                    {/* 凡例 */}
+                    <rect x={width - 200} y="45" width="180" height="55" fill="white" stroke="#e5e7eb" rx="4" />
+                    <line x1={width - 190} y1="62" x2={width - 160} y2="62" stroke="#E64B35" strokeWidth="2" />
+                    <text x={width - 155} y="66" fontSize="11" fill="#374151">{group1.name} (n={group1.data.length})</text>
+                    <line x1={width - 190} y1="82" x2={width - 160} y2="82" stroke="#4DBBD5" strokeWidth="2" />
+                    <text x={width - 155} y="86" fontSize="11" fill="#374151">{group2.name} (n={group2.data.length})</text>
+
+                    {/* p値 */}
+                    {logRank.pValue !== null && (
+                      <text x={width - 110} y={height - 55} textAnchor="middle" fontSize="11" fill="#374151">
+                        Log-rank p {logRank.pValue < 0.001 ? '< 0.001' : `= ${logRank.pValue.toFixed(3)}`}
+                      </text>
+                    )}
+
+                    {/* リスクテーブル */}
+                    <text x={margin.left} y={height - 25} fontSize="10" fill="#374151" fontWeight="bold">At risk:</text>
+                    <text x={margin.left} y={height - 12} fontSize="10" fill="#E64B35">{group1.name}: {group1.data.length}</text>
+                    <text x={margin.left + 150} y={height - 12} fontSize="10" fill="#4DBBD5">{group2.name}: {group2.data.length}</text>
+                  </svg>
+                );
+              })() : (
+                <div style={{ textAlign: 'center', padding: '60px', color: '#6b7280' }}>
+                  イベントタイプと2つの群を選択して「曲線を描画」をクリックしてください
+                </div>
+              )}
+            </div>
+
+            {/* エクスポートボタン */}
+            {kmChartData && (
+              <div style={{ marginTop: '16px', display: 'flex', gap: '8px', flexWrap: 'wrap' }}>
+                <button
+                  onClick={() => {
+                    const svgElement = kmChartRef.current?.querySelector('svg');
+                    if (!svgElement) return;
+                    const svgData = new XMLSerializer().serializeToString(svgElement);
+                    const blob = new Blob([svgData], { type: 'image/svg+xml' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `km_curve_${kmChartData.eventType}_${new Date().toISOString().split('T')[0]}.svg`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                  style={{ ...styles.addButton, backgroundColor: '#059669' }}
+                >
+                  SVGエクスポート
+                </button>
+                <button
+                  onClick={() => {
+                    const svgElement = kmChartRef.current?.querySelector('svg');
+                    if (!svgElement) return;
+                    const canvas = document.createElement('canvas');
+                    const ctx = canvas.getContext('2d');
+                    const svgData = new XMLSerializer().serializeToString(svgElement);
+                    const img = new Image();
+                    const svgBlob = new Blob([svgData], { type: 'image/svg+xml;charset=utf-8' });
+                    const url = URL.createObjectURL(svgBlob);
+                    img.onload = () => {
+                      const scale = 300 / 96;
+                      canvas.width = img.width * scale;
+                      canvas.height = img.height * scale;
+                      ctx.scale(scale, scale);
+                      ctx.fillStyle = 'white';
+                      ctx.fillRect(0, 0, canvas.width, canvas.height);
+                      ctx.drawImage(img, 0, 0);
+                      canvas.toBlob((blob) => {
+                        const a = document.createElement('a');
+                        a.href = URL.createObjectURL(blob);
+                        a.download = `km_curve_${kmChartData.eventType}_300dpi.png`;
+                        a.click();
+                      }, 'image/png');
+                      URL.revokeObjectURL(url);
+                    };
+                    img.src = url;
+                  }}
+                  style={{ ...styles.addButton, backgroundColor: '#7c3aed' }}
+                >
+                  PNG (300dpi)
+                </button>
+              </div>
+            )}
+
+            <div style={styles.modalActions}>
+              <button onClick={() => setShowKMChart(false)} style={styles.cancelButton}>
                 閉じる
               </button>
             </div>

@@ -179,7 +179,8 @@
 <li><a href="#newfeatures">v1.3 新機能</a></li>
 <li><a href="#v14features">v1.4 新機能</a></li>
 <li><a href="#v16features">v1.6 新機能</a></li>
-<li><a href="#v17features">v1.7 新機能 <span class="new-feature">NEW</span></a></li>
+<li><a href="#v17features">v1.7 新機能</a></li>
+<li><a href="#v18features">v1.8 新機能 <span class="new-feature">NEW</span></a></li>
 </ul>
 </div>
 
@@ -854,7 +855,7 @@
 <li><strong>感度・特異度:</strong> 最適カットオフでの値を表示</li>
 <li><strong>複数マーカー比較:</strong> 1つのグラフに複数のROC曲線を重ねて表示</li>
 </ul>
-<h2 id="v17features">v1.7 新機能（2026年2月） <span class="new-feature">NEW</span></h2>
+<h2 id="v17features">v1.7 新機能（2026年2月）</h2>
 <ul>
     <li><strong>学術誌スタイル設定</strong>: Nature, NEJM, Lancet, JAMA, JCO等の主要学術誌に準拠したカラーパレット</li>
     <li><strong>色覚対応パレット</strong>: Tol palette（色覚バリアフリー対応）</li>
@@ -894,12 +895,63 @@
 
 <hr>
 
+<h2 id="v18features">v1.8 新機能（2026年2月） <span class="new-feature">NEW</span></h2>
+<p>可視化機能を大幅に強化しました。</p>
+
+<h3>スパゲッティプロット（経時データ可視化）</h3>
+<p>個別患者の検査値推移を一つのグラフで可視化できます。</p>
+<ul>
+<li><strong>機能:</strong> 全患者の検査値を線グラフで重ね描き</li>
+<li><strong>群別色分け:</strong> 疾患群ごとに色分け表示</li>
+<li><strong>患者選択:</strong> 表示する患者を個別に選択可能</li>
+<li><strong>エクスポート:</strong> SVG/PNG (300dpi) + CSV + Rスクリプト</li>
+</ul>
+<p><strong>使い方:</strong> 統計・可視化セクション →「スパゲッティプロット」→ 検査項目を選択 → グラフ生成</p>
+
+<h3>検査値ヒートマップ</h3>
+<p>複数患者×複数検査項目の値を色で可視化します。</p>
+<ul>
+<li><strong>値の選択:</strong> 最初の値 / 最後の値 / ピーク値 / 平均値</li>
+<li><strong>患者選択:</strong> 群ごとの一括選択、個別選択に対応</li>
+<li><strong>カラースケール:</strong> 青→白→赤 / Viridis / グレースケール</li>
+<li><strong>エクスポート:</strong> SVG/PNG (300dpi) + CSV</li>
+</ul>
+<p><strong>使い方:</strong> 統計・可視化セクション →「ヒートマップ」→ 検査項目・患者を選択 → 表示</p>
+
+<h3>Kaplan-Meier曲線（生存時間解析）</h3>
+<p>臨床イベントの発生時間を2群間で比較できます。</p>
+<ul>
+<li><strong>イベント選択:</strong> 登録済みの臨床イベントから選択</li>
+<li><strong>2群比較:</strong> 任意の2群を選択して比較</li>
+<li><strong>Log-rank検定:</strong> p値を自動計算・表示</li>
+<li><strong>打ち切り表示:</strong> 打ち切り例を縦線マークで表示</li>
+<li><strong>エクスポート:</strong> SVG/PNG (300dpi)</li>
+</ul>
+<p><strong>使い方:</strong> 統計・可視化セクション →「Kaplan-Meier曲線」→ イベント・群を選択 →「曲線を描画」</p>
+
+<h3>データエクスポート機能の強化</h3>
+<table>
+<tr><th>ボタン</th><th>出力内容</th></tr>
+<tr><td>患者一覧CSV</td><td>患者ID、診断名、群、発症日、メモ</td></tr>
+<tr><td>全検査データCSV</td><td>全患者の全検査データ（発症からの日数含む）</td></tr>
+<tr><td>全臨床データCSV</td><td>治療薬データ + 臨床イベントデータ（2ファイル）</td></tr>
+<tr><td>KM曲線用データ</td><td>Tidy形式CSV + Rスクリプト（survival/survminer対応）</td></tr>
+</table>
+
+<h3>UIの整理</h3>
+<ul>
+<li><strong>3セクション構成:</strong> データ登録（青）/ 統計・可視化（白）/ データエクスポート（灰）</li>
+<li><strong>アカデミックカラー:</strong> 落ち着いた配色で視認性向上</li>
+</ul>
+
+<hr>
+
 <h2>お問い合わせ</h2>
 <p>技術的な問題やフィードバックは、GitHubリポジトリのIssuesにてお知らせください。</p>
 <p><strong>GitHub:</strong> <a href="https://github.com/tamunsa0613-arch/clinicaldataregistry">https://github.com/tamunsa0613-arch/clinicaldataregistry</a></p>
 
 <hr>
-<p style="text-align:center; color:#6b7280; font-size:0.9em;">Clinical Data Registry 操作マニュアル v1.4 - 2026年2月</p>
+<p style="text-align:center; color:#6b7280; font-size:0.9em;">Clinical Data Registry 操作マニュアル v1.8 - 2026年2月</p>
 
 </body>
 </html>
