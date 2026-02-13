@@ -181,7 +181,8 @@
 <li><a href="#v16features">v1.6 新機能</a></li>
 <li><a href="#v17features">v1.7 新機能</a></li>
 <li><a href="#v18features">v1.8 新機能</a></li>
-<li><a href="#v20features">v2.0 新機能 - 多施設共同研究 <span class="new-feature">NEW</span></a></li>
+<li><a href="#v20features">v2.0 新機能 - 多施設共同研究</a></li>
+<li><a href="#v21features">v2.1 新機能 - サマリーテキスト解析 <span class="new-feature">NEW</span></a></li>
 </ul>
 </div>
 
@@ -820,15 +821,28 @@
 </ul>
 
 <h3>サマリーから経過表作成（AI解析）</h3>
-<p>カルテサマリーの画像をアップロードすると、AIが自動で検査値・治療薬・臨床症状を抽出します。</p>
+<p>カルテサマリーのテキストまたは画像から、AIが自動で検査値・治療薬・臨床症状・診断名・発症日を抽出します。</p>
+
+<h4>テキスト貼り付けモード（v2.1〜）</h4>
 <ol>
 <li>「検査データ」セクションの「📋 サマリーから作成」をクリック</li>
+<li>「📝 テキスト貼り付け」タブを選択（デフォルト）</li>
+<li>退院時サマリーや経過記録のテキストをコピー＆ペースト</li>
+<li>「AIで解析」をクリック</li>
+<li>抽出結果（診断名・発症日・検査値・治療薬・臨床イベント）を確認</li>
+<li>「データを登録」で一括保存（患者の診断名・発症日も自動更新）</li>
+</ol>
+
+<h4>画像アップロードモード</h4>
+<ol>
+<li>「📷 画像アップロード」タブを選択</li>
 <li>サマリー画像をアップロード</li>
-<li>「画像を解析」をクリック</li>
+<li>「AIで解析」をクリック（OCR→AI構造化の2段階処理）</li>
 <li>抽出結果を確認し、「データを登録」で保存</li>
 </ol>
+
 <blockquote>
-<strong>注意:</strong> この機能はCloud Vision API（OCR）とClaude API（AI解析）を使用します。事前にAPIキーの設定が必要です。
+<strong>注意:</strong> この機能はClaude API（AI解析）を使用します。画像モードではCloud Vision API（OCR）も使用します。事前にAPIキーの設定が必要です。個人情報（氏名・ID・住所等）は自動で除外されます。
 </blockquote>
 
 <h3>臨床症状の追加</h3>
@@ -1020,12 +1034,59 @@
 
 <hr>
 
+<h2 id="v21features">v2.1 新機能（2026年2月） <span class="new-feature">NEW</span></h2>
+<p>カルテサマリーのテキストから経過表を自動作成する機能を追加しました。</p>
+
+<h3>サマリーテキスト解析</h3>
+<p>退院時サマリーや経過記録のテキストをコピー＆ペーストするだけで、AIが以下のデータを自動抽出します。</p>
+<table>
+<thead><tr><th>抽出データ</th><th>内容</th></tr></thead>
+<tbody>
+<tr><td><strong>患者情報</strong></td><td>診断名、発症日（患者基本情報に自動反映）</td></tr>
+<tr><td><strong>検査データ</strong></td><td>検査日ごとの検査項目・数値・単位</td></tr>
+<tr><td><strong>治療薬</strong></td><td>薬剤名、カテゴリ、用量、開始日・終了日</td></tr>
+<tr><td><strong>臨床イベント</strong></td><td>発熱、痙攣、意識障害、画像所見、手術など</td></tr>
+</tbody>
+</table>
+
+<h3>使い方</h3>
+<ol>
+<li>患者詳細画面の「検査データ」セクションで「📋 サマリーから作成」をクリック</li>
+<li>「📝 テキスト貼り付け」タブ（デフォルト）でテキストを貼り付け</li>
+<li>「AIで解析」をクリック（Claude AIが構造化データを抽出）</li>
+<li>プレビューで抽出結果を確認</li>
+<li>「データを登録」で検査値・治療薬・臨床イベント・患者情報を一括保存</li>
+</ol>
+
+<h3>対応するテキスト形式</h3>
+<ul>
+<li>退院時サマリー</li>
+<li>入院経過記録</li>
+<li>紹介状・返書</li>
+<li>カンファレンス記録</li>
+<li>自由記述形式のテキスト全般</li>
+</ul>
+
+<h3>個人情報保護</h3>
+<ul>
+<li>氏名、患者ID、住所、電話番号等は正規表現で自動検出・除去されます</li>
+<li>テキストはCloud Functions経由でClaude APIに送信され、端末には保存されません</li>
+<li>念のため、貼り付け前にご自身でも確認することを推奨します</li>
+</ul>
+
+<blockquote>
+<strong>前提条件:</strong> Firebase FunctionsにClaude APIキー（ANTHROPIC_API_KEY）がシークレットとして設定されている必要があります。<br>
+設定コマンド: <code>firebase functions:secrets:set ANTHROPIC_API_KEY</code>
+</blockquote>
+
+<hr>
+
 <h2>お問い合わせ</h2>
 <p>技術的な問題やフィードバックは、GitHubリポジトリのIssuesにてお知らせください。</p>
 <p><strong>GitHub:</strong> <a href="https://github.com/tamunsa0613-arch/clinicaldataregistry">https://github.com/tamunsa0613-arch/clinicaldataregistry</a></p>
 
 <hr>
-<p style="text-align:center; color:#6b7280; font-size:0.9em;">Clinical Data Registry 操作マニュアル v2.0 - 2026年2月</p>
+<p style="text-align:center; color:#6b7280; font-size:0.9em;">Clinical Data Registry 操作マニュアル v2.1 - 2026年2月</p>
 
 </body>
 </html>

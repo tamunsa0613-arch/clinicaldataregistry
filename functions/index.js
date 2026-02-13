@@ -680,7 +680,8 @@ exports.processSummaryImage = onCall(
     cors: true,
     maxInstances: 10,
     timeoutSeconds: 120, // 長めのタイムアウト
-    memory: "512MiB"
+    memory: "512MiB",
+    secrets: ["ANTHROPIC_API_KEY"]
   },
   async (request) => {
     // 認証チェック
@@ -771,6 +772,92 @@ exports.processSummaryImage = onCall(
       }
 
       throw new HttpsError('internal', `サマリー処理エラー: ${error.message}`);
+    }
+  }
+);
+
+// サマリーテキストから構造化データを抽出するCloud Function
+exports.parseSummaryText = onCall(
+  {
+    cors: true,
+    maxInstances: 10,
+    timeoutSeconds: 120,
+    memory: "512MiB",
+    secrets: ["ANTHROPIC_API_KEY"]
+  },
+  async (request) => {
+    // 認証チェック
+    if (!request.auth) {
+      throw new HttpsError('unauthenticated', '認証が必要です');
+    }
+
+    const { text } = request.data;
+
+    if (!text || text.trim().length === 0) {
+      throw new HttpsError('invalid-argument', 'テキストを入力してください');
+    }
+
+    if (text.length > 50000) {
+      throw new HttpsError('invalid-argument', 'テキストが長すぎます（最大50,000文字）');
+    }
+
+    try {
+      console.log('parseSummaryText: Input text length:', text.length);
+
+      // 個人情報を除去
+      let cleanedText = text;
+      piiPatterns.forEach(pattern => {
+        cleanedText = cleanedText.replace(pattern, '[個人情報削除]');
+      });
+
+      // Claude APIで構造化
+      console.log('Structuring with Claude API...');
+      const client = getAnthropicClient();
+
+      const message = await client.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 4096,
+        messages: [
+          {
+            role: "user",
+            content: SUMMARY_EXTRACTION_PROMPT + cleanedText
+          }
+        ]
+      });
+
+      // レスポンスからJSONを抽出
+      const responseText = message.content[0].text;
+      console.log('Claude Response Length:', responseText.length);
+
+      // JSONブロックを抽出
+      const jsonMatch = responseText.match(/```json\n?([\s\S]*?)\n?```/);
+      let extractedData;
+
+      if (jsonMatch) {
+        extractedData = JSON.parse(jsonMatch[1]);
+      } else {
+        try {
+          extractedData = JSON.parse(responseText);
+        } catch (e) {
+          throw new Error('Claude APIの応答からJSONを抽出できませんでした');
+        }
+      }
+
+      return {
+        success: true,
+        data: extractedData,
+        inputTextLength: text.length,
+        message: 'サマリーテキストの解析が完了しました'
+      };
+
+    } catch (error) {
+      console.error('parseSummaryText Error:', error);
+
+      if (error.message.includes('ANTHROPIC_API_KEY')) {
+        throw new HttpsError('failed-precondition', 'Claude APIキーが設定されていません。Firebase Functionsの環境変数を確認してください。');
+      }
+
+      throw new HttpsError('internal', `テキスト解析エラー: ${error.message}`);
     }
   }
 );

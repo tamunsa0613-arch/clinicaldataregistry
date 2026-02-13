@@ -911,6 +911,24 @@ async function processSummaryImage(imageFile, onProgress) {
 }
 
 // ============================================================
+// サマリーテキスト解析（Claude API直接）
+// ============================================================
+async function parseSummaryText(text) {
+  try {
+    const parseSummary = httpsCallable(functions, 'parseSummaryText');
+    const result = await parseSummary({ text });
+    console.log('Summary Text Parsing Result:', result.data);
+    return result.data;
+  } catch (error) {
+    console.error('Summary Text Parsing Error:', error);
+    return {
+      success: false,
+      error: error.message || 'サマリーテキスト解析に失敗しました'
+    };
+  }
+}
+
+// ============================================================
 // スタイル定義
 // ============================================================
 const styles = {
@@ -12423,7 +12441,7 @@ ggsave("spaghetti_plot_${spaghettiSelectedItem}.png", p, width = 10, height = 6,
 // ============================================================
 // 患者詳細画面
 // ============================================================
-function PatientDetailView({ patient, studyId, studyRole, onBack }) {
+function PatientDetailView({ patient, studyId, studyRole, onBack, onUpdatePatient }) {
   const { user } = useAuth();
   const activeStudyId = studyId || null;
   const studyCanEdit = !activeStudyId || studyRole === 'pi' || studyRole === 'editor';
@@ -12474,6 +12492,8 @@ function PatientDetailView({ patient, studyId, studyRole, onBack }) {
   const [summaryProcessing, setSummaryProcessing] = useState(false);
   const [summaryResult, setSummaryResult] = useState(null);
   const [summaryError, setSummaryError] = useState('');
+  const [summaryInputMode, setSummaryInputMode] = useState('text');
+  const [summaryText, setSummaryText] = useState('');
 
   // 臨床経過用state
   const [clinicalEvents, setClinicalEvents] = useState([]);
@@ -18025,8 +18045,8 @@ function PatientDetailView({ patient, studyId, studyRole, onBack }) {
         <div style={styles.modalOverlay}>
           <div style={{...styles.modal, maxWidth: '800px', maxHeight: '90vh', overflow: 'auto'}}>
             <h2 style={styles.modalTitle}>📋 サマリーから経過表を作成</h2>
-            <p style={{fontSize: '13px', color: '#6b7280', marginBottom: '20px'}}>
-              カルテサマリーの画像をアップロードすると、AIが検査値・治療薬・臨床経過を自動抽出します。
+            <p style={{fontSize: '13px', color: '#6b7280', marginBottom: '16px'}}>
+              カルテサマリーのテキストまたは画像から、AIが検査値・治療薬・臨床経過を自動抽出します。
             </p>
 
             {summaryError && (
@@ -18036,53 +18056,96 @@ function PatientDetailView({ patient, studyId, studyRole, onBack }) {
             )}
 
             {!summaryResult ? (
-              // 画像アップロード画面
               <div>
-                <div
-                  style={{
-                    border: '2px dashed #d1d5db',
-                    borderRadius: '12px',
-                    padding: '40px',
-                    textAlign: 'center',
-                    background: summaryImage ? '#f0fdf4' : '#f9fafb',
-                    cursor: 'pointer'
-                  }}
-                  onClick={() => document.getElementById('summaryImageInput').click()}
-                >
-                  <input
-                    id="summaryImageInput"
-                    type="file"
-                    accept="image/*"
-                    style={{display: 'none'}}
-                    onChange={(e) => {
-                      const file = e.target.files[0];
-                      if (file) {
-                        setSummaryImage(file);
-                        setSummaryError('');
-                      }
+                {/* 入力モード切り替えタブ */}
+                <div style={{display: 'flex', borderBottom: '2px solid #e5e7eb', marginBottom: '20px'}}>
+                  <button
+                    onClick={() => setSummaryInputMode('text')}
+                    style={{
+                      flex: 1, padding: '10px 16px', border: 'none', cursor: 'pointer', fontSize: '14px', fontWeight: '600',
+                      background: summaryInputMode === 'text' ? '#fff' : '#f9fafb',
+                      color: summaryInputMode === 'text' ? '#2563eb' : '#6b7280',
+                      borderBottom: summaryInputMode === 'text' ? '2px solid #2563eb' : '2px solid transparent',
+                      marginBottom: '-2px'
                     }}
-                  />
-                  {summaryImage ? (
-                    <div>
-                      <div style={{fontSize: '48px', marginBottom: '12px'}}>✅</div>
-                      <p style={{fontWeight: '600', color: '#059669'}}>{summaryImage.name}</p>
-                      <p style={{fontSize: '12px', color: '#6b7280'}}>クリックして変更</p>
-                    </div>
-                  ) : (
-                    <div>
-                      <div style={{fontSize: '48px', marginBottom: '12px'}}>📄</div>
-                      <p style={{fontWeight: '600', color: '#374151'}}>画像をドロップまたはクリック</p>
-                      <p style={{fontSize: '12px', color: '#6b7280'}}>対応形式: JPG, PNG, PDF</p>
-                    </div>
-                  )}
+                  >
+                    📝 テキスト貼り付け
+                  </button>
+                  <button
+                    onClick={() => setSummaryInputMode('image')}
+                    style={{
+                      flex: 1, padding: '10px 16px', border: 'none', cursor: 'pointer', fontSize: '14px', fontWeight: '600',
+                      background: summaryInputMode === 'image' ? '#fff' : '#f9fafb',
+                      color: summaryInputMode === 'image' ? '#2563eb' : '#6b7280',
+                      borderBottom: summaryInputMode === 'image' ? '2px solid #2563eb' : '2px solid transparent',
+                      marginBottom: '-2px'
+                    }}
+                  >
+                    📷 画像アップロード
+                  </button>
                 </div>
 
-                <div style={{marginTop: '20px', padding: '16px', background: '#fffbeb', borderRadius: '8px', border: '1px solid #fcd34d'}}>
-                  <p style={{fontSize: '12px', color: '#92400e', margin: 0}}>
-                    <strong>対応フォーマット:</strong> FUJITSU, IBM, NEC等の主要電子カルテ<br/>
-                    <strong>注意:</strong> 個人情報（氏名・ID等）は自動で除外されますが、念のため確認してください
-                  </p>
-                </div>
+                {summaryInputMode === 'text' ? (
+                  // テキスト入力モード
+                  <div>
+                    <textarea
+                      value={summaryText}
+                      onChange={(e) => { setSummaryText(e.target.value); setSummaryError(''); }}
+                      placeholder={'退院時サマリーや経過記録のテキストを貼り付けてください。\n\n例：\n入院日: 2025-01-10\n診断: 単純ヘルペス脳炎\n\n入院時検査：WBC 12000/μL, CRP 3.5mg/dL\n髄液：細胞数 150/μL, 蛋白 85mg/dL\n\n治療経過：\n1/10 アシクロビル 10mg/kg 開始\n1/12 痙攣出現、レベチラセタム 1000mg/日 開始\n1/15 mPSL 1000mg パルス療法 3日間'}
+                      style={{
+                        width: '100%', minHeight: '300px', padding: '16px', border: '2px solid #d1d5db',
+                        borderRadius: '12px', fontSize: '13px', lineHeight: '1.6', fontFamily: 'inherit',
+                        resize: 'vertical', outline: 'none', boxSizing: 'border-box',
+                        transition: 'border-color 0.2s'
+                      }}
+                      onFocus={(e) => e.target.style.borderColor = '#2563eb'}
+                      onBlur={(e) => e.target.style.borderColor = '#d1d5db'}
+                    />
+                    <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '8px'}}>
+                      <span style={{fontSize: '12px', color: '#9ca3af'}}>
+                        {summaryText.length.toLocaleString()} 文字
+                      </span>
+                      <span style={{fontSize: '12px', color: '#9ca3af'}}>
+                        個人情報は自動で除外されます
+                      </span>
+                    </div>
+                  </div>
+                ) : (
+                  // 画像アップロードモード（既存）
+                  <div>
+                    <div
+                      style={{
+                        border: '2px dashed #d1d5db', borderRadius: '12px', padding: '40px',
+                        textAlign: 'center', background: summaryImage ? '#f0fdf4' : '#f9fafb', cursor: 'pointer'
+                      }}
+                      onClick={() => document.getElementById('summaryImageInput').click()}
+                    >
+                      <input
+                        id="summaryImageInput" type="file" accept="image/*" style={{display: 'none'}}
+                        onChange={(e) => { const file = e.target.files[0]; if (file) { setSummaryImage(file); setSummaryError(''); } }}
+                      />
+                      {summaryImage ? (
+                        <div>
+                          <div style={{fontSize: '48px', marginBottom: '12px'}}>✅</div>
+                          <p style={{fontWeight: '600', color: '#059669'}}>{summaryImage.name}</p>
+                          <p style={{fontSize: '12px', color: '#6b7280'}}>クリックして変更</p>
+                        </div>
+                      ) : (
+                        <div>
+                          <div style={{fontSize: '48px', marginBottom: '12px'}}>📄</div>
+                          <p style={{fontWeight: '600', color: '#374151'}}>画像をドロップまたはクリック</p>
+                          <p style={{fontSize: '12px', color: '#6b7280'}}>対応形式: JPG, PNG, PDF</p>
+                        </div>
+                      )}
+                    </div>
+                    <div style={{marginTop: '16px', padding: '12px', background: '#fffbeb', borderRadius: '8px', border: '1px solid #fcd34d'}}>
+                      <p style={{fontSize: '12px', color: '#92400e', margin: 0}}>
+                        <strong>対応フォーマット:</strong> FUJITSU, IBM, NEC等の主要電子カルテ<br/>
+                        <strong>注意:</strong> 個人情報（氏名・ID等）は自動で除外されますが、念のため確認してください
+                      </p>
+                    </div>
+                  </div>
+                )}
 
                 <div style={{...styles.modalActions, marginTop: '24px'}}>
                   <button
@@ -18091,6 +18154,7 @@ function PatientDetailView({ patient, studyId, studyRole, onBack }) {
                       setSummaryImage(null);
                       setSummaryResult(null);
                       setSummaryError('');
+                      setSummaryText('');
                     }}
                     style={styles.cancelButton}
                   >
@@ -18098,31 +18162,52 @@ function PatientDetailView({ patient, studyId, studyRole, onBack }) {
                   </button>
                   <button
                     onClick={async () => {
-                      if (!summaryImage) {
-                        setSummaryError('画像を選択してください');
-                        return;
-                      }
-                      setSummaryProcessing(true);
-                      setSummaryError('');
-                      try {
-                        const result = await processSummaryImage(summaryImage, (progress) => {
-                          console.log('Progress:', progress);
-                        });
-                        if (result.success) {
-                          setSummaryResult(result.data);
-                        } else {
-                          setSummaryError(result.error || '解析に失敗しました');
+                      if (summaryInputMode === 'text') {
+                        if (!summaryText.trim()) {
+                          setSummaryError('テキストを入力してください');
+                          return;
                         }
-                      } catch (err) {
-                        setSummaryError(err.message || '解析中にエラーが発生しました');
-                      } finally {
-                        setSummaryProcessing(false);
+                        setSummaryProcessing(true);
+                        setSummaryError('');
+                        try {
+                          const result = await parseSummaryText(summaryText);
+                          if (result.success) {
+                            setSummaryResult(result.data);
+                          } else {
+                            setSummaryError(result.error || '解析に失敗しました');
+                          }
+                        } catch (err) {
+                          setSummaryError(err.message || '解析中にエラーが発生しました');
+                        } finally {
+                          setSummaryProcessing(false);
+                        }
+                      } else {
+                        if (!summaryImage) {
+                          setSummaryError('画像を選択してください');
+                          return;
+                        }
+                        setSummaryProcessing(true);
+                        setSummaryError('');
+                        try {
+                          const result = await processSummaryImage(summaryImage, (progress) => {
+                            console.log('Progress:', progress);
+                          });
+                          if (result.success) {
+                            setSummaryResult(result.data);
+                          } else {
+                            setSummaryError(result.error || '解析に失敗しました');
+                          }
+                        } catch (err) {
+                          setSummaryError(err.message || '解析中にエラーが発生しました');
+                        } finally {
+                          setSummaryProcessing(false);
+                        }
                       }
                     }}
-                    disabled={!summaryImage || summaryProcessing}
+                    disabled={summaryProcessing || (summaryInputMode === 'text' ? !summaryText.trim() : !summaryImage)}
                     style={{
                       ...styles.primaryButton,
-                      backgroundColor: summaryProcessing ? '#9ca3af' : '#f59e0b',
+                      backgroundColor: summaryProcessing ? '#9ca3af' : '#2563eb',
                       cursor: summaryProcessing ? 'wait' : 'pointer'
                     }}
                   >
@@ -18212,6 +18297,7 @@ function PatientDetailView({ patient, studyId, studyRole, onBack }) {
                     onClick={() => {
                       setSummaryResult(null);
                       setSummaryImage(null);
+                      setSummaryText('');
                     }}
                     style={styles.cancelButton}
                   >
@@ -18283,10 +18369,29 @@ function PatientDetailView({ patient, studyId, studyRole, onBack }) {
                           }
                         }
 
-                        alert(`登録完了!\n検査データ: ${labCount}件\n治療薬: ${treatmentCount}件\n臨床イベント: ${eventCount}件`);
+                        // 患者情報（診断・発症日）を更新
+                        if (summaryResult.patientInfo) {
+                          const updateData = {};
+                          if (summaryResult.patientInfo.diagnosis) {
+                            updateData.diagnosis = summaryResult.patientInfo.diagnosis;
+                          }
+                          if (summaryResult.patientInfo.onsetDate) {
+                            updateData.onsetDate = summaryResult.patientInfo.onsetDate;
+                          }
+                          if (Object.keys(updateData).length > 0) {
+                            await updateDoc(
+                              doc(db, ...getPatientDocPath(activeStudyId, user.uid, patient.id)),
+                              updateData
+                            );
+                            if (onUpdatePatient) onUpdatePatient(updateData);
+                          }
+                        }
+
+                        alert(`登録完了!\n${summaryResult.patientInfo?.diagnosis ? '診断: ' + summaryResult.patientInfo.diagnosis + '\n' : ''}${summaryResult.patientInfo?.onsetDate ? '発症日: ' + summaryResult.patientInfo.onsetDate + '\n' : ''}検査データ: ${labCount}件\n治療薬: ${treatmentCount}件\n臨床イベント: ${eventCount}件`);
                         setShowSummaryModal(false);
                         setSummaryResult(null);
                         setSummaryImage(null);
+                        setSummaryText('');
                       } catch (error) {
                         console.error('データ登録エラー:', error);
                         alert('登録に失敗しました: ' + error.message);
@@ -18345,6 +18450,7 @@ function App() {
         studyId={currentStudy?.id || null}
         studyRole={studyRole}
         onBack={() => setSelectedPatient(null)}
+        onUpdatePatient={(updates) => setSelectedPatient(prev => ({...prev, ...updates}))}
       />
     );
   }
