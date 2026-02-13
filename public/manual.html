@@ -180,7 +180,8 @@
 <li><a href="#v14features">v1.4 新機能</a></li>
 <li><a href="#v16features">v1.6 新機能</a></li>
 <li><a href="#v17features">v1.7 新機能</a></li>
-<li><a href="#v18features">v1.8 新機能 <span class="new-feature">NEW</span></a></li>
+<li><a href="#v18features">v1.8 新機能</a></li>
+<li><a href="#v20features">v2.0 新機能 - 多施設共同研究 <span class="new-feature">NEW</span></a></li>
 </ul>
 </div>
 
@@ -946,12 +947,85 @@
 
 <hr>
 
+<h2 id="v20features">v2.0 新機能（2026年2月） <span class="new-feature">NEW</span></h2>
+<p>多施設共同研究を支援する研究プロジェクト機能を追加しました。</p>
+
+<h3>多施設共同研究（研究プロジェクト機能）</h3>
+<p>複数の施設が参加する共同研究で、全施設の症例を一括管理・閲覧できます。</p>
+
+<div class="step-box">
+<h4>研究プロジェクトの作成</h4>
+<ol>
+<li>画面右上の「<strong>研究管理</strong>」ボタンをクリック</li>
+<li>「新規研究プロジェクト作成」セクションで以下を入力:
+  <ul>
+    <li><strong>研究ナンバー</strong>: 研究を識別する一意の番号（例: NEURO-2026-001）</li>
+    <li><strong>研究タイトル</strong>: 研究の名称</li>
+    <li><strong>説明</strong>（任意）: 研究の概要</li>
+  </ul>
+</li>
+<li>「研究を作成」をクリック</li>
+<li>作成者は自動的に<strong>研究代表者（PI）</strong>として登録されます</li>
+</ol>
+</div>
+
+<div class="step-box">
+<h4>メンバーの招待と権限管理</h4>
+<ol>
+<li>研究モードに切り替えた状態で、研究管理パネルの「メンバー管理」セクションを開く</li>
+<li>追加するメンバーの<strong>メールアドレス</strong>、<strong>権限</strong>、<strong>施設名</strong>を入力</li>
+<li>「メンバーを追加」をクリック</li>
+</ol>
+
+<table>
+<tr><th>権限</th><th>閲覧</th><th>症例登録・編集</th><th>メンバー管理</th></tr>
+<tr><td><strong>PI（研究代表者）</strong></td><td>全施設</td><td>全施設</td><td>可能</td></tr>
+<tr><td><strong>編集者</strong>（PIが許可した人）</td><td>全施設</td><td>全施設</td><td>不可</td></tr>
+<tr><td><strong>閲覧のみ</strong></td><td>全施設</td><td>不可</td><td>不可</td></tr>
+</table>
+
+<p><strong>ポイント:</strong> 招待されたメンバーがまだアカウントを持っていなくても、メールアドレスで事前登録が可能です。メンバーがアカウント作成・ログインすると自動的に研究に紐づけされます。</p>
+</div>
+
+<div class="step-box">
+<h4>研究モードの使い方</h4>
+<ol>
+<li>画面左上の<strong>ドロップダウン</strong>で「マイ患者一覧」から研究プロジェクトに切り替え</li>
+<li>黄色のバナーで現在の研究名と自分の権限が表示されます</li>
+<li>研究モードで登録した症例には<strong>施設名</strong>が自動で付与されます</li>
+<li>全メンバーが全施設の症例を閲覧できます</li>
+<li>「マイ患者一覧」に戻すと、個人の患者リストに戻ります</li>
+</ol>
+</div>
+
+<div class="step-box">
+<h4>研究ナンバーでの症例フィルタリング</h4>
+<p>ドロップダウンで研究プロジェクトを選択するだけで、その研究ナンバーに登録された症例のみが表示されます。複数の研究に参加している場合は、ドロップダウンで切り替えて使い分けられます。</p>
+</div>
+
+<h3>Firestoreデータ構造（研究プロジェクト）</h3>
+<ul>
+<li><code>studies/{studyId}</code> - 研究プロジェクト（研究ナンバー、タイトル、説明）</li>
+<li><code>studyMembers/{uid}_{studyId}</code> - メンバーシップ（権限、施設名）</li>
+<li><code>studies/{studyId}/patients/...</code> - 研究配下の患者データ（検査・治療・臨床イベント含む）</li>
+</ul>
+<p>個人の患者データ（<code>users/{uid}/patients/...</code>）はそのまま維持され、研究データとは完全に分離されます。</p>
+
+<h3>セキュリティ</h3>
+<ul>
+<li>Firestoreセキュリティルールにより、研究メンバーのみがデータにアクセス可能</li>
+<li>PI/編集者のみが書き込み可能（閲覧のみメンバーはサーバーサイドでもブロック）</li>
+<li>研究ごとにデータが完全に分離されています</li>
+</ul>
+
+<hr>
+
 <h2>お問い合わせ</h2>
 <p>技術的な問題やフィードバックは、GitHubリポジトリのIssuesにてお知らせください。</p>
 <p><strong>GitHub:</strong> <a href="https://github.com/tamunsa0613-arch/clinicaldataregistry">https://github.com/tamunsa0613-arch/clinicaldataregistry</a></p>
 
 <hr>
-<p style="text-align:center; color:#6b7280; font-size:0.9em;">Clinical Data Registry 操作マニュアル v1.8 - 2026年2月</p>
+<p style="text-align:center; color:#6b7280; font-size:0.9em;">Clinical Data Registry 操作マニュアル v2.0 - 2026年2月</p>
 
 </body>
 </html>

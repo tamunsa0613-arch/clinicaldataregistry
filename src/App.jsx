@@ -354,6 +354,248 @@ function useOrganization() {
 }
 
 // ============================================================
+// Firestore パスヘルパー（研究モード対応）
+// ============================================================
+
+function getPatientsCollectionPath(studyId, userId) {
+  if (studyId) return ['studies', studyId, 'patients'];
+  return ['users', userId, 'patients'];
+}
+
+function getPatientDocPath(studyId, userId, patientId) {
+  if (studyId) return ['studies', studyId, 'patients', patientId];
+  return ['users', userId, 'patients', patientId];
+}
+
+function getPatientSubcollectionPath(studyId, userId, patientId, subcollection) {
+  if (studyId) return ['studies', studyId, 'patients', patientId, subcollection];
+  return ['users', userId, 'patients', patientId, subcollection];
+}
+
+function getPatientSubdocPath(studyId, userId, patientId, subcollection, docId) {
+  if (studyId) return ['studies', studyId, 'patients', patientId, subcollection, docId];
+  return ['users', userId, 'patients', patientId, subcollection, docId];
+}
+
+// ============================================================
+// 研究プロジェクトコンテキスト（多施設研究対応）
+// ============================================================
+const StudyContext = createContext();
+
+function StudyProvider({ children }) {
+  const { user } = useAuth();
+  const [studies, setStudies] = useState([]);
+  const [currentStudy, setCurrentStudy] = useState(null);
+  const [studyRole, setStudyRole] = useState(null);
+  const [studyLoading, setStudyLoading] = useState(true);
+  const [studyMembers, setStudyMembers] = useState([]);
+
+  // ユーザーの研究メンバーシップを監視
+  useEffect(() => {
+    if (!user) {
+      setStudies([]);
+      setCurrentStudy(null);
+      setStudyRole(null);
+      setStudyLoading(false);
+      return;
+    }
+
+    // メールベースのメンバーシップをUID にリンク
+    const linkStudyMemberships = async () => {
+      try {
+        const emailQuery = query(
+          collection(db, 'studyMembers'),
+          where('email', '==', user.email)
+        );
+        const emailSnapshot = await getDocs(emailQuery);
+        for (const memberDoc of emailSnapshot.docs) {
+          const data = memberDoc.data();
+          if (!data.uid) {
+            await updateDoc(doc(db, 'studyMembers', memberDoc.id), { uid: user.uid });
+          }
+        }
+      } catch (err) {
+        console.error('Error linking study memberships:', err);
+      }
+    };
+    linkStudyMemberships();
+
+    const q = query(
+      collection(db, 'studyMembers'),
+      where('uid', '==', user.uid)
+    );
+
+    const unsubscribe = onSnapshot(q, async (snapshot) => {
+      try {
+        const memberships = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+
+        if (memberships.length === 0) {
+          setStudies([]);
+          setCurrentStudy(null);
+          setStudyRole(null);
+          setStudyLoading(false);
+          return;
+        }
+
+        const studiesWithDetails = await Promise.all(
+          memberships.map(async (membership) => {
+            try {
+              const studyDoc = await getDoc(doc(db, 'studies', membership.studyId));
+              if (studyDoc.exists()) {
+                return {
+                  id: studyDoc.id,
+                  ...studyDoc.data(),
+                  role: membership.role,
+                  siteName: membership.siteName
+                };
+              }
+            } catch (err) {
+              console.error('Error fetching study:', err);
+            }
+            return null;
+          })
+        );
+
+        const validStudies = studiesWithDetails.filter(s => s !== null);
+        setStudies(validStudies);
+
+        // 現在の研究を維持、なければnull
+        if (currentStudy) {
+          const still = validStudies.find(s => s.id === currentStudy.id);
+          if (still) {
+            setCurrentStudy(still);
+            setStudyRole(still.role);
+          } else {
+            setCurrentStudy(null);
+            setStudyRole(null);
+          }
+        }
+
+        setStudyLoading(false);
+      } catch (err) {
+        console.error('Error loading studies:', err);
+        setStudyLoading(false);
+      }
+    });
+
+    return unsubscribe;
+  }, [user]);
+
+  // 現在の研究のメンバー一覧を監視
+  useEffect(() => {
+    if (!currentStudy) {
+      setStudyMembers([]);
+      return;
+    }
+
+    const q = query(
+      collection(db, 'studyMembers'),
+      where('studyId', '==', currentStudy.id)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const members = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      setStudyMembers(members);
+    });
+
+    return unsubscribe;
+  }, [currentStudy]);
+
+  const switchStudy = (studyId) => {
+    if (!studyId) {
+      setCurrentStudy(null);
+      setStudyRole(null);
+      return;
+    }
+    const study = studies.find(s => s.id === studyId);
+    if (study) {
+      setCurrentStudy(study);
+      setStudyRole(study.role);
+    }
+  };
+
+  const createStudy = async (studyNumber, title, description) => {
+    if (!user) return;
+
+    // 研究を作成
+    const studyRef = await addDoc(collection(db, 'studies'), {
+      studyNumber,
+      title,
+      description: description || '',
+      status: 'active',
+      createdAt: serverTimestamp(),
+      createdBy: user.uid
+    });
+
+    // 作成者をPIとして登録
+    const memberDocId = `${user.uid}_${studyRef.id}`;
+    await setDoc(doc(db, 'studyMembers', memberDocId), {
+      studyId: studyRef.id,
+      uid: user.uid,
+      email: user.email,
+      role: 'pi',
+      siteName: '',
+      joinedAt: serverTimestamp(),
+      invitedBy: user.uid
+    });
+
+    return studyRef.id;
+  };
+
+  const addStudyMember = async (studyId, email, role, siteName) => {
+    if (!user) return;
+
+    // メールでUID を検索（既存ユーザーの場合）
+    let targetUid = null;
+    try {
+      const usersQuery = query(collection(db, 'users'), where('email', '==', email.toLowerCase()));
+      const usersSnapshot = await getDocs(usersQuery);
+      if (!usersSnapshot.empty) {
+        targetUid = usersSnapshot.docs[0].id;
+      }
+    } catch (err) {
+      console.error('Error looking up user:', err);
+    }
+
+    const memberDocId = targetUid ? `${targetUid}_${studyId}` : `pending_${email.replace(/[^a-zA-Z0-9]/g, '_')}_${studyId}`;
+    await setDoc(doc(db, 'studyMembers', memberDocId), {
+      studyId,
+      uid: targetUid,
+      email: email.toLowerCase(),
+      role,
+      siteName: siteName || '',
+      joinedAt: serverTimestamp(),
+      invitedBy: user.uid
+    });
+  };
+
+  const removeStudyMember = async (memberId) => {
+    await deleteDoc(doc(db, 'studyMembers', memberId));
+  };
+
+  const updateStudyMemberRole = async (memberId, newRole) => {
+    await updateDoc(doc(db, 'studyMembers', memberId), { role: newRole });
+  };
+
+  const canEdit = !currentStudy || studyRole === 'pi' || studyRole === 'editor';
+  const isStudyMode = !!currentStudy;
+
+  return (
+    <StudyContext.Provider value={{
+      studies, currentStudy, studyRole, studyLoading, studyMembers,
+      switchStudy, createStudy, addStudyMember, removeStudyMember, updateStudyMemberRole,
+      canEdit, isStudyMode
+    }}>
+      {children}
+    </StudyContext.Provider>
+  );
+}
+
+function useStudy() {
+  return useContext(StudyContext);
+}
+
+// ============================================================
 // OCR処理 - 個人情報フィルタリング付き
 // ============================================================
 
@@ -1675,6 +1917,8 @@ function LoginView() {
 function PatientsListView({ onSelectPatient }) {
   const { user, logout, isAdmin } = useAuth();
   const { organizations, currentOrg, orgLoading, isSystemAdmin, switchOrganization, createOrganization, addMemberToOrg } = useOrganization();
+  const { studies, currentStudy, studyRole, studyMembers, switchStudy, createStudy, addStudyMember, removeStudyMember, updateStudyMemberRole, canEdit: studyCanEdit, isStudyMode } = useStudy();
+  const activeStudyId = currentStudy?.id || null;
   const [patients, setPatients] = useState([]);
   const [showAddModal, setShowAddModal] = useState(false);
   const [newPatient, setNewPatient] = useState({
@@ -1687,6 +1931,16 @@ function PatientsListView({ onSelectPatient }) {
   const [isExporting, setIsExporting] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
   const [exportFormat, setExportFormat] = useState('long'); // 'long', 'wide', 'integrated'
+
+  // 研究管理パネル用state
+  const [showStudyManagementPanel, setShowStudyManagementPanel] = useState(false);
+  const [newStudyNumber, setNewStudyNumber] = useState('');
+  const [newStudyTitle, setNewStudyTitle] = useState('');
+  const [newStudyDescription, setNewStudyDescription] = useState('');
+  const [newStudyMemberEmail, setNewStudyMemberEmail] = useState('');
+  const [newStudyMemberRole, setNewStudyMemberRole] = useState('viewer');
+  const [newStudyMemberSiteName, setNewStudyMemberSiteName] = useState('');
+  const [isCreatingStudy, setIsCreatingStudy] = useState(false);
 
   // システム管理パネル用state
   const [showSystemAdminPanel, setShowSystemAdminPanel] = useState(false);
@@ -1904,7 +2158,7 @@ function PatientsListView({ onSelectPatient }) {
     if (!user) return;
 
     const q = query(
-      collection(db, 'users', user.uid, 'patients'),
+      collection(db, ...getPatientsCollectionPath(activeStudyId, user.uid)),
       orderBy('createdAt', 'desc')
     );
 
@@ -1918,7 +2172,7 @@ function PatientsListView({ onSelectPatient }) {
     });
 
     return unsubscribe;
-  }, [user]);
+  }, [user, activeStudyId]);
 
   // 管理者設定を読み込み
   useEffect(() => {
@@ -2089,14 +2343,24 @@ function PatientsListView({ onSelectPatient }) {
     if (!newPatient.diagnosis) return;
 
     try {
-      await addDoc(collection(db, 'users', user.uid, 'patients'), {
+      const patientData = {
         displayId: `P${Date.now().toString(36).toUpperCase()}`,
         diagnosis: newPatient.diagnosis,
         group: newPatient.group,
         onsetDate: newPatient.onsetDate,
         memo: newPatient.memo,
         createdAt: serverTimestamp(),
-      });
+      };
+
+      // 研究モード時は登録者情報とサイト名を付与
+      if (activeStudyId && currentStudy) {
+        const myMembership = studyMembers.find(m => m.uid === user.uid);
+        patientData.registeredBy = user.uid;
+        patientData.registeredByEmail = user.email;
+        patientData.siteName = myMembership?.siteName || '';
+      }
+
+      await addDoc(collection(db, ...getPatientsCollectionPath(activeStudyId, user.uid)), patientData);
 
       setNewPatient({ diagnosis: '', group: '', onsetDate: '', memo: '' });
       setShowAddModal(false);
@@ -2196,7 +2460,7 @@ function PatientsListView({ onSelectPatient }) {
       if (!row.diagnosis) continue;
 
       try {
-        await addDoc(collection(db, 'users', user.uid, 'patients'), {
+        await addDoc(collection(db, ...getPatientsCollectionPath(activeStudyId, user.uid)), {
           displayId: row.patientId,
           diagnosis: row.diagnosis,
           group: row.group,
@@ -2563,7 +2827,7 @@ function PatientsListView({ onSelectPatient }) {
       let existingLabDates = new Set();
       try {
         const existingSnapshot = await getDocs(
-          collection(db, 'users', user.uid, 'patients', patientRef.id, 'labResults')
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patientRef.id, 'labResults'))
         );
         existingSnapshot.forEach(doc => {
           const data = doc.data();
@@ -2585,7 +2849,7 @@ function PatientsListView({ onSelectPatient }) {
           }
 
           await addDoc(
-            collection(db, 'users', user.uid, 'patients', patientRef.id, 'labResults'),
+            collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patientRef.id, 'labResults')),
             {
               date: dayData.date,
               specimen: dayData.specimen || '',
@@ -2607,7 +2871,7 @@ function PatientsListView({ onSelectPatient }) {
       if (importedCount > 0) {
         try {
           const currentLabCount = patientRef.labCount || 0;
-          await updateDoc(doc(db, 'users', user.uid, 'patients', patientRef.id), {
+          await updateDoc(doc(db, ...getPatientDocPath(activeStudyId, user.uid, patientRef.id)), {
             labCount: currentLabCount + importedCount
           });
         } catch (err) {
@@ -2628,7 +2892,7 @@ function PatientsListView({ onSelectPatient }) {
       let existingEvents = new Set();
       try {
         const existingSnapshot = await getDocs(
-          collection(db, 'users', user.uid, 'patients', patientRef.id, 'clinicalEvents')
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patientRef.id, 'clinicalEvents'))
         );
         existingSnapshot.forEach(doc => {
           const data = doc.data();
@@ -2694,7 +2958,7 @@ function PatientsListView({ onSelectPatient }) {
           }
 
           await addDoc(
-            collection(db, 'users', user.uid, 'patients', patientRef.id, 'clinicalEvents'),
+            collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patientRef.id, 'clinicalEvents')),
             {
               eventType: eventType,
               startDate: dateStr,
@@ -3170,7 +3434,7 @@ function PatientsListView({ onSelectPatient }) {
       // Group 1のデータ収集
       for (const patient of group1Patients) {
         const labQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           orderBy('date', 'asc')
         );
         const labSnapshot = await getDocs(labQuery);
@@ -3194,7 +3458,7 @@ function PatientsListView({ onSelectPatient }) {
       // Group 2のデータ収集
       for (const patient of group2Patients) {
         const labQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           orderBy('date', 'asc')
         );
         const labSnapshot = await getDocs(labQuery);
@@ -3373,7 +3637,7 @@ function PatientsListView({ onSelectPatient }) {
 
     for (const patient of targetPatients) {
       const labQuery = query(
-        collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+        collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
         orderBy('date', 'asc')
       );
       const labSnapshot = await getDocs(labQuery);
@@ -3511,7 +3775,7 @@ function PatientsListView({ onSelectPatient }) {
       try {
         // 治療薬データ
         const treatmentQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'treatments')),
           orderBy('startDate', 'asc')
         );
         const treatmentSnapshot = await getDocs(treatmentQuery);
@@ -3522,7 +3786,7 @@ function PatientsListView({ onSelectPatient }) {
 
         // 臨床イベントデータ
         const eventQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
           orderBy('startDate', 'asc')
         );
         const eventSnapshot = await getDocs(eventQuery);
@@ -3533,7 +3797,7 @@ function PatientsListView({ onSelectPatient }) {
 
         // 検査データ（最終フォローアップ日を取得するため）
         const labQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           orderBy('date', 'desc'),
           limit(1)
         );
@@ -3649,7 +3913,7 @@ function PatientsListView({ onSelectPatient }) {
 
       try {
         const labQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           orderBy('date', 'asc')
         );
         const labSnapshot = await getDocs(labQuery);
@@ -3788,7 +4052,7 @@ function PatientsListView({ onSelectPatient }) {
 
       try {
         const labQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           orderBy('date', 'asc')
         );
         const labSnapshot = await getDocs(labQuery);
@@ -4616,7 +4880,7 @@ cat("\\n解析完了！\\n")
 
         // 検査データ
         const labQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           orderBy('date', 'asc')
         );
         const labSnapshot = await getDocs(labQuery);
@@ -4633,7 +4897,7 @@ cat("\\n解析完了！\\n")
 
         // 治療薬データ
         const treatmentQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'treatments')),
           orderBy('startDate', 'asc')
         );
         const treatmentSnapshot = await getDocs(treatmentQuery);
@@ -4644,7 +4908,7 @@ cat("\\n解析完了！\\n")
 
         // 臨床経過データ
         const eventQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
           orderBy('startDate', 'asc')
         );
         const eventSnapshot = await getDocs(eventQuery);
@@ -5099,7 +5363,7 @@ cat("\\n解析完了！\\n")
         const onsetDate = patient.onsetDate ? new Date(patient.onsetDate) : null;
 
         const labQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           orderBy('date', 'asc')
         );
         const labSnapshot = await getDocs(labQuery);
@@ -5175,7 +5439,7 @@ cat("\\n解析完了！\\n")
 
         // 治療薬データ
         const treatmentQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'treatments')),
           orderBy('startDate', 'asc')
         );
         const treatmentSnapshot = await getDocs(treatmentQuery);
@@ -5196,7 +5460,7 @@ cat("\\n解析完了！\\n")
 
         // 臨床イベントデータ
         const eventQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
           orderBy('startDate', 'asc')
         );
         const eventSnapshot = await getDocs(eventQuery);
@@ -5281,7 +5545,7 @@ cat("\\n解析完了！\\n")
 
         // 臨床イベントを取得
         const eventQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
           orderBy('startDate', 'asc')
         );
         const eventSnapshot = await getDocs(eventQuery);
@@ -5475,7 +5739,7 @@ exp(confint(cox_model))
         if (!onsetDate) continue;
 
         const eventQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
           orderBy('startDate', 'asc')
         );
         const eventSnapshot = await getDocs(eventQuery);
@@ -5612,7 +5876,7 @@ exp(confint(cox_model))
       if (patient.group) groupsSet.add(patient.group);
 
       const labQuery = query(
-        collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+        collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
         orderBy('date', 'asc')
       );
       const labSnapshot = await getDocs(labQuery);
@@ -5675,7 +5939,7 @@ exp(confint(cox_model))
 
     for (const patient of selectedPatientsData) {
       const labQuery = query(
-        collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+        collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
         orderBy('date', 'asc')
       );
       const labSnapshot = await getDocs(labQuery);
@@ -5923,7 +6187,7 @@ exp(confint(cox_model))
       // Group 1のデータ収集
       for (const patient of group1Patients) {
         const labQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           orderBy('date', 'asc')
         );
         const labSnapshot = await getDocs(labQuery);
@@ -5953,7 +6217,7 @@ exp(confint(cox_model))
       // Group 2のデータ収集
       for (const patient of group2Patients) {
         const labQuery = query(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           orderBy('date', 'asc')
         );
         const labSnapshot = await getDocs(labQuery);
@@ -6143,6 +6407,31 @@ exp(confint(cox_model))
               {currentOrg.name}
             </span>
           )}
+          {/* 研究プロジェクトセレクター */}
+          {studies.length > 0 && (
+            <select
+              value={currentStudy?.id || 'personal'}
+              onChange={(e) => switchStudy(e.target.value === 'personal' ? null : e.target.value)}
+              style={{
+                marginLeft: '16px',
+                padding: '6px 12px',
+                borderRadius: '6px',
+                border: '1px solid #d1d5db',
+                fontSize: '13px',
+                backgroundColor: currentStudy ? '#fef3c7' : '#f0fdf4',
+                color: currentStudy ? '#92400e' : '#166534',
+                fontWeight: '500',
+                cursor: 'pointer'
+              }}
+            >
+              <option value="personal">マイ患者一覧</option>
+              {studies.map(study => (
+                <option key={study.id} value={study.id}>
+                  {study.studyNumber} - {study.title}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
         <div style={styles.headerRight}>
           <span style={styles.userInfo}>{user?.email}</span>
@@ -6194,6 +6483,19 @@ exp(confint(cox_model))
               ⚙️ 管理
             </button>
           )}
+          <button
+            onClick={() => setShowStudyManagementPanel(true)}
+            style={{
+              ...styles.logoutButton,
+              backgroundColor: '#d97706',
+              color: '#ffffff',
+              fontSize: '14px',
+              fontWeight: '600',
+              marginRight: '8px'
+            }}
+          >
+            研究管理
+          </button>
           <button onClick={logout} style={styles.logoutButton}>
             ログアウト
           </button>
@@ -6201,6 +6503,45 @@ exp(confint(cox_model))
       </header>
 
       <main style={styles.content}>
+        {/* 研究モードバナー */}
+        {isStudyMode && currentStudy && (
+          <div style={{
+            background: '#fef3c7',
+            border: '1px solid #f59e0b',
+            borderRadius: '8px',
+            padding: '10px 16px',
+            marginBottom: '16px',
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            fontSize: '14px'
+          }}>
+            <span style={{ fontWeight: '600', color: '#92400e' }}>
+              研究モード: {currentStudy.studyNumber} - {currentStudy.title}
+            </span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+              <span style={{ color: '#78350f', fontSize: '13px' }}>
+                権限: {studyRole === 'pi' ? '研究代表者(PI)' : studyRole === 'editor' ? '編集者' : '閲覧のみ'}
+              </span>
+              <button
+                onClick={() => setShowStudyManagementPanel(true)}
+                style={{
+                  padding: '4px 10px',
+                  borderRadius: '4px',
+                  border: '1px solid #d97706',
+                  backgroundColor: '#fffbeb',
+                  color: '#92400e',
+                  fontSize: '12px',
+                  cursor: 'pointer',
+                  fontWeight: '500'
+                }}
+              >
+                研究管理
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* 機能セクション */}
         <div style={{
           display: 'grid',
@@ -6230,6 +6571,7 @@ exp(confint(cox_model))
               データ登録
             </h3>
             <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {studyCanEdit && (
               <button onClick={() => setShowAddModal(true)} style={{
                 ...styles.addButton,
                 backgroundColor: '#0284c7',
@@ -6239,6 +6581,8 @@ exp(confint(cox_model))
                 <span style={styles.addIcon}>+</span>
                 新規患者登録
               </button>
+              )}
+              {studyCanEdit && (
               <button
                 onClick={() => setShowBulkImportModal(true)}
                 style={{
@@ -6250,6 +6594,8 @@ exp(confint(cox_model))
               >
                 患者一括登録（CSV）
               </button>
+              )}
+              {studyCanEdit && (
               <button
                 onClick={() => setShowBulkLabImportModal(true)}
                 style={{
@@ -6261,6 +6607,7 @@ exp(confint(cox_model))
               >
                 データ一括登録
               </button>
+              )}
             </div>
           </div>
 
@@ -6374,7 +6721,7 @@ exp(confint(cox_model))
                     const eventTypesSet = new Set();
                     for (const patient of patients) {
                       const eventQuery = query(
-                        collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents')
+                        collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents'))
                       );
                       const eventSnapshot = await getDocs(eventQuery);
                       eventSnapshot.docs.forEach(doc => {
@@ -6481,7 +6828,7 @@ exp(confint(cox_model))
                     const eventTypesSet = new Set();
                     for (const patient of patients) {
                       const eventQuery = query(
-                        collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents')
+                        collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents'))
                       );
                       const eventSnapshot = await getDocs(eventQuery);
                       eventSnapshot.docs.forEach(doc => {
@@ -6571,6 +6918,11 @@ exp(confint(cox_model))
                 <h3 style={styles.patientDiagnosis}>{patient.diagnosis}</h3>
                 <div style={styles.patientMeta}>
                   <span>発症日: {patient.onsetDate || '未設定'}</span>
+                  {isStudyMode && patient.siteName && (
+                    <span style={{ marginLeft: '8px', color: '#d97706', fontSize: '11px' }}>
+                      [{patient.siteName}]
+                    </span>
+                  )}
                 </div>
                 {patient.memo && (
                   <p style={styles.patientMemo}>{patient.memo}</p>
@@ -11780,6 +12132,271 @@ ggsave("spaghetti_plot_${spaghettiSelectedItem}.png", p, width = 10, height = 6,
         </div>
       )}
 
+      {/* 研究管理パネルモーダル */}
+      {showStudyManagementPanel && (
+        <div style={styles.modalOverlay}>
+          <div style={{ ...styles.modal, maxWidth: '700px', maxHeight: '80vh', overflow: 'auto' }}>
+            <h2 style={styles.modalTitle}>研究プロジェクト管理</h2>
+
+            {/* 新規研究作成 */}
+            <div style={{ marginBottom: '24px', padding: '16px', backgroundColor: '#f0fdf4', borderRadius: '8px', border: '1px solid #bbf7d0' }}>
+              <h3 style={{ margin: '0 0 12px', fontSize: '15px', color: '#166534' }}>新規研究プロジェクト作成</h3>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr', gap: '8px', marginBottom: '8px' }}>
+                <input
+                  type="text"
+                  placeholder="研究ナンバー（例: NEURO-2026-001）"
+                  value={newStudyNumber}
+                  onChange={(e) => setNewStudyNumber(e.target.value)}
+                  style={styles.input}
+                />
+                <input
+                  type="text"
+                  placeholder="研究タイトル"
+                  value={newStudyTitle}
+                  onChange={(e) => setNewStudyTitle(e.target.value)}
+                  style={styles.input}
+                />
+              </div>
+              <input
+                type="text"
+                placeholder="研究の説明（任意）"
+                value={newStudyDescription}
+                onChange={(e) => setNewStudyDescription(e.target.value)}
+                style={{ ...styles.input, width: '100%', marginBottom: '8px' }}
+              />
+              <button
+                onClick={async () => {
+                  if (!newStudyNumber || !newStudyTitle) {
+                    alert('研究ナンバーとタイトルは必須です');
+                    return;
+                  }
+                  setIsCreatingStudy(true);
+                  try {
+                    const newId = await createStudy(newStudyNumber, newStudyTitle, newStudyDescription);
+                    alert(`研究「${newStudyNumber}」を作成しました`);
+                    setNewStudyNumber('');
+                    setNewStudyTitle('');
+                    setNewStudyDescription('');
+                    switchStudy(newId);
+                  } catch (err) {
+                    alert('作成に失敗しました: ' + err.message);
+                  } finally {
+                    setIsCreatingStudy(false);
+                  }
+                }}
+                disabled={isCreatingStudy}
+                style={{ ...styles.primaryButton, opacity: isCreatingStudy ? 0.6 : 1 }}
+              >
+                {isCreatingStudy ? '作成中...' : '研究を作成'}
+              </button>
+            </div>
+
+            {/* 所属研究一覧 */}
+            <div style={{ marginBottom: '24px' }}>
+              <h3 style={{ margin: '0 0 12px', fontSize: '15px' }}>参加中の研究</h3>
+              {studies.length === 0 ? (
+                <p style={{ color: '#6b7280', fontSize: '13px' }}>参加している研究はありません</p>
+              ) : (
+                studies.map(study => (
+                  <div key={study.id} style={{
+                    padding: '12px',
+                    border: '1px solid #e5e7eb',
+                    borderRadius: '8px',
+                    marginBottom: '8px',
+                    backgroundColor: currentStudy?.id === study.id ? '#fef3c7' : '#fff'
+                  }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div>
+                        <strong style={{ fontSize: '14px' }}>{study.studyNumber}</strong>
+                        <span style={{ marginLeft: '8px', color: '#6b7280', fontSize: '13px' }}>{study.title}</span>
+                      </div>
+                      <span style={{
+                        padding: '2px 8px',
+                        borderRadius: '4px',
+                        fontSize: '11px',
+                        fontWeight: '600',
+                        backgroundColor: study.role === 'pi' ? '#dc2626' : study.role === 'editor' ? '#2563eb' : '#6b7280',
+                        color: '#fff'
+                      }}>
+                        {study.role === 'pi' ? 'PI' : study.role === 'editor' ? '編集者' : '閲覧'}
+                      </span>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            {/* メンバー管理（PI のみ） */}
+            {currentStudy && studyRole === 'pi' && (
+              <div style={{ marginBottom: '24px', padding: '16px', backgroundColor: '#eff6ff', borderRadius: '8px', border: '1px solid #bfdbfe' }}>
+                <h3 style={{ margin: '0 0 12px', fontSize: '15px', color: '#1e40af' }}>
+                  メンバー管理: {currentStudy.studyNumber}
+                </h3>
+
+                {/* メンバー追加フォーム */}
+                <div style={{ marginBottom: '16px' }}>
+                  <h4 style={{ margin: '0 0 8px', fontSize: '13px', color: '#374151' }}>メンバー追加</h4>
+                  <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1fr', gap: '8px', marginBottom: '8px' }}>
+                    <input
+                      type="email"
+                      placeholder="メールアドレス"
+                      value={newStudyMemberEmail}
+                      onChange={(e) => setNewStudyMemberEmail(e.target.value)}
+                      style={styles.input}
+                    />
+                    <select
+                      value={newStudyMemberRole}
+                      onChange={(e) => setNewStudyMemberRole(e.target.value)}
+                      style={styles.input}
+                    >
+                      <option value="viewer">閲覧のみ</option>
+                      <option value="editor">編集者</option>
+                      <option value="pi">PI</option>
+                    </select>
+                    <input
+                      type="text"
+                      placeholder="施設名"
+                      value={newStudyMemberSiteName}
+                      onChange={(e) => setNewStudyMemberSiteName(e.target.value)}
+                      style={styles.input}
+                    />
+                  </div>
+                  <button
+                    onClick={async () => {
+                      if (!newStudyMemberEmail) {
+                        alert('メールアドレスを入力してください');
+                        return;
+                      }
+                      try {
+                        await addStudyMember(currentStudy.id, newStudyMemberEmail, newStudyMemberRole, newStudyMemberSiteName);
+                        alert(`${newStudyMemberEmail} を追加しました`);
+                        setNewStudyMemberEmail('');
+                        setNewStudyMemberRole('viewer');
+                        setNewStudyMemberSiteName('');
+                      } catch (err) {
+                        alert('追加に失敗しました: ' + err.message);
+                      }
+                    }}
+                    style={styles.primaryButton}
+                  >
+                    メンバーを追加
+                  </button>
+                </div>
+
+                {/* メンバー一覧 */}
+                <h4 style={{ margin: '0 0 8px', fontSize: '13px', color: '#374151' }}>
+                  メンバー一覧（{studyMembers.length}名）
+                </h4>
+                <div style={{ maxHeight: '200px', overflow: 'auto' }}>
+                  {studyMembers.map(member => (
+                    <div key={member.id} style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      padding: '8px 12px',
+                      backgroundColor: '#fff',
+                      borderRadius: '4px',
+                      marginBottom: '4px',
+                      border: '1px solid #e5e7eb'
+                    }}>
+                      <div>
+                        <span style={{ fontSize: '13px' }}>{member.email}</span>
+                        {member.siteName && (
+                          <span style={{ marginLeft: '8px', color: '#6b7280', fontSize: '11px' }}>
+                            [{member.siteName}]
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {member.uid !== user.uid ? (
+                          <>
+                            <select
+                              value={member.role}
+                              onChange={(e) => updateStudyMemberRole(member.id, e.target.value)}
+                              style={{ fontSize: '12px', padding: '2px 6px', borderRadius: '4px', border: '1px solid #d1d5db' }}
+                            >
+                              <option value="viewer">閲覧</option>
+                              <option value="editor">編集者</option>
+                              <option value="pi">PI</option>
+                            </select>
+                            <button
+                              onClick={async () => {
+                                if (window.confirm(`${member.email} を削除しますか？`)) {
+                                  await removeStudyMember(member.id);
+                                }
+                              }}
+                              style={{ fontSize: '11px', color: '#dc2626', background: 'none', border: 'none', cursor: 'pointer' }}
+                            >
+                              削除
+                            </button>
+                          </>
+                        ) : (
+                          <span style={{
+                            padding: '2px 6px',
+                            borderRadius: '4px',
+                            fontSize: '11px',
+                            fontWeight: '600',
+                            backgroundColor: '#fecaca',
+                            color: '#dc2626'
+                          }}>
+                            PI（自分）
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* メンバー一覧表示（PI以外でも閲覧可能） */}
+            {currentStudy && studyRole !== 'pi' && (
+              <div style={{ marginBottom: '24px', padding: '16px', backgroundColor: '#f9fafb', borderRadius: '8px', border: '1px solid #e5e7eb' }}>
+                <h3 style={{ margin: '0 0 12px', fontSize: '15px' }}>
+                  メンバー一覧: {currentStudy.studyNumber}（{studyMembers.length}名）
+                </h3>
+                <div style={{ maxHeight: '200px', overflow: 'auto' }}>
+                  {studyMembers.map(member => (
+                    <div key={member.id} style={{
+                      display: 'flex',
+                      justifyContent: 'space-between',
+                      alignItems: 'center',
+                      padding: '8px 12px',
+                      backgroundColor: '#fff',
+                      borderRadius: '4px',
+                      marginBottom: '4px',
+                      border: '1px solid #e5e7eb'
+                    }}>
+                      <span style={{ fontSize: '13px' }}>
+                        {member.email}
+                        {member.siteName && <span style={{ marginLeft: '8px', color: '#6b7280', fontSize: '11px' }}>[{member.siteName}]</span>}
+                      </span>
+                      <span style={{
+                        padding: '2px 6px',
+                        borderRadius: '4px',
+                        fontSize: '11px',
+                        fontWeight: '600',
+                        backgroundColor: member.role === 'pi' ? '#fecaca' : member.role === 'editor' ? '#dbeafe' : '#f3f4f6',
+                        color: member.role === 'pi' ? '#dc2626' : member.role === 'editor' ? '#2563eb' : '#6b7280'
+                      }}>
+                        {member.role === 'pi' ? 'PI' : member.role === 'editor' ? '編集者' : '閲覧'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <button
+              onClick={() => setShowStudyManagementPanel(false)}
+              style={{ ...styles.cancelButton, width: '100%' }}
+            >
+              閉じる
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* フッター */}
       <footer style={{
         marginTop: '40px',
@@ -11806,8 +12423,10 @@ ggsave("spaghetti_plot_${spaghettiSelectedItem}.png", p, width = 10, height = 6,
 // ============================================================
 // 患者詳細画面
 // ============================================================
-function PatientDetailView({ patient, onBack }) {
+function PatientDetailView({ patient, studyId, studyRole, onBack }) {
   const { user } = useAuth();
+  const activeStudyId = studyId || null;
+  const studyCanEdit = !activeStudyId || studyRole === 'pi' || studyRole === 'editor';
   const [labResults, setLabResults] = useState([]);
   const [showAddLabModal, setShowAddLabModal] = useState(false);
   const [selectedImage, setSelectedImage] = useState(null);
@@ -12505,7 +13124,7 @@ function PatientDetailView({ patient, onBack }) {
     if (!user || !patient) return;
 
     const q = query(
-      collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+      collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
       orderBy('date', 'desc')
     );
 
@@ -12525,7 +13144,7 @@ function PatientDetailView({ patient, onBack }) {
     if (!user || !patient) return;
 
     const q = query(
-      collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+      collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
       orderBy('startDate', 'asc')
     );
 
@@ -12545,7 +13164,7 @@ function PatientDetailView({ patient, onBack }) {
     if (!user || !patient) return;
 
     const q = query(
-      collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+      collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'treatments')),
       orderBy('startDate', 'asc')
     );
 
@@ -12607,7 +13226,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await addDoc(
-        collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+        collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
         {
           eventType: eventType,
           inputType: config.inputType,
@@ -12656,7 +13275,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await deleteDoc(
-        doc(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents', eventId)
+        doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'clinicalEvents', eventId))
       );
     } catch (err) {
       console.error('Error deleting clinical event:', err);
@@ -12702,7 +13321,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await updateDoc(
-        doc(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents', editingEventId),
+        doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'clinicalEvents', editingEventId)),
         {
           eventType: editEvent.eventType,
           startDate: editEvent.startDate,
@@ -12787,7 +13406,7 @@ function PatientDetailView({ patient, onBack }) {
 
       try {
         await addDoc(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
           {
             eventType: eventType,
             inputType: inputTypeIdx !== -1 ? values[inputTypeIdx] || 'severity' : 'severity',
@@ -12898,7 +13517,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await addDoc(
-        collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+        collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'treatments')),
         {
           category: newTreatment.category,
           medicationName: medicationName,
@@ -12937,7 +13556,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await deleteDoc(
-        doc(db, 'users', user.uid, 'patients', patient.id, 'treatments', treatmentId)
+        doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'treatments', treatmentId))
       );
     } catch (err) {
       console.error('Error deleting treatment:', err);
@@ -12981,7 +13600,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await updateDoc(
-        doc(db, 'users', user.uid, 'patients', patient.id, 'treatments', editingTreatmentId),
+        doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'treatments', editingTreatmentId)),
         {
           category: editTreatment.category,
           medicationName: editTreatment.medicationName,
@@ -13063,7 +13682,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await addDoc(
-        collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+        collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
         {
           date: labDate,
           data: ocrResults,
@@ -13072,7 +13691,7 @@ function PatientDetailView({ patient, onBack }) {
       );
 
       // 患者の検査件数を更新
-      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+      await updateDoc(doc(db, ...getPatientDocPath(activeStudyId, user.uid, patient.id)), {
         labCount: (labResults.length || 0) + 1
       });
 
@@ -13489,7 +14108,7 @@ function PatientDetailView({ patient, onBack }) {
         if (!dayData || dayData.data.length === 0) continue;
 
         await addDoc(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
           {
             date: dayData.date,
             specimen: dayData.specimen || '',
@@ -13507,7 +14126,7 @@ function PatientDetailView({ patient, onBack }) {
         if (!t) continue;
 
         await addDoc(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'treatments')),
           {
             category: t.category || 'その他',
             medicationName: t.medicationName,
@@ -13528,7 +14147,7 @@ function PatientDetailView({ patient, onBack }) {
         if (!e) continue;
 
         await addDoc(
-          collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+          collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
           {
             eventType: e.eventType,
             startDate: e.startDate,
@@ -13544,7 +14163,7 @@ function PatientDetailView({ patient, onBack }) {
 
       // 患者の検査件数を更新
       if (labCount > 0) {
-        await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+        await updateDoc(doc(db, ...getPatientDocPath(activeStudyId, user.uid, patient.id)), {
           labCount: (labResults.length || 0) + labCount
         });
       }
@@ -13578,10 +14197,10 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await deleteDoc(
-        doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', labId)
+        doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'labResults', labId))
       );
 
-      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+      await updateDoc(doc(db, ...getPatientDocPath(activeStudyId, user.uid, patient.id)), {
         labCount: Math.max((labResults.length || 1) - 1, 0)
       });
     } catch (err) {
@@ -13596,11 +14215,11 @@ function PatientDetailView({ patient, onBack }) {
     try {
       for (const lab of labResults) {
         await deleteDoc(
-          doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', lab.id)
+          doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'labResults', lab.id))
         );
       }
 
-      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+      await updateDoc(doc(db, ...getPatientDocPath(activeStudyId, user.uid, patient.id)), {
         labCount: 0
       });
       alert('全検査データを削除しました');
@@ -13617,7 +14236,7 @@ function PatientDetailView({ patient, onBack }) {
     try {
       for (const t of treatments) {
         await deleteDoc(
-          doc(db, 'users', user.uid, 'patients', patient.id, 'treatments', t.id)
+          doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'treatments', t.id))
         );
       }
       alert('全治療データを削除しました');
@@ -13634,7 +14253,7 @@ function PatientDetailView({ patient, onBack }) {
     try {
       for (const e of clinicalEvents) {
         await deleteDoc(
-          doc(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents', e.id)
+          doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'clinicalEvents', e.id))
         );
       }
       alert('全臨床イベントを削除しました');
@@ -13657,18 +14276,18 @@ function PatientDetailView({ patient, onBack }) {
     try {
       // 検査データを削除
       for (const lab of labResults) {
-        await deleteDoc(doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', lab.id));
+        await deleteDoc(doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'labResults', lab.id)));
       }
       // 治療データを削除
       for (const t of treatments) {
-        await deleteDoc(doc(db, 'users', user.uid, 'patients', patient.id, 'treatments', t.id));
+        await deleteDoc(doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'treatments', t.id)));
       }
       // 臨床イベントを削除
       for (const e of clinicalEvents) {
-        await deleteDoc(doc(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents', e.id));
+        await deleteDoc(doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'clinicalEvents', e.id)));
       }
 
-      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+      await updateDoc(doc(db, ...getPatientDocPath(activeStudyId, user.uid, patient.id)), {
         labCount: 0
       });
 
@@ -13696,7 +14315,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await updateDoc(
-        doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', labId),
+        doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'labResults', labId)),
         { data: updatedData }
       );
       setEditLabItem({ item: '', value: '', unit: '' });
@@ -13715,7 +14334,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       await updateDoc(
-        doc(db, 'users', user.uid, 'patients', patient.id, 'labResults', labId),
+        doc(db, ...getPatientSubdocPath(activeStudyId, user.uid, patient.id, 'labResults', labId)),
         { data: updatedData }
       );
     } catch (err) {
@@ -13725,7 +14344,7 @@ function PatientDetailView({ patient, onBack }) {
 
   const saveMemo = async () => {
     try {
-      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+      await updateDoc(doc(db, ...getPatientDocPath(activeStudyId, user.uid, patient.id)), {
         memo: memoText
       });
       setEditingMemo(false);
@@ -13736,7 +14355,7 @@ function PatientDetailView({ patient, onBack }) {
 
   const savePatientInfo = async () => {
     try {
-      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+      await updateDoc(doc(db, ...getPatientDocPath(activeStudyId, user.uid, patient.id)), {
         diagnosis: editedPatient.diagnosis,
         group: editedPatient.group,
         onsetDate: editedPatient.onsetDate,
@@ -13772,7 +14391,7 @@ function PatientDetailView({ patient, onBack }) {
 
     try {
       // 重複チェック: 同じユーザーの他の患者で同じIDが使われていないか確認
-      const patientsRef = collection(db, 'users', user.uid, 'patients');
+      const patientsRef = collection(db, ...getPatientsCollectionPath(activeStudyId, user.uid));
       const snapshot = await getDocs(patientsRef);
       const isDuplicate = snapshot.docs.some(doc =>
         doc.id !== patient.id && doc.data().displayId === trimmedId
@@ -13784,7 +14403,7 @@ function PatientDetailView({ patient, onBack }) {
       }
 
       // 更新実行
-      await updateDoc(doc(db, 'users', user.uid, 'patients', patient.id), {
+      await updateDoc(doc(db, ...getPatientDocPath(activeStudyId, user.uid, patient.id)), {
         displayId: trimmedId,
       });
 
@@ -14068,18 +14687,22 @@ function PatientDetailView({ patient, onBack }) {
             💊 臨床経過（治療・症状）
           </h2>
           <div style={{display: 'flex', gap: '8px', flexWrap: 'wrap', marginBottom: '16px'}}>
+              {studyCanEdit && (
               <button
                 onClick={openAddTreatmentModal}
                 style={{...styles.addLabButton, background: '#ecfdf5', color: '#047857'}}
               >
                 <span>💊</span> 治療薬追加
               </button>
+              )}
+              {studyCanEdit && (
               <button
                 onClick={openAddEventModal}
                 style={{...styles.addLabButton, background: '#fef3c7', color: '#92400e'}}
               >
                 <span>📋</span> 症状追加
               </button>
+              )}
               <button
                 onClick={exportClinicalEventsCSV}
                 style={{...styles.addLabButton, background: '#e0f2fe', color: '#0369a1'}}
@@ -16328,6 +16951,7 @@ function PatientDetailView({ patient, onBack }) {
           }}>
             🔬 検査データ
           </h2>
+          {studyCanEdit && (
           <div style={{display: 'flex', gap: '10px', flexWrap: 'wrap', marginBottom: '16px'}}>
               <button onClick={() => setShowAddLabModal(true)} style={styles.addLabButton}>
                 <span>📷</span> 写真から追加
@@ -16344,6 +16968,7 @@ function PatientDetailView({ patient, onBack }) {
                 </button>
               )}
           </div>
+          )}
 
           {labResults.length === 0 ? (
             <div style={styles.emptyLab}>
@@ -17602,7 +18227,7 @@ function PatientDetailView({ patient, onBack }) {
                           for (const lab of summaryResult.labResults) {
                             if (lab.date && lab.data && lab.data.length > 0) {
                               await addDoc(
-                                collection(db, 'users', user.uid, 'patients', patient.id, 'labResults'),
+                                collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'labResults')),
                                 {
                                   date: lab.date,
                                   data: lab.data,
@@ -17620,7 +18245,7 @@ function PatientDetailView({ patient, onBack }) {
                           for (const t of summaryResult.treatments) {
                             if (t.medicationName && t.startDate) {
                               await addDoc(
-                                collection(db, 'users', user.uid, 'patients', patient.id, 'treatments'),
+                                collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'treatments')),
                                 {
                                   category: t.category || 'その他',
                                   medicationName: t.medicationName,
@@ -17642,7 +18267,7 @@ function PatientDetailView({ patient, onBack }) {
                           for (const e of summaryResult.clinicalEvents) {
                             if (e.eventType && e.startDate) {
                               await addDoc(
-                                collection(db, 'users', user.uid, 'patients', patient.id, 'clinicalEvents'),
+                                collection(db, ...getPatientSubcollectionPath(activeStudyId, user.uid, patient.id, 'clinicalEvents')),
                                 {
                                   eventType: e.eventType,
                                   startDate: e.startDate,
@@ -17706,6 +18331,7 @@ function PatientDetailView({ patient, onBack }) {
 // ============================================================
 function App() {
   const { user } = useAuth();
+  const { currentStudy, studyRole } = useStudy();
   const [selectedPatient, setSelectedPatient] = useState(null);
 
   if (!user) {
@@ -17716,6 +18342,8 @@ function App() {
     return (
       <PatientDetailView
         patient={selectedPatient}
+        studyId={currentStudy?.id || null}
+        studyRole={studyRole}
         onBack={() => setSelectedPatient(null)}
       />
     );
@@ -17724,12 +18352,14 @@ function App() {
   return <PatientsListView onSelectPatient={setSelectedPatient} />;
 }
 
-// AuthProviderとOrganizationProviderでラップしてエクスポート
+// AuthProvider, OrganizationProvider, StudyProviderでラップしてエクスポート
 export default function AppWithAuth() {
   return (
     <AuthProvider>
       <OrganizationProvider>
-        <App />
+        <StudyProvider>
+          <App />
+        </StudyProvider>
       </OrganizationProvider>
     </AuthProvider>
   );

@@ -90,6 +90,80 @@ service cloud.firestore {
     }
 
     // ============================================================
+    // 研究プロジェクト関連のルール（多施設共同研究）
+    // ============================================================
+
+    // 研究メンバーかどうかをチェック
+    function isStudyMember(studyId) {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/studyMembers/$(request.auth.uid + '_' + studyId));
+    }
+
+    // 研究での役割を取得
+    function getStudyRole(studyId) {
+      return get(/databases/$(database)/documents/studyMembers/$(request.auth.uid + '_' + studyId)).data.role;
+    }
+
+    // 研究のPI または編集者かどうか
+    function isStudyEditor(studyId) {
+      return isStudyMember(studyId) && getStudyRole(studyId) in ['pi', 'editor'];
+    }
+
+    // 研究のPIかどうか
+    function isStudyPI(studyId) {
+      return isStudyMember(studyId) && getStudyRole(studyId) == 'pi';
+    }
+
+    // 研究プロジェクト
+    match /studies/{studyId} {
+      allow read: if isStudyMember(studyId) || isSystemAdmin();
+      allow create: if request.auth != null;
+      allow update: if isStudyPI(studyId) || isSystemAdmin();
+      allow delete: if isStudyPI(studyId) || isSystemAdmin();
+
+      // 研究内の患者データ
+      match /patients/{patientId} {
+        allow read: if isStudyMember(studyId);
+        allow create, update, delete: if isStudyEditor(studyId);
+
+        match /labResults/{labId} {
+          allow read: if isStudyMember(studyId);
+          allow create, update, delete: if isStudyEditor(studyId);
+        }
+
+        match /treatments/{treatmentId} {
+          allow read: if isStudyMember(studyId);
+          allow create, update, delete: if isStudyEditor(studyId);
+        }
+
+        match /clinicalEvents/{eventId} {
+          allow read: if isStudyMember(studyId);
+          allow create, update, delete: if isStudyEditor(studyId);
+        }
+      }
+    }
+
+    // 研究メンバーシップ
+    match /studyMembers/{memberId} {
+      allow read: if request.auth != null && (
+        resource.data.uid == request.auth.uid ||
+        resource.data.email == request.auth.token.email ||
+        isSystemAdmin()
+      );
+      allow create: if request.auth != null;
+      allow update: if isSystemAdmin() || (
+        request.auth != null && (
+          // PIはメンバーの権限を変更可能
+          isStudyPI(resource.data.studyId) ||
+          // メールベースのメンバーシップをUIDにリンク
+          (resource.data.email == request.auth.token.email &&
+           request.resource.data.uid == request.auth.uid)
+        )
+      );
+      allow delete: if isSystemAdmin() || isStudyPI(resource.data.studyId);
+    }
+
+    // ============================================================
     // 既存のルール（後方互換性のため維持）
     // ============================================================
 
