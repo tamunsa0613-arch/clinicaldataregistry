@@ -9541,9 +9541,9 @@ exp(confint(cox_model))
                               svgContent += `<text x="${legendX + legendWidth + 5}" y="${legendY + legendHeight}" font-size="10">-1</text>`;
 
                               // 有意水準の凡例
-                              svgContent += `<text x="${legendX}" y="${legendY + legendHeight + 20}" font-size="9">*p<0.05</text>`;
-                              svgContent += `<text x="${legendX}" y="${legendY + legendHeight + 32}" font-size="9">**p<0.01</text>`;
-                              svgContent += `<text x="${legendX}" y="${legendY + legendHeight + 44}" font-size="9">***p<0.001</text>`;
+                              svgContent += `<text x="${legendX}" y="${legendY + legendHeight + 20}" font-size="9">*p&lt;0.05</text>`;
+                              svgContent += `<text x="${legendX}" y="${legendY + legendHeight + 32}" font-size="9">**p&lt;0.01</text>`;
+                              svgContent += `<text x="${legendX}" y="${legendY + legendHeight + 44}" font-size="9">***p&lt;0.001</text>`;
 
                               svgContent += '</svg>';
 
@@ -12637,7 +12637,7 @@ function PatientDetailView({ patient, studyId, studyRole, onBack, onUpdatePatien
 
   // ラベル変換マッピング
   const labelTranslations = {
-    // 臨床症状
+    // === 臨床症状（神経系） ===
     '意識障害': { english: 'Consciousness Disturbance', abbreviation: 'Consc.' },
     'てんかん発作': { english: 'Epileptic Seizure', abbreviation: 'Sz' },
     '不随意運動': { english: 'Involuntary Movement', abbreviation: 'Invol.Mov.' },
@@ -12646,28 +12646,70 @@ function PatientDetailView({ patient, studyId, studyRole, onBack, onUpdatePatien
     '失語': { english: 'Aphasia', abbreviation: 'Aphasia' },
     '認知機能障害': { english: 'Cognitive Impairment', abbreviation: 'Cogn.' },
     '精神症状': { english: 'Psychiatric Symptoms', abbreviation: 'Psych.' },
+    // === 臨床症状（全身） ===
     '発熱': { english: 'Fever', abbreviation: 'Fever' },
     '頭痛': { english: 'Headache', abbreviation: 'HA' },
     '髄膜刺激症状': { english: 'Meningeal Signs', abbreviation: 'Mening.' },
     '人工呼吸器管理': { english: 'Mechanical Ventilation', abbreviation: 'MV' },
     'ICU入室': { english: 'ICU Admission', abbreviation: 'ICU' },
+    // === 臨床症状（消化器） ===
     '嘔吐': { english: 'Vomiting', abbreviation: 'Vomit' },
     '腹痛': { english: 'Abdominal Pain', abbreviation: 'Abd.Pain' },
     '下痢': { english: 'Diarrhea', abbreviation: 'Diarrhea' },
+    '食欲不振': { english: 'Anorexia', abbreviation: 'Anorexia' },
+    // === 臨床症状（代謝・脱水） ===
     '口渇': { english: 'Thirst', abbreviation: 'Thirst' },
     '多尿': { english: 'Polyuria', abbreviation: 'Polyuria' },
     '脱水': { english: 'Dehydration', abbreviation: 'Dehydr.' },
+    '体重減少': { english: 'Weight Loss', abbreviation: 'Wt.Loss' },
+    // === 臨床症状（呼吸器） ===
     '頻呼吸': { english: 'Tachypnea', abbreviation: 'Tachypnea' },
     '呼吸困難': { english: 'Dyspnea', abbreviation: 'Dyspnea' },
-    // 治療薬カテゴリ
+    // === 臨床症状（電解質・内分泌） ===
+    '低ナトリウム血症': { english: 'Hyponatremia', abbreviation: 'HypoNa' },
+    '高ナトリウム血症': { english: 'Hypernatremia', abbreviation: 'HyperNa' },
+    'SIADH': { english: 'SIADH', abbreviation: 'SIADH' },
+    '尿崩症': { english: 'Diabetes Insipidus', abbreviation: 'DI' },
+    '高血糖': { english: 'Hyperglycemia', abbreviation: 'HyperGlu' },
+    '低血糖': { english: 'Hypoglycemia', abbreviation: 'HypoGlu' },
+    '甲状腺機能低下': { english: 'Hypothyroidism', abbreviation: 'HypoThyr' },
+    '甲状腺機能亢進': { english: 'Hyperthyroidism', abbreviation: 'HyperThyr' },
+    '副腎不全': { english: 'Adrenal Insufficiency', abbreviation: 'Adrenal Insuf.' },
+    // === 治療薬カテゴリ（神経系） ===
     '抗てんかん薬': { english: 'Antiepileptics', abbreviation: 'AED' },
     'ステロイド': { english: 'Steroids', abbreviation: 'Steroid' },
     '免疫グロブリン': { english: 'Immunoglobulin', abbreviation: 'IVIG' },
     '血漿交換': { english: 'Plasma Exchange', abbreviation: 'PE' },
     '免疫抑制剤': { english: 'Immunosuppressants', abbreviation: 'Immunosup.' },
-    '抗ウイルス薬': { english: 'Antivirals', abbreviation: 'Antiviral' },
-    '抗菌薬': { english: 'Antibiotics', abbreviation: 'Abx' },
     '抗浮腫薬': { english: 'Anti-edema', abbreviation: 'Anti-edema' },
+    'ミトコンドリア治療': { english: 'Mitochondrial Therapy', abbreviation: 'Mito.Tx' },
+    '栄養・微量元素補充': { english: 'Nutrition/Trace Elements', abbreviation: 'Nutr.' },
+    // === 治療薬カテゴリ（感染症） ===
+    '抗菌薬': { english: 'Antibiotics', abbreviation: 'Abx' },
+    '抗菌薬（ペニシリン系）': { english: 'Penicillins', abbreviation: 'PCN' },
+    '抗菌薬（セフェム系）': { english: 'Cephalosporins', abbreviation: 'Ceph' },
+    '抗菌薬（カルバペネム系）': { english: 'Carbapenems', abbreviation: 'Carbap.' },
+    '抗菌薬（その他）': { english: 'Other Antibiotics', abbreviation: 'Other Abx' },
+    '抗ウイルス薬': { english: 'Antivirals', abbreviation: 'Antiviral' },
+    '抗真菌薬': { english: 'Antifungals', abbreviation: 'Antifung.' },
+    // === 治療薬カテゴリ（ICU/急性期） ===
+    '昇圧薬・強心薬': { english: 'Vasopressors/Inotropes', abbreviation: 'Vasopres.' },
+    '鎮静薬・鎮痛薬': { english: 'Sedatives/Analgesics', abbreviation: 'Sed/Analg' },
+    '筋弛緩薬': { english: 'Neuromuscular Blockers', abbreviation: 'NMB' },
+    '血液製剤': { english: 'Blood Products', abbreviation: 'Blood Prod.' },
+    '抗凝固薬': { english: 'Anticoagulants', abbreviation: 'Anticoag.' },
+    // === 治療薬カテゴリ（腎臓） ===
+    '透析関連': { english: 'Dialysis', abbreviation: 'Dialysis' },
+    '利尿薬': { english: 'Diuretics', abbreviation: 'Diuret.' },
+    '腎性貧血治療薬': { english: 'Renal Anemia Treatment', abbreviation: 'ESA' },
+    'ネフローゼ治療薬': { english: 'Nephrotic Syndrome Treatment', abbreviation: 'Neph.Tx' },
+    '降圧薬': { english: 'Antihypertensives', abbreviation: 'AntiHTN' },
+    // === 治療薬カテゴリ（内分泌） ===
+    'ホルモン補充療法': { english: 'Hormone Replacement', abbreviation: 'HRT' },
+    '糖尿病治療薬': { english: 'Antidiabetics', abbreviation: 'AntiDM' },
+    '電解質補正': { english: 'Electrolyte Correction', abbreviation: 'Lyte Corr.' },
+    // === その他 ===
+    'その他': { english: 'Others', abbreviation: 'Others' },
   };
 
   // ラベル変換関数
@@ -16341,112 +16383,109 @@ function PatientDetailView({ patient, studyId, studyRole, onBack, onUpdatePatien
                     // ダミー用（古いrenderTimeline参照を維持）
                     const renderTimeline = renderClinicalTimeline;
 
-                    // 検査データのグラフ（X軸をタイムラインと揃える）- 二軸対応
+                    // 検査データのグラフ（分離モード：項目ごとに個別グラフ）- 二軸対応
                     const renderLabChartAligned = () => {
                       if (selectedLabItemsForChart.length === 0) return null;
 
-                      const datasets = [];
+                      // 各項目ごとのデータを収集
+                      const chartsData = [];
                       selectedLabItemsForChart.forEach((item, idx) => {
                         const dataPoints = [];
+                        let unit = '';
                         labResults.forEach(lab => {
                           const labItem = lab.data?.find(d => d.item === item);
                           if (labItem) {
                             const day = calcDaysFromOnset(lab.date);
                             if (day !== null) {
                               dataPoints.push({ x: day, y: labItem.value });
+                              if (!unit && labItem.unit) unit = labItem.unit;
                             }
                           }
                         });
                         if (dataPoints.length > 0) {
                           dataPoints.sort((a, b) => a.x - b.x);
-                          const isSecondary = useDualAxis && secondaryAxisItems.includes(item);
-                          const baseColor = isSecondary
-                            ? ['#f59e0b', '#f97316', '#ea580c', '#dc2626'][idx % 4]
-                            : labColors[idx % labColors.length];
-                          datasets.push({
-                            label: item + (isSecondary ? ' [右]' : ''),
-                            data: dataPoints,
-                            borderColor: baseColor,
-                            backgroundColor: baseColor,
-                            tension: 0.2,
-                            pointRadius: 4,
-                            pointHoverRadius: 6,
-                            borderWidth: 2,
-                            yAxisID: isSecondary ? 'ySecondary' : 'y'
-                          });
+                          chartsData.push({ item, dataPoints, unit, idx });
                         }
                       });
 
-                      if (datasets.length === 0) return null;
-
-                      const hasSecondaryLabData = useDualAxis && selectedLabItemsForChart.some(item => secondaryAxisItems.includes(item));
-
-                      const scales = {
-                        x: {
-                          type: 'linear',
-                          min: minDay,
-                          max: maxDay,
-                          title: {
-                            display: true,
-                            text: 'days',
-                            font: { size: 11 }
-                          },
-                          ticks: {
-                            stepSize: 5,
-                            font: { size: 10 }
-                          },
-                          grid: {
-                            color: '#e5e7eb'
-                          }
-                        },
-                        y: {
-                          type: 'linear',
-                          position: 'left',
-                          title: { display: true, text: '検査値（左軸）', color: '#3b82f6', font: { size: 11 } },
-                          ticks: { color: '#3b82f6', font: { size: 10 } },
-                          grid: { color: '#e5e7eb' }
-                        }
-                      };
-
-                      if (hasSecondaryLabData) {
-                        scales.ySecondary = {
-                          type: 'linear',
-                          position: 'right',
-                          title: { display: true, text: '検査値（右軸）', color: '#f59e0b', font: { size: 11 } },
-                          ticks: { color: '#f59e0b', font: { size: 10 } },
-                          grid: { drawOnChartArea: false }
-                        };
-                      }
+                      if (chartsData.length === 0) return null;
 
                       return (
-                        <div style={{ marginLeft: '120px' }}>
-                          <Line
-                            ref={overlayChartRef}
-                            data={{ datasets }}
-                            options={{
-                              responsive: true,
-                              maintainAspectRatio: true,
-                              aspectRatio: 2.5,
-                              interaction: {
-                                mode: 'index',
-                                intersect: false
-                              },
-                              plugins: {
-                                legend: {
-                                  position: 'right',
-                                  labels: {
-                                    usePointStyle: true,
-                                    padding: 12,
-                                    font: { size: 11 }
-                                  }
-                                },
-                                title: {
-                                  display: false
-                                }
-                              },
-                              scales
-                            }}
-                          />
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+                          {chartsData.map((chartInfo, chartIndex) => {
+                            const baseColor = labColors[chartInfo.idx % labColors.length];
+                            const dataset = {
+                              label: chartInfo.item + (chartInfo.unit ? ` (${chartInfo.unit})` : ''),
+                              data: chartInfo.dataPoints,
+                              borderColor: baseColor,
+                              backgroundColor: baseColor + '20',
+                              tension: 0.2,
+                              pointRadius: 4,
+                              pointHoverRadius: 6,
+                              borderWidth: 2,
+                              fill: false
+                            };
+
+                            return (
+                              <div key={chartIndex} style={{ marginLeft: '120px', marginBottom: '8px' }}>
+                                <Line
+                                  data={{ datasets: [dataset] }}
+                                  options={{
+                                    responsive: true,
+                                    maintainAspectRatio: true,
+                                    aspectRatio: 3.5,
+                                    interaction: {
+                                      mode: 'index',
+                                      intersect: false
+                                    },
+                                    plugins: {
+                                      legend: {
+                                        display: false
+                                      },
+                                      title: {
+                                        display: true,
+                                        text: chartInfo.item + (chartInfo.unit ? ` (${chartInfo.unit})` : ''),
+                                        font: { size: 13, weight: 'bold' },
+                                        color: baseColor,
+                                        padding: { bottom: 8 }
+                                      }
+                                    },
+                                    scales: {
+                                      x: {
+                                        type: 'linear',
+                                        min: minDay,
+                                        max: maxDay,
+                                        title: {
+                                          display: chartIndex === chartsData.length - 1,
+                                          text: 'days',
+                                          font: { size: 11 }
+                                        },
+                                        ticks: {
+                                          stepSize: 5,
+                                          font: { size: 10 }
+                                        },
+                                        grid: {
+                                          color: '#e5e7eb'
+                                        }
+                                      },
+                                      y: {
+                                        type: 'linear',
+                                        position: 'left',
+                                        title: {
+                                          display: true,
+                                          text: chartInfo.unit || '値',
+                                          color: baseColor,
+                                          font: { size: 11 }
+                                        },
+                                        ticks: { color: baseColor, font: { size: 10 } },
+                                        grid: { color: '#e5e7eb' }
+                                      }
+                                    }
+                                  }}
+                                />
+                              </div>
+                            );
+                          })}
                         </div>
                       );
                     };
